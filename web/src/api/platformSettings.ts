@@ -124,13 +124,23 @@ export interface MonitoringSettings {
   clickhouse_url?: string | null
 }
 
+export type PublicHostnameStrategy = 'standard' | 'flat'
+
+export interface PublicHostnameSettings {
+  strategy: PublicHostnameStrategy
+  environment_template?: string | null
+  service_template?: string | null
+  deployment_template?: string | null
+}
+
 // Re-export the types from the API for consistency
-export interface PlatformSettings extends AppSettings {
+export interface PlatformSettings extends Omit<AppSettings, 'agent_sandbox'> {
   dns_provider: DnsProviderSettings
   external_url: string | null
   internal_url: string | null
   letsencrypt: LetsEncryptSettings
   preview_domain: string
+  public_hostnames: PublicHostnameSettings
   screenshots: ScreenshotSettings
   security_headers: SecurityHeadersSettings
   rate_limiting: RateLimitSettings
@@ -194,13 +204,13 @@ export async function updatePlatformSettings(
 
   validateSettings(updated)
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const body: any = {
     dns_provider: updated.dns_provider,
     external_url: updated.external_url,
     internal_url: updated.internal_url,
     letsencrypt: updated.letsencrypt,
     preview_domain: updated.preview_domain,
+    public_hostnames: updated.public_hostnames,
     screenshots: updated.screenshots,
     security_headers: updated.security_headers,
     rate_limiting: updated.rate_limiting,

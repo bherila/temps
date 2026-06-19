@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Configurable public hostname strategy**: platform settings now support
+  `public_hostnames` templates for generated environment, deployment, and
+  public compose-service routes. Operators can switch to the `flat` strategy to
+  keep generated hostnames one label beneath `preview_domain` for proxied
+  wildcard TLS providers such as Cloudflare Universal SSL; labels are sanitized
+  and truncated with stable short-hash suffixes when they exceed DNS limits.
 - **Opt-in MariaDB external services**: Temps can now create standalone
   MariaDB services for hosted projects without changing its internal Postgres
   dependency. The new `mariadb` service type uses the official `mariadb:lts`

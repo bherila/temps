@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
 
+use crate::PublicHostnameSettings;
+
 /// Application settings stored in the database
 /// All fields have sensible defaults for easy onboarding
 #[derive(Debug, Clone, Serialize, ToSchema, Deserialize)]
@@ -17,6 +19,7 @@ pub struct AppSettings {
     /// `external_url`, which is the public-facing address.
     pub internal_url: Option<String>,
     pub preview_domain: String,
+    pub public_hostnames: PublicHostnameSettings,
 
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
@@ -534,6 +537,7 @@ impl Default for AppSettings {
             external_url: None,
             internal_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
+            public_hostnames: PublicHostnameSettings::default(),
             screenshots: ScreenshotSettings::default(),
             letsencrypt: LetsEncryptSettings::default(),
             dns_provider: DnsProviderSettings::default(),
