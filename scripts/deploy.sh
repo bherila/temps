@@ -480,6 +480,11 @@ SETUP_MODE=""
 #   beta   -> newest tag from /releases?per_page=20 (stable OR prerelease)
 CHANNEL="stable"
 
+# GitHub repository used for binary releases. The upstream default remains
+# gotempsh/temps; forks can set TEMPS_RELEASE_REPO=owner/repo while testing
+# compatibility binaries before they are accepted upstream.
+TEMPS_RELEASE_REPO="${TEMPS_RELEASE_REPO:-gotempsh/temps}"
+
 # Anonymous product telemetry. Temps reports anonymous usage events (e.g.
 # "an instance attempted a deploy" vs "an instance deployed successfully") so
 # the maintainers can tell whether the product is working for self-hosters.
@@ -507,10 +512,10 @@ LOCAL_PORT=80
 resolve_channel_version() {
   local ver=""
   if [[ "$CHANNEL" == "beta" ]]; then
-    ver=$(curl -fsSL "https://api.github.com/repos/gotempsh/temps/releases?per_page=20" 2>/dev/null \
+    ver=$(curl -fsSL "https://api.github.com/repos/$TEMPS_RELEASE_REPO/releases?per_page=20" 2>/dev/null \
       | grep '"tag_name":' | head -1 | cut -d'"' -f4)
   else
-    ver=$(curl -fsSL "https://api.github.com/repos/gotempsh/temps/releases/latest" 2>/dev/null \
+    ver=$(curl -fsSL "https://api.github.com/repos/$TEMPS_RELEASE_REPO/releases/latest" 2>/dev/null \
       | grep '"tag_name":' | head -1 | cut -d'"' -f4)
   fi
   echo "$ver"
@@ -1302,12 +1307,16 @@ ADMIN_EMAIL=""
 ADMIN_PASSWORD=""
 
 # ---------------------------------------------------------------------------
-# Binary installer: download temps from GitHub releases (stable only)
-# Usage: install_temps_binary [VERSION]
-# ---------------------------------------------------------------------------
-install_temps_binary() {
-  local version="${1:-}"
-  local platform target bin_dir exe
+# resolve_binary_target
+# Prints the release asset suffix for this host. TEMPS_BINARY_TARGET can be
+# used by fork/release testing to override auto-detection.
+resolve_binary_target() {
+  if [[ -n "${TEMPS_BINARY_TARGET:-}" ]]; then
+    echo "$TEMPS_BINARY_TARGET"
+    return 0
+  fi
+
+  local platform target os_id os_version
 
   platform="$(uname -ms)"
   case "$platform" in
@@ -1316,15 +1325,36 @@ install_temps_binary() {
     *)               target=linux-amd64  ;;
   esac
 
-  # Alpine / musl
-  case "$target" in
-    linux*) [[ -f /etc/alpine-release ]] && target="$target-musl" ;;
-  esac
+  if [[ "$target" == linux* ]]; then
+    [[ -f /etc/alpine-release ]] && target="$target-musl"
+
+    if [[ "$target" == "linux-amd64" && -r /etc/os-release ]]; then
+      # shellcheck disable=SC1091
+      . /etc/os-release
+      os_id="${ID:-}"
+      os_version="${VERSION_ID:-}"
+      if [[ "$os_id" == "amzn" && "$os_version" == 2023* ]]; then
+        target="linux-amd64-amzn2023"
+      fi
+    fi
+  fi
+
+  echo "$target"
+}
+
+# Binary installer: download temps from GitHub releases
+# Usage: install_temps_binary [VERSION]
+# ---------------------------------------------------------------------------
+install_temps_binary() {
+  local version="${1:-}"
+  local target bin_dir exe
+
+  target="$(resolve_binary_target)"
 
   # Resolve the newest version on the selected channel if none was pinned.
   if [[ -z "$version" ]]; then
     version=$(resolve_channel_version)
-    [[ -z "$version" ]] && fatal "Failed to fetch latest $CHANNEL Temps release from GitHub"
+    [[ -z "$version" ]] && fatal "Failed to fetch latest $CHANNEL Temps release from GitHub repo $TEMPS_RELEASE_REPO"
     info "Latest $CHANNEL version: ${BOLD}$version${RESET}"
   fi
 
@@ -1332,13 +1362,41 @@ install_temps_binary() {
   exe="$bin_dir/temps"
   mkdir -p "$bin_dir"
 
-  local url="https://github.com/gotempsh/temps/releases/download/$version/temps-$target.tar.gz"
+  local url="https://github.com/$TEMPS_RELEASE_REPO/releases/download/$version/temps-$target.tar.gz"
   curl --fail --location --progress-bar --output "$exe.tar.gz" "$url" || \
     fatal "Failed to download Temps from $url"
   tar -xzf "$exe.tar.gz" -C "$bin_dir" || fatal "Failed to extract Temps binary"
   chmod +x "$exe"
   rm -f "$exe.tar.gz"
   success "Temps $version installed to ${DIM}$bin_dir${RESET}"
+}
+
+ensure_temps_binary() {
+  local temps_bin=""
+
+  if [[ -f "$HOME_DIR/.temps/bin/temps" ]]; then
+    temps_bin="$HOME_DIR/.temps/bin/temps"
+  elif check_command temps; then
+    temps_bin="$(command -v temps)"
+  fi
+
+  if [[ -n "$temps_bin" ]] && "$temps_bin" --version >/dev/null 2>&1; then
+    success "Temps binary already installed"
+    return 0
+  fi
+
+  if [[ -n "$temps_bin" ]]; then
+    warn "Existing Temps binary is not runnable on this host; reinstalling"
+  else
+    info "Installing Temps binary..."
+  fi
+
+  echo ""
+  install_temps_binary
+  echo ""
+
+  export PATH="$HOME_DIR/.temps/bin:$PATH"
+  $SUDO ln -sf "$HOME_DIR/.temps/bin/temps" /usr/local/bin/temps 2>/dev/null || true
 }
 
 # Ensure GeoLite2-City.mmdb is reachable by `temps serve`.
@@ -1383,17 +1441,7 @@ ensure_geolite2() {
 step_temps_setup() {
   step_header 4 $TOTAL_STEPS "Temps Platform Setup"
 
-  # Check if temps binary is installed
-  if ! check_command temps && [[ ! -f $HOME_DIR/.temps/bin/temps ]]; then
-    info "Installing Temps binary..."
-    echo ""
-    install_temps_binary
-    echo ""
-
-    # Ensure it's in PATH
-    export PATH="$HOME_DIR/.temps/bin:$PATH"
-    $SUDO ln -sf $HOME_DIR/.temps/bin/temps /usr/local/bin/temps 2>/dev/null || true
-  fi
+  ensure_temps_binary
 
   local temps_bin
   if [[ -f $HOME_DIR/.temps/bin/temps ]]; then
@@ -2573,16 +2621,7 @@ run_quick_flow() {
   step_header 3 $TOTAL_STEPS "Temps Binary & Domain"
 
   # Install the binary on the chosen channel (idempotent)
-  if ! check_command temps && [[ ! -f $HOME_DIR/.temps/bin/temps ]]; then
-    info "Installing Temps binary..."
-    echo ""
-    install_temps_binary
-    echo ""
-    export PATH="$HOME_DIR/.temps/bin:$PATH"
-    $SUDO ln -sf $HOME_DIR/.temps/bin/temps /usr/local/bin/temps 2>/dev/null || true
-  else
-    success "Temps binary already installed"
-  fi
+  ensure_temps_binary
 
   local temps_bin="$HOME_DIR/.temps/bin/temps"
   [[ ! -f "$temps_bin" ]] && temps_bin="$(command -v temps)"

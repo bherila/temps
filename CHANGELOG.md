@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from native Amazon Linux `dnf`/`yum` packages instead of Docker's
   convenience installer, which rejects the `amzn` distribution id before the
   Temps quick-start flow can continue.
+- **Forked release testing on Amazon Linux**: `scripts/deploy.sh` can resolve
+  binary releases from `TEMPS_RELEASE_REPO=owner/repo`, detects Amazon Linux
+  2023 x86_64 hosts as `linux-amd64-amzn2023`, and reinstalls an existing
+  binary if it is present but cannot execute on the current host.
 
 
 ## [0.1.0-beta.34] - 2026-06-17
