@@ -74,6 +74,14 @@ jobs:
       # network this box doesn't provide. Keep this list in sync with the
       # unit-a/unit-b matrix in rust-tests.yml. (temps-captcha-wasm is omitted:
       # it needs a wasm-pack build step we don't run here.)
+      #
+      # temps-screenshots is also excluded: its local_provider tests launch a
+      # real bundled Chromium against live example.com/github.com. Hosted CI
+      # passes because the ubuntu-latest image ships google-chrome system-wide;
+      # this box has no system browser, so headless_chrome auto-downloads one
+      # and the parallel tests race on the binary ("Text file busy") and debug
+      # ports ("no available ports between 8000 and 9000"). It's a live-network
+      # browser integration test, not a unit test — hosted already covers it.
       - name: cargo test (unit crates)
         run: |
           cargo test --no-fail-fast --lib \
@@ -81,7 +89,7 @@ jobs:
             -p temps-monitoring -p temps-kv -p temps-analytics-funnels \
             -p temps-webhooks -p temps-infra -p temps-geo -p temps-environments \
             -p temps-audit -p temps-analytics-performance -p temps-proxy \
-            -p temps-error-tracking -p temps-git -p temps-screenshots \
+            -p temps-error-tracking -p temps-git \
             -p temps-routes -p temps-entities -p temps-cli -p temps-status-page \
             -p temps-import -p temps-queue -p temps-query \
             -p temps-analytics-session-replay -p temps-dns -p temps-email \
