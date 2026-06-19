@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Hosted website memory protection**: New projects and their default `production` environments now seed the hosted-website small resource profile with `memory_limit=512` MB in addition to the existing CPU and memory requests, so Docker enforces a cgroup cap by default on small single-node installations while operators can still raise or clear the limit for standard and dedicated workloads.
+
 ## [0.1.0-beta.46] - 2026-07-12
 
 ### Added

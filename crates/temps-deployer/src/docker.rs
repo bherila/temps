@@ -96,6 +96,30 @@ pub fn dns_with_fallback(primary: Vec<String>) -> Vec<String> {
     merge_dns_with_fallback(primary, &host_default_dns_servers())
 }
 
+const HOSTED_CONTAINER_MEMORY_SAFETY_PERCENT: u64 = 80;
+
+fn memory_admission_error(
+    requested_limit_mb: u64,
+    already_reserved_mb: u64,
+    total_memory_mb: u64,
+) -> Option<String> {
+    if requested_limit_mb == 0 || total_memory_mb == 0 {
+        return None;
+    }
+
+    let safe_capacity_mb =
+        total_memory_mb.saturating_mul(HOSTED_CONTAINER_MEMORY_SAFETY_PERCENT) / 100;
+    let projected_mb = already_reserved_mb.saturating_add(requested_limit_mb);
+    if projected_mb > safe_capacity_mb {
+        Some(format!(
+            "starting this container would reserve {} MB of the host's {} MB safe app-container budget ({} MB total memory, {}% safety cap); lower replicas/memory_limit or explicitly move the workload to dedicated/uncapped capacity",
+            projected_mb, safe_capacity_mb, total_memory_mb, HOSTED_CONTAINER_MEMORY_SAFETY_PERCENT
+        ))
+    } else {
+        None
+    }
+}
+
 pub struct DockerRuntime {
     docker: Arc<Docker>,
     use_buildkit: bool,
@@ -1679,6 +1703,33 @@ impl ContainerDeployer for DockerRuntime {
 
             port_bindings.insert(container_port_key.clone(), Some(vec![host_port_binding]));
             exposed_ports.push(container_port_key);
+        }
+
+        if let Some(memory_limit_mb) = request.resource_limits.memory_limit_mb {
+            let mut sys = System::new_all();
+            sys.refresh_memory();
+            let total_memory_mb = sys.total_memory() / 1024 / 1024;
+            if let Some(reason) = memory_admission_error(memory_limit_mb, 0, total_memory_mb) {
+                return Err(DeployerError::ResourceAllocationFailed(format!(
+                    "Container '{}' exceeds host memory admission limits: {}",
+                    request.container_name, reason
+                )));
+            }
+            debug!(
+                container_name = %request.container_name,
+                memory_limit_mb,
+                total_memory_mb,
+                "Accepted hosted container memory limit against host capacity"
+            );
+        } else if request
+            .labels
+            .get("sh.temps.managed")
+            .is_some_and(|v| v == "true")
+        {
+            warn!(
+                container_name = %request.container_name,
+                "Starting Temps-managed hosted container without a memory limit; this is intended only for explicit dedicated/uncapped workloads"
+            );
         }
 
         // Create host config with log rotation to prevent unbounded disk growth
@@ -3727,5 +3778,16 @@ CMD ["cat", "/hello.txt"]
             }),
         );
         assert!(rt.build_resource_override.is_none());
+    }
+
+    #[test]
+    fn memory_admission_accepts_within_safe_capacity() {
+        assert!(memory_admission_error(512, 1024, 4096).is_none());
+    }
+
+    #[test]
+    fn memory_admission_blocks_above_safe_capacity() {
+        let err = memory_admission_error(3072, 512, 4096).unwrap();
+        assert!(err.contains("safe app-container budget"));
     }
 }
