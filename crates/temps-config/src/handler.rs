@@ -16,8 +16,8 @@ use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiConfigSettings, AppSettings, AuditContext, AuditLogger,
     AuditOperation, ContainerLogSettings, DiskSpaceAlertSettings, LetsEncryptSettings,
-    MetricsStoreKind, RateLimitSettings, RequestMetadata, ScreenshotSettings,
-    SecurityHeadersSettings,
+    MetricsStoreKind, PublicHostnameSettings, PublicHostnameStrategy, RateLimitSettings,
+    RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -80,6 +80,7 @@ pub struct AppSettingsResponse {
     pub external_url: Option<String>,
     pub internal_url: Option<String>,
     pub preview_domain: String,
+    pub public_hostnames: PublicHostnameSettings,
 
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
@@ -239,6 +240,7 @@ impl From<AppSettings> for AppSettingsResponse {
             external_url: settings.external_url,
             internal_url: settings.internal_url,
             preview_domain: settings.preview_domain,
+            public_hostnames: settings.public_hostnames,
             screenshots: settings.screenshots,
             letsencrypt: settings.letsencrypt,
             dns_provider: DnsProviderSettingsMasked {
@@ -350,6 +352,8 @@ impl AppSettingsResponse {
         crate::disk_status::DiskSpaceAlert,
         crate::disk_status::DiskSpaceCheckResult,
         ContainerLogSettings,
+        PublicHostnameSettings,
+        PublicHostnameStrategy,
         DnsProviderSettingsMasked,
         DockerRegistrySettingsMasked,
         AgentSandboxSettingsMasked,
@@ -473,6 +477,21 @@ async fn get_disk_status(
 /// `None`). Kept as a small pure helper so the invariant is unit-testable.
 fn preserve_self_recorded_fields(incoming: &mut AppSettings, current: &AppSettings) {
     incoming.console_version = current.console_version.clone();
+}
+
+fn normalize_public_hostname_templates(settings: &mut AppSettings) {
+    fn normalize_template(template: &mut Option<String>) {
+        if let Some(value) = template.take() {
+            let trimmed = value.trim().to_string();
+            if !trimmed.is_empty() {
+                *template = Some(trimmed);
+            }
+        }
+    }
+
+    normalize_template(&mut settings.public_hostnames.environment_template);
+    normalize_template(&mut settings.public_hostnames.service_template);
+    normalize_template(&mut settings.public_hostnames.deployment_template);
 }
 
 /// Update application settings
@@ -698,6 +717,8 @@ async fn update_settings(
             }
         }
     }
+
+    normalize_public_hostname_templates(&mut settings);
 
     match app_state.config_service.update_settings(settings).await {
         Ok(_) => {
