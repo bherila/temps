@@ -16343,6 +16343,7 @@ export type AppSettingsResponse = {
     multi_node: MultiNodeSettingsMasked;
     preview_domain: string;
     preview_gateway: PreviewGatewaySettingsMasked;
+    public_hostnames: PublicHostnameSettings;
     rate_limiting: RateLimitSettings;
     /**
      * When enabled, Admin-role accounts without MFA enrolled are rejected
@@ -16357,6 +16358,26 @@ export type AppSettingsResponse = {
      */
     setup_complete: boolean;
 };
+
+/**
+ * Operator-configurable templates for generated public hostnames.
+ *
+ * Templates may use `{base_domain}`, `{environment}`, `{service}`,
+ * `{deployment}`, `{project}`, `{app}`, `{branch}`, `{preview_slug}`, and
+ * `{short_hash}`. When `strategy = flat`, all generated labels before
+ * `{base_domain}` are collapsed into a single DNS label.
+ */
+export type PublicHostnameSettings = {
+    deployment_template?: string | null;
+    environment_template?: string | null;
+    service_template?: string | null;
+    strategy?: PublicHostnameStrategy;
+};
+
+/**
+ * Public hostname generation mode for Temps-managed preview routes.
+ */
+export type PublicHostnameStrategy = 'standard' | 'flat';
 
 /**
  * Global AI configuration settings. Controls the default config repo
@@ -16462,6 +16483,7 @@ export type AppSettings = {
     on_demand_tls?: OnDemandTlsSettings;
     preview_domain?: string;
     preview_gateway?: PreviewGatewaySettings;
+    public_hostnames?: PublicHostnameSettings;
     rate_limiting?: RateLimitSettings;
     /**
      * When `true`, any user holding the `Admin` role must have MFA enrolled

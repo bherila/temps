@@ -79,11 +79,7 @@ pub async fn load(platform_config: &Arc<ConfigService>) -> PreviewUrlParts {
                 ("https".to_string(), None)
             };
 
-            let domain = if s.preview_domain.is_empty() {
-                "localho.st".to_string()
-            } else {
-                s.preview_domain.trim_start_matches("*.").to_string()
-            };
+            let domain = s.public_hostnames.base_domain(&s.preview_domain);
 
             let port = port.filter(|p| {
                 !((protocol == "https" && *p == 443) || (protocol == "http" && *p == 80))

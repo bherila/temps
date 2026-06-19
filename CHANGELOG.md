@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0-beta.41] - 2026-07-02
 
 ### CI
+### Added
+- **Configurable public hostname strategy**: platform settings now support
+  `public_hostnames` templates for generated environment, deployment, and
+  public compose-service routes. Operators can switch to the `flat` strategy to
+  keep generated hostnames one label beneath `preview_domain` for proxied
+  wildcard TLS providers such as Cloudflare Universal SSL; labels are sanitized
+  and truncated with stable short-hash suffixes when they exceed DNS limits.
 
 - **changelog:** Skip preview comment on fork PRs
 

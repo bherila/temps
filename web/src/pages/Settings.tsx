@@ -40,8 +40,17 @@ import { toast } from 'sonner'
 
 type SettingsFormData = Pick<
   PlatformSettings,
-  'external_url' | 'internal_url' | 'preview_domain' | 'screenshots'
+  | 'external_url'
+  | 'internal_url'
+  | 'preview_domain'
+  | 'public_hostnames'
+  | 'screenshots'
 >
+
+function optionalTemplate(value: string | null | undefined): string | null {
+  const trimmed = value?.trim() ?? ''
+  return trimmed.length > 0 ? trimmed : null
+}
 
 export function Settings() {
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -61,6 +70,12 @@ export function Settings() {
       external_url: '',
       internal_url: '',
       preview_domain: 'localho.st',
+      public_hostnames: {
+        strategy: 'standard',
+        environment_template: '',
+        service_template: '',
+        deployment_template: '',
+      },
       screenshots: {
         enabled: false,
         provider: 'local',
@@ -70,6 +85,10 @@ export function Settings() {
   })
 
   const screenshots = useWatch({ control, name: 'screenshots' })
+  const hostnameStrategy = useWatch({
+    control,
+    name: 'public_hostnames.strategy',
+  })
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Settings' }])
@@ -83,6 +102,14 @@ export function Settings() {
         external_url: settings.external_url || '',
         internal_url: settings.internal_url || '',
         preview_domain: settings.preview_domain || 'localho.st',
+        public_hostnames: {
+          strategy: settings.public_hostnames?.strategy || 'standard',
+          environment_template:
+            settings.public_hostnames?.environment_template || '',
+          service_template: settings.public_hostnames?.service_template || '',
+          deployment_template:
+            settings.public_hostnames?.deployment_template || '',
+        },
         screenshots: settings.screenshots || {
           enabled: false,
           provider: 'local',
@@ -94,11 +121,39 @@ export function Settings() {
 
   const onSubmit = async (data: SettingsFormData) => {
     try {
-      await updateSettings.mutateAsync(data)
-      reset(data)
+      const normalized: SettingsFormData = {
+        ...data,
+        public_hostnames: {
+          strategy: data.public_hostnames?.strategy || 'standard',
+          environment_template: optionalTemplate(
+            data.public_hostnames?.environment_template
+          ),
+          service_template: optionalTemplate(
+            data.public_hostnames?.service_template
+          ),
+          deployment_template: optionalTemplate(
+            data.public_hostnames?.deployment_template
+          ),
+        },
+      }
+      await updateSettings.mutateAsync(normalized)
+      reset({
+        ...normalized,
+        public_hostnames: {
+          ...normalized.public_hostnames,
+          environment_template:
+            normalized.public_hostnames.environment_template || '',
+          service_template: normalized.public_hostnames.service_template || '',
+          deployment_template:
+            normalized.public_hostnames.deployment_template || '',
+        },
+      })
       toast.success('Settings saved successfully')
     } catch (err: any) {
-      const detail = err?.body?.detail || err?.message || 'Failed to save settings. Please try again.'
+      const detail =
+        err?.body?.detail ||
+        err?.message ||
+        'Failed to save settings. Please try again.'
       toast.error(detail)
     }
   }
@@ -147,11 +202,16 @@ export function Settings() {
                   if (!value) return true // optional
                   const trimmed = value.trim()
                   if (!trimmed) return true
-                  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://'))
+                  if (
+                    !trimmed.startsWith('http://') &&
+                    !trimmed.startsWith('https://')
+                  )
                     return 'Must start with http:// or https://'
                   if (trimmed.includes('#') || trimmed.includes('?'))
                     return 'Must not contain # or ? characters'
-                  try { new URL(trimmed) } catch {
+                  try {
+                    new URL(trimmed)
+                  } catch {
                     return 'Must be a valid URL'
                   }
                   return true
@@ -159,7 +219,9 @@ export function Settings() {
               })}
             />
             {errors.external_url && (
-              <p className="text-sm text-destructive">{errors.external_url.message}</p>
+              <p className="text-sm text-destructive">
+                {errors.external_url.message}
+              </p>
             )}
             <p className="text-sm text-muted-foreground">
               Used for OAuth callbacks, webhooks, and external integrations
@@ -177,11 +239,16 @@ export function Settings() {
                   if (!value) return true // optional — falls back to default
                   const trimmed = value.trim()
                   if (!trimmed) return true
-                  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://'))
+                  if (
+                    !trimmed.startsWith('http://') &&
+                    !trimmed.startsWith('https://')
+                  )
                     return 'Must start with http:// or https://'
                   if (trimmed.includes('#') || trimmed.includes('?'))
                     return 'Must not contain # or ? characters'
-                  try { new URL(trimmed) } catch {
+                  try {
+                    new URL(trimmed)
+                  } catch {
                     return 'Must be a valid URL'
                   }
                   return true
@@ -189,12 +256,17 @@ export function Settings() {
               })}
             />
             {errors.internal_url && (
-              <p className="text-sm text-destructive">{errors.internal_url.message}</p>
+              <p className="text-sm text-destructive">
+                {errors.internal_url.message}
+              </p>
             )}
             <p className="text-sm text-muted-foreground">
               How service containers reach the Temps API from inside the Docker
               network (OTLP metrics ingest, agent callbacks). Leave blank to use{' '}
-              <code className="font-mono text-xs">http://host.docker.internal:&lt;proxy-port&gt;</code>.
+              <code className="font-mono text-xs">
+                http://host.docker.internal:&lt;proxy-port&gt;
+              </code>
+              .
             </p>
           </div>
         </CardContent>
@@ -210,7 +282,7 @@ export function Settings() {
             Configure the domain used for deployment previews
           </CardDescription>
         </CardHeader>
-        <CardContent>
+        <CardContent className="space-y-4">
           <div className="space-y-2">
             <Label htmlFor="preview-domain">Preview Domain</Label>
             <Input
@@ -223,6 +295,60 @@ export function Settings() {
               Deployments will be accessible at subdomain.
               {settings?.preview_domain || 'localho.st'}
             </p>
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="hostname-strategy">Hostname Strategy</Label>
+            <Select
+              value={hostnameStrategy || 'standard'}
+              onValueChange={(value: 'standard' | 'flat') =>
+                setValue('public_hostnames.strategy', value, {
+                  shouldDirty: true,
+                })
+              }
+            >
+              <SelectTrigger id="hostname-strategy">
+                <SelectValue placeholder="Select hostname strategy" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="standard">Standard</SelectItem>
+                <SelectItem value="flat">Flat wildcard</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-sm text-muted-foreground">
+              Flat wildcard keeps generated service hostnames one label under
+              the preview domain for providers such as Cloudflare Universal SSL.
+            </p>
+          </div>
+
+          <div className="grid gap-4 md:grid-cols-3">
+            <div className="space-y-2">
+              <Label htmlFor="environment-template">Environment Template</Label>
+              <Input
+                id="environment-template"
+                type="text"
+                placeholder="{environment}.{base_domain}"
+                {...register('public_hostnames.environment_template')}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="service-template">Service Template</Label>
+              <Input
+                id="service-template"
+                type="text"
+                placeholder="{environment}-{service}.{base_domain}"
+                {...register('public_hostnames.service_template')}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="deployment-template">Deployment Template</Label>
+              <Input
+                id="deployment-template"
+                type="text"
+                placeholder="{deployment}.{base_domain}"
+                {...register('public_hostnames.deployment_template')}
+              />
+            </div>
           </div>
         </CardContent>
       </Card>
@@ -312,8 +438,9 @@ export function Settings() {
             Route Table
           </CardTitle>
           <CardDescription>
-            Manually refresh the proxy route table from the database. Use this if
-            routes appear out of sync after deployments or configuration changes.
+            Manually refresh the proxy route table from the database. Use this
+            if routes appear out of sync after deployments or configuration
+            changes.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -362,7 +489,11 @@ export function Settings() {
             <p className="text-sm text-muted-foreground">
               You have unsaved changes
             </p>
-            <Button type="submit" disabled={isSubmitting} className="w-full sm:w-auto">
+            <Button
+              type="submit"
+              disabled={isSubmitting}
+              className="w-full sm:w-auto"
+            >
               {isSubmitting ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />

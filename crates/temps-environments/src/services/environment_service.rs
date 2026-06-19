@@ -128,8 +128,9 @@ impl EnvironmentService {
             }
         };
 
-        // Use external_url if configured, otherwise fall back to preview_domain
-        let base_domain = settings.preview_domain.clone();
+        let domain = settings
+            .public_hostnames
+            .environment_hostname(&settings.preview_domain, environment_slug);
 
         // Determine protocol - use https if external_url is configured, otherwise http
         let protocol = if settings.external_url.is_some() {
@@ -146,11 +147,8 @@ impl EnvironmentService {
         // host/port (typically 443) and the internal proxy port is irrelevant.
         let port_suffix = self.port_suffix(protocol, settings.external_url.is_some());
 
-        // <scheme>://<slug>.<preview_domain>[:port]
-        format!(
-            "{}://{}.{}{}",
-            protocol, environment_slug, base_domain, port_suffix
-        )
+        // <scheme>://<generated-public-host>[:port]
+        format!("{}://{}{}", protocol, domain, port_suffix)
     }
 
     /// Returns `:<port>` when the proxy listens on a non-default port for the
@@ -178,8 +176,9 @@ impl EnvironmentService {
     /// Compute the full FQDN for an environment (without protocol)
     pub async fn compute_environment_fqdn(&self, environment_slug: &str) -> String {
         let settings = self.config_service.get_settings().await.unwrap_or_default();
-        let base_domain = settings.preview_domain.clone();
-        format!("{}.{}", environment_slug, base_domain)
+        settings
+            .public_hostnames
+            .environment_hostname(&settings.preview_domain, environment_slug)
     }
 
     /// Compute the URL for a user-supplied custom domain (verbatim host).
