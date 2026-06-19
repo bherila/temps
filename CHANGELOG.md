@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wildcard TLS providers such as Cloudflare Universal SSL; labels are sanitized
   and truncated with stable short-hash suffixes when they exceed DNS limits.
 - **Managed S3 backend driver contract**: `temps-providers` now defines a `ManagedS3Backend` protocol for RustFS-compatible and Garage-compatible object-storage lifecycle operations, keeping `rustfs` as the default while requiring `garage` to be managed by an out-of-process provider over `provider_socket` so AGPL storage engines are not compiled into the Temps binary.
+- **Hosted website memory protection**: new projects and their default `production` environments now seed the hosted-website small resource profile with `memory_limit=512` MB (`memory_swap` pinned to the same value so the cap is a real hard limit), admission accounts for memory already reserved by running managed containers against the Docker host's capacity, and `memory_limit` gains an explicit uncapped sentinel (`0`) distinct from "inherit default" so operators can opt dedicated workloads out of the cap.
 
 ### Changed
 - **MariaDB services default to a small-host profile**: new managed MariaDB
