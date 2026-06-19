@@ -44,19 +44,23 @@ jobs:
       - name: Toolchain info
         run: cargo --version && rustc --version
 
-      # The example plugins embed their web UI via `include_dir!(".../web/dist")`,
-      # and their build.rs writes that dir into the (gitignored) source tree —
-      # but only when it actually runs. With a persistent CARGO_TARGET_DIR the
-      # build-script fingerprint is cached, so after actions/checkout's
-      # `git clean -ffdx` wipes web/dist the script is skipped and the macro
-      # panics on a missing dir. Recreate the same debug placeholder up front so
-      # `cargo check --all-targets` is independent of build-script cache state.
-      - name: Prepare example plugin web assets
+      # Several crates embed a built web UI via `include_dir!(".../dist")`
+      # (temps-cli and the example plugins). Their build.rs writes that dir into
+      # the (gitignored) source tree, but only when it actually runs — and with
+      # a persistent CARGO_TARGET_DIR the build-script fingerprint is cached, so
+      # after actions/checkout's `git clean -ffdx` wipes the dirs the scripts are
+      # skipped and the macro panics on a missing dir. Recreate the same debug
+      # placeholders up front so `cargo check --all-targets` is independent of
+      # build-script cache state. Keep this list in sync with `include_dir!`
+      # call sites: `git grep -n 'include_dir!' -- '*.rs'`.
+      - name: Prepare embedded web assets
         run: |
-          for web in examples/*/web; do
-            mkdir -p "$web/dist"
-            [ -f "$web/dist/index.html" ] || \
-              printf '<!doctype html><title>placeholder</title>\n' > "$web/dist/index.html"
+          dist_dirs="crates/temps-cli/dist"
+          for web in examples/*/web; do dist_dirs="$dist_dirs $web/dist"; done
+          for d in $dist_dirs; do
+            mkdir -p "$d"
+            [ -f "$d/index.html" ] || \
+              printf '<!doctype html><title>placeholder</title>\n' > "$d/index.html"
           done
 
       - name: cargo check
