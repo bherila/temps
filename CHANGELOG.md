@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **Hosted website memory protection**: new projects and their default `production` environments now seed the hosted-website small resource profile with `memory_limit=512` MB in addition to the existing CPU/memory requests, so Docker enforces a cgroup cap by default on small single-node installs while operators can still raise or clear the limit for standard/dedicated workloads.
 
 ### Changed
 -
