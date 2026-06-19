@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supported in the query explorer, existing MariaDB/MySQL-compatible containers
   can be imported as MariaDB services, and full logical backup/restore uses
   `mariadb-dump` with `mysqldump` fallback for non-system databases.
+- **Configurable public hostname strategy**: platform settings now support
+  `public_hostnames` templates for generated environment, deployment, and
+  public compose-service routes. Operators can switch to the `flat` strategy to
+  keep generated hostnames one label beneath `preview_domain` for proxied
+  wildcard TLS providers such as Cloudflare Universal SSL; labels are sanitized
+  and truncated with stable short-hash suffixes when they exceed DNS limits.
 
 ### Changed
 - **MariaDB services default to a small-host profile**: new managed MariaDB
