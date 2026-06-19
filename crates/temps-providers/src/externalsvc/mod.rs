@@ -6,6 +6,7 @@ use utoipa::ToSchema;
 
 pub mod cluster_role;
 pub mod exec_util;
+pub mod managed_s3;
 pub mod mongodb;
 pub mod port_util;
 pub mod postgres;
@@ -34,6 +35,7 @@ pub(crate) static DEPLOYMENT_MODE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex
 
 // Re-export services for easier access
 pub use cluster_role::{ClusterRole, PgAutoFailoverState};
+pub use managed_s3::{ManagedS3Backend, ManagedS3BackendKind, ManagedS3BackendSelection};
 pub use mongodb::MongodbService;
 pub use postgres::PostgresService;
 pub use postgres_cluster::PostgresClusterService;
