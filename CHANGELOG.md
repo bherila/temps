@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Amazon Linux Docker bootstrap**: `scripts/deploy.sh` now installs Docker
+  from native Amazon Linux `dnf`/`yum` packages instead of Docker's
+  convenience installer, which rejects the `amzn` distribution id before the
+  Temps quick-start flow can continue.
 
 
 ## [0.1.0-beta.34] - 2026-06-17
