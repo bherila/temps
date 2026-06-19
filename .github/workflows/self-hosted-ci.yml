@@ -44,6 +44,21 @@ jobs:
       - name: Toolchain info
         run: cargo --version && rustc --version
 
+      # The example plugins embed their web UI via `include_dir!(".../web/dist")`,
+      # and their build.rs writes that dir into the (gitignored) source tree —
+      # but only when it actually runs. With a persistent CARGO_TARGET_DIR the
+      # build-script fingerprint is cached, so after actions/checkout's
+      # `git clean -ffdx` wipes web/dist the script is skipped and the macro
+      # panics on a missing dir. Recreate the same debug placeholder up front so
+      # `cargo check --all-targets` is independent of build-script cache state.
+      - name: Prepare example plugin web assets
+        run: |
+          for web in examples/*/web; do
+            mkdir -p "$web/dist"
+            [ -f "$web/dist/index.html" ] || \
+              printf '<!doctype html><title>placeholder</title>\n' > "$web/dist/index.html"
+          done
+
       - name: cargo check
         run: cargo check --workspace --all-targets
 
