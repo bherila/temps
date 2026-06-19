@@ -885,6 +885,96 @@ impl DockerRuntime {
         }
     }
 
+    /// Total memory of the Docker *host* in MB.
+    ///
+    /// In containerized control-plane installs (`temps serve` talking to the
+    /// host Docker daemon over the socket) `sysinfo` reports the memory visible
+    /// to this process — i.e. the control-plane container's cgroup limit — not
+    /// the host that will actually run app containers. Admission must size
+    /// against the host, so prefer the daemon's `MemTotal` from `docker info`
+    /// and only fall back to the process view if the daemon doesn't report it.
+    async fn host_total_memory_mb(&self) -> u64 {
+        match self.docker.info().await {
+            Ok(info) => match info.mem_total {
+                Some(mem_total) if mem_total > 0 => return (mem_total as u64) / 1024 / 1024,
+                _ => warn!(
+                    "Docker info did not report MemTotal; falling back to process memory view for memory admission"
+                ),
+            },
+            Err(e) => warn!(
+                "Failed to query Docker info for host memory ({}); falling back to process memory view for memory admission",
+                e
+            ),
+        }
+
+        let mut sys = System::new_all();
+        sys.refresh_memory();
+        sys.total_memory() / 1024 / 1024
+    }
+
+    /// Sum of memory limits (MB) already reserved by running Temps-managed
+    /// containers on this host.
+    ///
+    /// Admission must consider aggregate reservations, not just the single
+    /// incoming container: the deploy loop calls `deploy_container` once per
+    /// replica, and earlier replicas of the same rollout are already created
+    /// (with their `HostConfig.Memory` set) by the time later replicas are
+    /// admitted, so enumerating running managed containers naturally counts
+    /// them. Containers without a memory limit contribute 0 — we cannot
+    /// attribute a bounded reservation to an uncapped container here.
+    async fn reserved_managed_memory_mb(&self) -> u64 {
+        let containers = match self
+            .docker
+            .list_containers(Some(ListContainersOptions {
+                all: false, // running containers only
+                ..Default::default()
+            }))
+            .await
+        {
+            Ok(containers) => containers,
+            Err(e) => {
+                warn!(
+                    "Failed to list containers for memory admission ({}); treating reserved memory as 0 MB",
+                    e
+                );
+                return 0;
+            }
+        };
+
+        let mut reserved_mb = 0u64;
+        for container in containers {
+            let is_managed = container
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("sh.temps.managed"))
+                .is_some_and(|value| value == "true");
+            if !is_managed {
+                continue;
+            }
+            let Some(id) = container.id else {
+                continue;
+            };
+            match self
+                .docker
+                .inspect_container(&id, None::<InspectContainerOptions>)
+                .await
+            {
+                Ok(details) => {
+                    if let Some(mem) = details.host_config.and_then(|hc| hc.memory) {
+                        if mem > 0 {
+                            reserved_mb = reserved_mb.saturating_add((mem as u64) / 1024 / 1024);
+                        }
+                    }
+                }
+                Err(e) => warn!(
+                    "Failed to inspect container {} for memory admission ({}); excluding from reserved total",
+                    id, e
+                ),
+            }
+        }
+        reserved_mb
+    }
+
     /// Find a container by its name
     /// Returns the container ID if found, or None if not found
     async fn find_container_by_name(
@@ -1705,11 +1795,19 @@ impl ContainerDeployer for DockerRuntime {
             exposed_ports.push(container_port_key);
         }
 
-        if let Some(memory_limit_mb) = request.resource_limits.memory_limit_mb {
-            let mut sys = System::new_all();
-            sys.refresh_memory();
-            let total_memory_mb = sys.total_memory() / 1024 / 1024;
-            if let Some(reason) = memory_admission_error(memory_limit_mb, 0, total_memory_mb) {
+        // A memory limit of 0 is the explicit "uncapped" sentinel from the
+        // config layer; treat it the same as no limit here (skip admission and
+        // leave Docker's memory cap unset below).
+        if let Some(memory_limit_mb) = request
+            .resource_limits
+            .memory_limit_mb
+            .filter(|&mb| mb > 0)
+        {
+            let total_memory_mb = self.host_total_memory_mb().await;
+            let already_reserved_mb = self.reserved_managed_memory_mb().await;
+            if let Some(reason) =
+                memory_admission_error(memory_limit_mb, already_reserved_mb, total_memory_mb)
+            {
                 return Err(DeployerError::ResourceAllocationFailed(format!(
                     "Container '{}' exceeds host memory admission limits: {}",
                     request.container_name, reason
@@ -1718,6 +1816,7 @@ impl ContainerDeployer for DockerRuntime {
             debug!(
                 container_name = %request.container_name,
                 memory_limit_mb,
+                already_reserved_mb,
                 total_memory_mb,
                 "Accepted hosted container memory limit against host capacity"
             );
@@ -1782,9 +1881,22 @@ impl ContainerDeployer for DockerRuntime {
                 name: Some(Self::map_restart_policy(&request.restart_policy)),
                 ..Default::default()
             }),
+            // A limit of 0 is the explicit "uncapped" sentinel → leave Docker's
+            // memory cap unset (None) so the container runs unlimited.
             memory: request
                 .resource_limits
                 .memory_limit_mb
+                .filter(|&mb| mb > 0)
+                .map(|mb| mb as i64 * 1024 * 1024),
+            // Cap swap at the memory limit so the advertised hard cap is real.
+            // Docker lets a container use swap up to its memory limit when
+            // memory_swap is left unset, which would let a "512 MB" app reach
+            // ~1 GiB of memory+swap and undercount against the admission budget.
+            // Setting memory_swap == memory disables swap for the container.
+            memory_swap: request
+                .resource_limits
+                .memory_limit_mb
+                .filter(|&mb| mb > 0)
                 .map(|mb| mb as i64 * 1024 * 1024),
             nano_cpus: request
                 .resource_limits
@@ -3766,6 +3878,17 @@ CMD ["cat", "/hello.txt"]
     #[test]
     fn memory_admission_blocks_above_safe_capacity() {
         let err = memory_admission_error(3072, 512, 4096).unwrap();
+        assert!(err.contains("safe app-container budget"));
+    }
+
+    #[test]
+    fn memory_admission_blocks_aggregate_replica_overcommit() {
+        // Seven 512 MB replicas on a 4 GB host: the first six (3072 MB) fit
+        // under the 3276 MB budget individually, but the seventh pushes the
+        // projected total to 3584 MB and must be rejected. Without counting
+        // already-reserved memory each replica passes in isolation.
+        assert!(memory_admission_error(512, 2560, 4096).is_none());
+        let err = memory_admission_error(512, 3072, 4096).unwrap();
         assert!(err.contains("safe app-container budget"));
     }
 }
