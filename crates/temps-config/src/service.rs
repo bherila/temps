@@ -316,9 +316,6 @@ impl ServerConfig {
     }
 }
 
-// Default domain for local development (resolves to 127.0.0.1)
-pub const DEFAULT_LOCAL_DOMAIN: &str = "localho.st";
-
 /// Service that provides centralized access to configuration paths and settings
 /// Handles path resolution, persistent settings, and ensures consistency across the application
 pub struct ConfigService {
@@ -697,7 +694,7 @@ impl ConfigService {
     }
 
     /// Get the full deployment URL for a given deployment slug
-    /// Always returns [protocol]://{slug}.{preview_domain}
+    /// using the configured public hostname strategy.
     /// Get the deployment URL by deployment ID
     pub async fn get_deployment_url(
         &self,
@@ -739,28 +736,22 @@ impl ConfigService {
             ("https".to_string(), None)
         };
 
-        // Use preview_domain if set, otherwise fallback to DEFAULT_LOCAL_DOMAIN
-        let preview_domain = if !settings.preview_domain.is_empty() {
-            settings.preview_domain.trim_start_matches("*.").to_string()
-        } else {
-            DEFAULT_LOCAL_DOMAIN.to_string()
-        };
+        let hostname = settings
+            .public_hostnames
+            .deployment_hostname(&settings.preview_domain, deployment_slug);
 
-        // Construct the URL as [protocol]://{slug}.{preview_domain}[:port]
+        // Construct the URL as [protocol]://{host}[:port]
         // Only include port if it's non-standard (not 443 for https, not 80 for http)
         let url = if let Some(port) = port {
             let is_standard_port =
                 (protocol == "https" && port == 443) || (protocol == "http" && port == 80);
             if is_standard_port {
-                format!("{}://{}.{}", protocol, deployment_slug, preview_domain)
+                format!("{}://{}", protocol, hostname)
             } else {
-                format!(
-                    "{}://{}.{}:{}",
-                    protocol, deployment_slug, preview_domain, port
-                )
+                format!("{}://{}:{}", protocol, hostname, port)
             }
         } else {
-            format!("{}://{}.{}", protocol, deployment_slug, preview_domain)
+            format!("{}://{}", protocol, hostname)
         };
 
         Ok(url)
