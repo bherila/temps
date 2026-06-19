@@ -1,0 +1,51 @@
+name: Self-hosted CI (tempsdev1)
+
+# SAFETY: this workflow runs on the self-hosted EC2 runner, so it MUST NOT be
+# reachable by untrusted code. It triggers ONLY on pushes to branches in this
+# repo (strangers cannot push to your fork) and on manual dispatch. There is
+# deliberately no `pull_request` trigger here — fork PR CI runs on isolated
+# GitHub-hosted runners via rust-tests.yml instead. Never add `pull_request`
+# or `pull_request_target` to a self-hosted job.
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+      - 'fix/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per branch; newer pushes cancel older queued runs so the single
+# runner doesn't pile up.
+concurrency:
+  group: self-hosted-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      # Persistent local build cache. CARGO_TARGET_DIR is pinned OUTSIDE the
+      # runner's _work dir so actions/checkout's `git clean -ffdx` never wipes
+      # it. CARGO_HOME is left at its default (~/.cargo) so the runner reuses
+      # the box's already-warm registry instead of re-downloading crates.
+      # This is plain local disk, not subject to the 10 GB Actions cache limit.
+      - name: Configure persistent cargo target dir
+        run: echo "CARGO_TARGET_DIR=$HOME/.cache/temps-ci/target" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      # No toolchain step: the box uses the system Rust (Amazon Linux package,
+      # /usr/bin/cargo, currently 1.95.0 — already >= the 1.91 the AWS crates
+      # need). There is no rustup on this host, so dtolnay/rust-toolchain would
+      # not work here.
+      - name: Toolchain info
+        run: cargo --version && rustc --version
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+
+      - name: cargo test
+        run: cargo test --lib --workspace
