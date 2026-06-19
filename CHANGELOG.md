@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keep generated hostnames one label beneath `preview_domain` for proxied
   wildcard TLS providers such as Cloudflare Universal SSL; labels are sanitized
   and truncated with stable short-hash suffixes when they exceed DNS limits.
+- **Managed S3 backend driver contract**: `temps-providers` now defines a `ManagedS3Backend` protocol for RustFS-compatible and Garage-compatible object-storage lifecycle operations, keeping `rustfs` as the default while requiring `garage` to be managed by an out-of-process provider over `provider_socket` so AGPL storage engines are not compiled into the Temps binary.
 
 ### Changed
 - **MariaDB services default to a small-host profile**: new managed MariaDB
