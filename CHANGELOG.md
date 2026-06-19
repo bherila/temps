@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **Managed S3 backend driver contract**: `temps-providers` now defines a `ManagedS3Backend` protocol for RustFS-compatible and Garage-compatible object-storage lifecycle operations, keeping `rustfs` as the default while requiring `garage` to be managed by an out-of-process provider over `provider_socket` so AGPL storage engines are not compiled into the Temps binary.
 
 ### Changed
 -
