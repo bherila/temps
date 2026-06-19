@@ -759,6 +759,26 @@ export type ApiKeyResponse = {
 };
 
 /**
+ * Operator-configurable templates for generated public hostnames.
+ *
+ * Templates may use `{base_domain}`, `{environment}`, `{service}`,
+ * `{deployment}`, `{project}`, `{app}`, `{branch}`, `{preview_slug}`, and
+ * `{short_hash}`. When `strategy = flat`, all generated labels before
+ * `{base_domain}` are collapsed into a single DNS label.
+ */
+export type PublicHostnameSettings = {
+    deployment_template?: string | null;
+    environment_template?: string | null;
+    service_template?: string | null;
+    strategy?: PublicHostnameStrategy;
+};
+
+/**
+ * Public hostname generation mode for Temps-managed preview routes.
+ */
+export type PublicHostnameStrategy = 'standard' | 'flat';
+
+/**
  * Application settings stored in the database
  * All fields have sensible defaults for easy onboarding
  */
@@ -816,6 +836,7 @@ export type AppSettings = {
     multi_node?: MultiNodeSettings;
     preview_domain?: string;
     preview_gateway?: PreviewGatewaySettings;
+    public_hostnames?: PublicHostnameSettings;
     rate_limiting?: RateLimitSettings;
     screenshots?: ScreenshotSettings;
     security_headers?: SecurityHeadersSettings;
@@ -856,6 +877,7 @@ export type AppSettingsResponse = {
     multi_node: MultiNodeSettingsMasked;
     preview_domain: string;
     preview_gateway: PreviewGatewaySettingsMasked;
+    public_hostnames: PublicHostnameSettings;
     rate_limiting: RateLimitSettings;
     screenshots: ScreenshotSettings;
     security_headers: SecurityHeadersSettings;
