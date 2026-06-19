@@ -1669,10 +1669,7 @@ impl ContainerDeployer for DockerRuntime {
         // A memory limit of 0 is the explicit "uncapped" sentinel from the
         // config layer; treat it the same as no limit here (skip admission and
         // leave Docker's memory cap unset below).
-        if let Some(memory_limit_mb) = request
-            .resource_limits
-            .memory_limit_mb
-            .filter(|&mb| mb > 0)
+        if let Some(memory_limit_mb) = request.resource_limits.memory_limit_mb.filter(|&mb| mb > 0)
         {
             let total_memory_mb = self.host_total_memory_mb().await;
             let already_reserved_mb = self.reserved_managed_memory_mb().await;
