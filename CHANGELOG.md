@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binary releases from `TEMPS_RELEASE_REPO=owner/repo`, detects Amazon Linux
   2023 x86_64 hosts as `linux-amd64-amzn2023`, and reinstalls an existing
   binary if it is present but cannot execute on the current host.
+- **Existing database reruns on port 5432**: `scripts/deploy.sh` no longer
+  exits during TimescaleDB recovery when an existing container uses the default
+  `5432` host port.
 
 
 ## [0.1.0-beta.34] - 2026-06-17

@@ -737,7 +737,9 @@ recover_db_port() {
   fi
   [[ -z "$DB_PORT" ]] && DB_PORT="5432"
   state_set db_port "$DB_PORT"
-  [[ "$DB_PORT" != "5432" ]] && info "Database port: ${BOLD}${DB_PORT}${RESET}"
+  if [[ "$DB_PORT" != "5432" ]]; then
+    info "Database port: ${BOLD}${DB_PORT}${RESET}"
+  fi
 }
 
 step_timescaledb() {
