@@ -1,22 +1,20 @@
 import {
   addManagedDomain,
+  applyHostnameMode,
   deleteDnsProvider as deleteProvider,
   getDnsProvider as getProvider,
   listManagedDomains,
   listProviderZones,
+  previewHostnameMode,
   removeManagedDomain,
   testProviderConnection,
+  updateManagedDomain,
   updateProvider,
   verifyManagedDomain,
   type HostnamePreviewResponse,
   type ManagedDomainResponse,
   type UpdateDnsProviderRequest,
 } from '@/api/client'
-import {
-  applyHostnameMode,
-  previewHostnameMode,
-  updateManagedDomainSettings,
-} from '@/api/managedDomains'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
   AlertDialog,
@@ -300,12 +298,17 @@ export default function DnsProviderDetail() {
   } | null>(null)
 
   const previewModeMut = useMutation({
-    mutationFn: (vars: {
+    mutationFn: async (vars: {
       domain: string
       target: 'standard' | 'flat'
       syncDns: boolean
-    }) =>
-      previewHostnameMode(providerId, vars.domain, vars.target, vars.syncDns),
+    }) => {
+      const res = await previewHostnameMode({
+        path: { provider_id: providerId, domain: vars.domain },
+        query: { mode: vars.target, sync: vars.syncDns },
+      })
+      return res.data as HostnamePreviewResponse
+    },
     onSuccess: (result, vars) => {
       setHostnamePreview({ ...vars, result })
     },
@@ -321,7 +324,11 @@ export default function DnsProviderDetail() {
       domain: string
       target: 'standard' | 'flat'
       syncDns: boolean
-    }) => applyHostnameMode(providerId, vars.domain, vars.target, vars.syncDns),
+    }) =>
+      applyHostnameMode({
+        path: { provider_id: providerId, domain: vars.domain },
+        body: { mode: vars.target, sync_dns: vars.syncDns },
+      }),
     onSuccess: () => {
       toast.success('Hostname mode applied')
       setHostnamePreview(null)
@@ -336,8 +343,9 @@ export default function DnsProviderDetail() {
 
   const syncToggleMut = useMutation({
     mutationFn: (vars: { domain: string; enabled: boolean }) =>
-      updateManagedDomainSettings(providerId, vars.domain, {
-        sync_generated_records: vars.enabled,
+      updateManagedDomain({
+        path: { provider_id: providerId, domain: vars.domain },
+        body: { sync_generated_records: vars.enabled },
       }),
     onSuccess: () => {
       refetchDomains()

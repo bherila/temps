@@ -216,6 +216,14 @@ export type AddEventsResponse = {
 export type AddManagedDomainApiRequest = {
     auto_manage?: boolean;
     domain: string;
+    /**
+     * Generated hostname layout: `"standard"` (default) or `"flat"`.
+     */
+    generated_hostname_mode?: string | null;
+    /**
+     * Opt in to reconciling generated hostnames into this domain's DNS zone.
+     */
+    sync_generated_records?: boolean;
 };
 
 export type AdminGateResponse = {
@@ -759,12 +767,6 @@ export type ApiKeyResponse = {
 };
 
 /**
- * Public hostname generation mode for Temps-managed preview routes.
- * Stored per managed domain (`generated_hostname_mode`), not globally.
- */
-export type PublicHostnameStrategy = 'standard' | 'flat';
-
-/**
  * Application settings stored in the database
  * All fields have sensible defaults for easy onboarding
  */
@@ -795,6 +797,13 @@ export type AppSettings = {
     disk_space_alert?: DiskSpaceAlertSettings;
     dns_provider?: DnsProviderSettings;
     docker_registry?: DockerRegistrySettings;
+    /**
+     * Public edge target that generated DNS records point at when a managed
+     * domain opts into automatic record sync. An IPv4/IPv6 address produces an
+     * `A`/`AAAA` record; anything else is treated as a `CNAME` target. `None`
+     * disables DNS record sync regardless of per-domain opt-in.
+     */
+    edge_target?: string | null;
     external_url?: string | null;
     /**
      * Skip TLS certificate verification on outbound HTTP clients built by the
@@ -820,7 +829,7 @@ export type AppSettings = {
      */
     monitoring?: MonitoringSettings;
     multi_node?: MultiNodeSettings;
-    edge_target?: string | null;
+    on_demand_tls?: OnDemandTlsSettings;
     preview_domain?: string;
     preview_gateway?: PreviewGatewaySettings;
     rate_limiting?: RateLimitSettings;
@@ -846,6 +855,10 @@ export type AppSettingsResponse = {
     dns_provider: DnsProviderSettingsMasked;
     docker_registry: DockerRegistrySettingsMasked;
     /**
+     * Public edge target that synced DNS records point at (IP → A/AAAA, else CNAME).
+     */
+    edge_target?: string | null;
+    /**
      * The storage backend the runtime is **actually** using for metrics,
      * after reconciling the `monitoring.store` toggle with the server's
      * `TEMPS_CLICKHOUSE_*` configuration. When `monitoring.store` is
@@ -861,7 +874,6 @@ export type AppSettingsResponse = {
     letsencrypt: LetsEncryptSettings;
     monitoring: MonitoringSettingsMasked;
     multi_node: MultiNodeSettingsMasked;
-    edge_target?: string | null;
     preview_domain: string;
     preview_gateway: PreviewGatewaySettingsMasked;
     rate_limiting: RateLimitSettings;
@@ -872,6 +884,20 @@ export type AppSettingsResponse = {
      * wizard checks this field on load and skips itself when true.
      */
     setup_complete: boolean;
+};
+
+/**
+ * Request to apply a hostname mode (recompute + optional DNS sync).
+ */
+export type ApplyHostnameModeRequest = {
+    /**
+     * Target mode to apply: `"standard"` or `"flat"`.
+     */
+    mode: string;
+    /**
+     * Also reconcile the provider's DNS zone for the affected hostnames.
+     */
+    sync_dns?: boolean;
 };
 
 export type ArchiveMode = 'off' | 'on' | 'always' | 'unknown';
@@ -1385,6 +1411,26 @@ export type CancelBackupResponse = {
      * idempotent.
      */
     cancelled: number;
+};
+
+/**
+ * Current on-demand cert status for a single hostname (ADR-018 §5). Backs
+ * `GET /domains/by-host/{hostname}/cert-status`.
+ */
+export type CertStatusResponse = {
+    /**
+     * On-demand negative-cache deadline (epoch millis), when in backoff.
+     */
+    backoff_until?: number | null;
+    /**
+     * SNI hostname.
+     */
+    hostname: string;
+    last_attempt?: null | OnDemandCertAttemptResponse;
+    /**
+     * Current cert lifecycle status from the `domains` row, when one exists.
+     */
+    status?: string | null;
 };
 
 /**
@@ -3282,6 +3328,13 @@ export type DeployFromImageRequest = {
      */
     external_image_id?: number | null;
     /**
+     * Optional HTTP health-check path override (e.g. "/api/healthz").
+     * Image deploys can't read `.temps.yaml`, so this sets the path the deployer
+     * probes after the container starts and the path the environment's uptime
+     * monitor checks. Must start with '/'. When omitted, defaults to "/".
+     */
+    health_check_path?: string | null;
+    /**
      * Docker image reference (e.g., "ghcr.io/org/app:v1.0")
      * Required if external_image_id is not provided
      */
@@ -3297,6 +3350,11 @@ export type DeployFromImageRequest = {
  */
 export type DeployFromImageUploadQuery = {
     /**
+     * Optional HTTP health-check path override (e.g. "/api/healthz").
+     * Must start with '/'. When omitted, defaults to "/".
+     */
+    health_check_path?: string | null;
+    /**
      * Tag to apply to the imported image (e.g., "myapp:v1.0")
      * If not provided, a unique tag will be generated
      */
@@ -3304,6 +3362,13 @@ export type DeployFromImageUploadQuery = {
 };
 
 export type DeployFromStaticRequest = {
+    /**
+     * Optional HTTP health-check path override (e.g. "/api/healthz").
+     * Static deploys can't read `.temps.yaml`, so this sets the path the deployer
+     * probes after the container starts and the path the environment's uptime
+     * monitor checks. Must start with '/'. When omitted, defaults to "/".
+     */
+    health_check_path?: string | null;
     /**
      * Optional deployment metadata
      */
@@ -3361,7 +3426,17 @@ export type DeploymentConfig = {
      */
     idleTimeoutSeconds?: number;
     /**
-     * Memory limit in megabytes (e.g., 512 = 512MB)
+     * Memory limit in megabytes. Three-state semantics:
+     * - `None`     → inherit the parent layer (env inherits project, project
+     * inherits the seeded default); used by the settings UI's "Use default".
+     * - `Some(0)`  → explicit **uncapped**: stop inheriting and run with no
+     * memory limit. This is the deliberate escape hatch for dedicated
+     * workloads, distinct from `None`.
+     * - `Some(n)`  → hard cap of `n` MB.
+     *
+     * `merge`/resolution keep `Some(0)` as a present value (it wins precedence
+     * over a parent cap), and the deployer collapses it to "no limit" before
+     * talking to Docker.
      */
     memoryLimit?: number | null;
     /**
@@ -3635,6 +3710,13 @@ export type DeploymentMetadata = {
      */
     fileCount?: number | null;
     gitPushEvent?: null | GitPushEvent;
+    /**
+     * Explicit deploy-time HTTP health-check path override.
+     * Image/static deploys can't read `.temps.yaml`, so this lets the deploy
+     * request set a custom path (e.g. "/api/healthz"). When present it takes
+     * priority over any `.temps.yaml` `health.path` value. Always starts with '/'.
+     */
+    healthCheckPath?: string | null;
     /**
      * Total size of the built image in bytes
      */
@@ -4117,6 +4199,22 @@ export type DnsRecord = {
 };
 
 /**
+ * A single DNS record change the Cloudflare sync would make.
+ */
+export type DnsRecordChange = {
+    /**
+     * `"create"`, `"update"`, or `"delete"`.
+     */
+    action: string;
+    name: string;
+    /**
+     * Record type, e.g. `"A"` or `"CNAME"`.
+     */
+    record_type: string;
+    value: string;
+};
+
+/**
  * DNS record content - varies by record type
  */
 export type DnsRecordContent = {
@@ -4390,6 +4488,12 @@ export type DomainResponse = {
     last_error?: string | null;
     last_error_type?: string | null;
     last_renewed?: number | null;
+    /**
+     * On-demand TLS negative-cache deadline (epoch millis), when this hostname's
+     * on-demand HTTP-01 issuance is in backoff after a failure (ADR-018 §4).
+     * `None` means no active backoff.
+     */
+    on_demand_backoff_until?: number | null;
     status: string;
     updated_at: number;
     verification_method: string;
@@ -6631,6 +6735,35 @@ export type HierarchyLevel = {
     name: string;
 };
 
+/**
+ * A single generated-hostname change in a flatten preview/apply.
+ */
+export type HostnameChange = {
+    /**
+     * Row id of the affected record.
+     */
+    id: number;
+    /**
+     * `"deployment"` or `"environment"`.
+     */
+    kind: string;
+    new: string;
+    old: string;
+};
+
+/**
+ * Combined preview of a hostname-mode change.
+ */
+export type HostnamePreviewResponse = {
+    dns_changes: Array<DnsRecordChange>;
+    hostname_changes: Array<HostnameChange>;
+    total: number;
+    /**
+     * Whether the provider token can manage this zone (None if not checked).
+     */
+    zone_access_ok?: boolean | null;
+};
+
 export type HourlyPageSessions = {
     avg_duration_seconds: number;
     event_count: number;
@@ -7495,6 +7628,17 @@ export type ListMcpsResponse = {
     total: number;
 };
 
+/**
+ * Paginated list of on-demand cert attempts (ADR-018 §5 console "Certificates"
+ * surface). Joined with current `domains.status`, newest first.
+ */
+export type ListOnDemandCertsResponse = {
+    certs: Array<OnDemandCertRow>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
 export type ListOrdersResponse = {
     orders: Array<AcmeOrderResponse>;
 };
@@ -7722,7 +7866,7 @@ export type ManagedDomainResponse = {
     created_at: string;
     domain: string;
     /**
-     * Generated hostname layout: "standard" or "flat".
+     * Generated hostname layout: `"standard"` or `"flat"`.
      */
     generated_hostname_mode: string;
     id: number;
@@ -7736,41 +7880,14 @@ export type ManagedDomainResponse = {
     verified: boolean;
     verified_at?: string | null;
     /**
-     * Last token zone-access check result (null if unchecked).
+     * Detail for a failed zone-access check.
+     */
+    zone_access_error?: string | null;
+    /**
+     * Last token zone-access check: `Some(true)`/`Some(false)`/`None` (unchecked).
      */
     zone_access_ok?: boolean | null;
-    zone_access_error?: string | null;
     zone_id?: string | null;
-};
-
-/**
- * A single generated-hostname change in a flatten preview/apply.
- */
-export type HostnameChange = {
-    kind: string;
-    id: number;
-    old: string;
-    new: string;
-};
-
-/**
- * A single DNS record change the sync would make.
- */
-export type DnsRecordChange = {
-    action: string;
-    name: string;
-    record_type: string;
-    value: string;
-};
-
-/**
- * Combined preview of a hostname-mode change.
- */
-export type HostnamePreviewResponse = {
-    hostname_changes: Array<HostnameChange>;
-    dns_changes: Array<DnsRecordChange>;
-    zone_access_ok?: boolean | null;
-    total: number;
 };
 
 /**
@@ -8531,6 +8648,136 @@ export type OidcRoleMappingResponse = {
 export type OidcTestConnectionResponse = {
     message: string;
     success: boolean;
+};
+
+/**
+ * A single on-demand HTTP-01 issuance attempt from the append-only
+ * `on_demand_cert_attempts` audit log. Carries the full forensic detail for one
+ * attempt; the current cert state lives on the enclosing row's domain fields.
+ *
+ * Contains no private-key or certificate material — only audit metadata — so it
+ * is safe to return without masking.
+ */
+export type OnDemandCertAttemptResponse = {
+    /**
+     * Did we reach the Let's Encrypt API?
+     */
+    acme_request_sent?: boolean | null;
+    /**
+     * HTTP status or ACME error type returned by Let's Encrypt, when known.
+     */
+    acme_response_status?: string | null;
+    /**
+     * Did the proxy serve the `/.well-known/acme-challenge/` request?
+     */
+    challenge_served?: boolean | null;
+    /**
+     * When the attempt was recorded (epoch millis).
+     */
+    created_at: number;
+    /**
+     * End-to-end issuance duration in milliseconds (0/None for skipped).
+     */
+    duration_ms?: number | null;
+    /**
+     * Coarse error category for UI labelling: `"rate_limited"`, `"dns_failure"`,
+     * `"acme_order_expired"`, `"challenge_mismatch"`, `"timeout"`, `"internal"`.
+     */
+    error_category?: string | null;
+    /**
+     * Full `Display` chain of the error (all `source()` levels), when failed.
+     */
+    error_chain?: string | null;
+    /**
+     * SNI hostname that triggered the attempt.
+     */
+    hostname: string;
+    id: number;
+    /**
+     * Final outcome: `"issued"`, `"failed"`, `"skipped_duplicate"`,
+     * `"skipped_gate"`, `"skipped_rate_limit"`, or `"skipped_no_route"`.
+     */
+    outcome: string;
+    /**
+     * What triggered the attempt (always `"tls_callback"` today).
+     */
+    trigger: string;
+};
+
+/**
+ * One row of the on-demand certificates list: the most-recent attempt for a
+ * hostname plus the current authoritative cert state from its `domains` row.
+ */
+export type OnDemandCertRow = {
+    /**
+     * The audit record for the attempt this row represents (newest first in
+     * the list).
+     */
+    attempt: OnDemandCertAttemptResponse;
+    /**
+     * On-demand negative-cache deadline (epoch millis), when in backoff.
+     */
+    backoff_until?: number | null;
+    /**
+     * Certificate expiration (epoch millis), when an active cert exists.
+     */
+    expiration_time?: number | null;
+    /**
+     * SNI hostname.
+     */
+    hostname: string;
+    /**
+     * Current cert lifecycle status from the `domains` row, when one exists:
+     * `on_demand_pending`, `on_demand_issuing`, `active`, `on_demand_failed`,
+     * etc. `None` when no `domains` row exists yet for this hostname.
+     */
+    status?: string | null;
+};
+
+/**
+ * On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018).
+ *
+ * When `enabled`, the proxy's `certificate_callback` triggers ACME HTTP-01
+ * issuance for allowlisted, STABLE hostnames (per-environment aliases and the
+ * console host) that have no active cert, rather than silently failing the
+ * handshake. Ephemeral per-deployment hostnames are NEVER certed (ADR §2).
+ *
+ * Off by default — operators opt in explicitly, except QuickStart (`sslip.io`)
+ * installs where `temps setup` auto-enables it and derives `zone`.
+ */
+export type OnDemandTlsSettings = {
+    /**
+     * How ephemeral per-deployment hostnames behave when they have no cert
+     * (they are NEVER certed — see ADR §2). One of:
+     * - `"http"` (default): serve plain HTTP on :80.
+     * - `"redirect_to_env"`: 308-redirect to the stable per-environment URL,
+     * which IS certed.
+     */
+    deployment_url_mode?: string;
+    /**
+     * Master switch. When `false` (default) the proxy's on-demand cert gate
+     * rejects every SNI and no issuance is ever triggered.
+     */
+    enabled?: boolean;
+    /**
+     * Global cap on total on-demand issuances per hour across all hostnames
+     * (ADR §4 Layer 3). The operator's self-imposed safety net, separate from
+     * the Let's Encrypt rate limit.
+     */
+    hourly_cap?: number;
+    /**
+     * Maximum number of ACME issuance flows allowed to run simultaneously
+     * (the concurrent-issuance semaphore, ADR §4 Layer 1). Min 1.
+     */
+    max_concurrent?: number;
+    /**
+     * Zone suffix for the allowlist gate. A hostname passes the gate only if
+     * it is a direct subdomain of this zone (e.g. zone `1.2.3.4.sslip.io`
+     * admits `myapp.1.2.3.4.sslip.io` but not `deep.sub.1.2.3.4.sslip.io`).
+     * `None` (default) means "auto-derive from `external_url`"; if no zone can
+     * be derived the gate rejects all SNI, disabling the feature.
+     */
+    zone?: string | null;
 };
 
 export type OpenAiError = {
@@ -9741,7 +9988,7 @@ export type ProjectHealthSummary = {
      */
     status: string;
     /**
-     * Total errors (status >= 400) in the period
+     * Total server errors (status >= 500) in the period
      */
     total_errors: number;
     /**
@@ -12197,6 +12444,7 @@ export type ServicePlan = {
  * - `memory_swap_mb`→ `HostConfig.memory_swap`   (bytes; ≥ memory)
  * - `nano_cpus`     → `HostConfig.nano_cpus`     (1e9 = 1 full CPU)
  * - `cpu_shares`    → `HostConfig.cpu_shares`    (relative weight, default 1024)
+ * - `shm_size_mb`   → `HostConfig.shm_size`      (bytes; default 64 MiB)
  *
  * IMPORTANT: enabling hard memory limits causes the kernel OOM killer to
  * terminate the container when the working set exceeds the limit. The
@@ -12224,8 +12472,11 @@ export type ServiceResourceLimits = {
     nano_cpus?: number | null;
     /**
      * Shared memory (/dev/shm) size in MiB. None = Docker default (64 MiB).
-     * TODO(sdk-regen): added by hand ahead of `bun run openapi-ts` regen; the
-     * backend `ServiceResourceLimits` already carries this field.
+     * Maps to HostConfig.shm_size (bytes). PostgreSQL uses /dev/shm for parallel
+     * query workers and large work_mem; the 64 MiB default causes "could not
+     * resize shared memory segment ... No space left on device" under load.
+     * NOTE: shm_size is fixed at container-create time — Docker's live update
+     * API cannot change it, so changing this value recreates the container.
      */
     shm_size_mb?: number | null;
 };
@@ -14256,6 +14507,25 @@ export type UpdateKvResponse = {
      * Whether the operation succeeded
      */
     success: boolean;
+};
+
+/**
+ * Request to update a managed domain's settings.
+ */
+export type UpdateManagedDomainApiRequest = {
+    /**
+     * Toggle automatic DNS management for this domain.
+     */
+    auto_manage?: boolean | null;
+    /**
+     * `"standard"` or `"flat"`. Persisted as-is; switching to `"flat"` does not
+     * recompute existing hostnames — use the apply endpoint for that.
+     */
+    generated_hostname_mode?: string | null;
+    /**
+     * Toggle DNS record sync for this domain.
+     */
+    sync_generated_records?: boolean | null;
 };
 
 export type UpdateMcpRequest = {
@@ -21022,6 +21292,117 @@ export type RemoveManagedDomainResponses = {
 
 export type RemoveManagedDomainResponse = RemoveManagedDomainResponses[keyof RemoveManagedDomainResponses];
 
+export type UpdateManagedDomainData = {
+    body: UpdateManagedDomainApiRequest;
+    path: {
+        provider_id: number;
+        domain: string;
+    };
+    query?: never;
+    url: '/dns-providers/{provider_id}/domains/{domain}';
+};
+
+export type UpdateManagedDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+};
+
+export type UpdateManagedDomainResponses = {
+    /**
+     * Managed domain updated
+     */
+    200: ManagedDomainResponse;
+};
+
+export type UpdateManagedDomainResponse = UpdateManagedDomainResponses[keyof UpdateManagedDomainResponses];
+
+export type ApplyHostnameModeData = {
+    body: ApplyHostnameModeRequest;
+    path: {
+        provider_id: number;
+        domain: string;
+    };
+    query?: never;
+    url: '/dns-providers/{provider_id}/domains/{domain}/apply-hostname-mode';
+};
+
+export type ApplyHostnameModeErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions or token lacks zone access
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+};
+
+export type ApplyHostnameModeResponses = {
+    /**
+     * Hostname mode applied
+     */
+    200: HostnamePreviewResponse;
+};
+
+export type ApplyHostnameModeResponse = ApplyHostnameModeResponses[keyof ApplyHostnameModeResponses];
+
+export type PreviewHostnameModeData = {
+    body?: never;
+    path: {
+        provider_id: number;
+        domain: string;
+    };
+    query: {
+        /**
+         * Target mode: standard|flat
+         */
+        mode: string;
+        /**
+         * Include DNS record changes
+         */
+        sync?: boolean;
+    };
+    url: '/dns-providers/{provider_id}/domains/{domain}/hostname-preview';
+};
+
+export type PreviewHostnameModeErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+};
+
+export type PreviewHostnameModeResponses = {
+    /**
+     * Hostname mode preview
+     */
+    200: HostnamePreviewResponse;
+};
+
+export type PreviewHostnameModeResponse = PreviewHostnameModeResponses[keyof PreviewHostnameModeResponses];
+
 export type VerifyManagedDomainData = {
     body?: never;
     path: {
@@ -21192,6 +21573,82 @@ export type GetDomainByHostResponses = {
 };
 
 export type GetDomainByHostResponse = GetDomainByHostResponses[keyof GetDomainByHostResponses];
+
+export type GetOnDemandCertStatusData = {
+    body?: never;
+    path: {
+        /**
+         * Domain hostname
+         */
+        hostname: string;
+    };
+    query?: never;
+    url: '/domains/by-host/{hostname}/cert-status';
+};
+
+export type GetOnDemandCertStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetOnDemandCertStatusResponses = {
+    /**
+     * On-demand cert status retrieved successfully
+     */
+    200: CertStatusResponse;
+};
+
+export type GetOnDemandCertStatusResponse = GetOnDemandCertStatusResponses[keyof GetOnDemandCertStatusResponses];
+
+export type ListOnDemandCertsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number | null;
+        /**
+         * Number of items per page (max 100)
+         */
+        page_size?: number | null;
+    };
+    url: '/domains/on-demand-certs';
+};
+
+export type ListOnDemandCertsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListOnDemandCertsResponses = {
+    /**
+     * On-demand cert attempts retrieved successfully
+     */
+    200: ListOnDemandCertsResponse;
+};
+
+export type ListOnDemandCertsResponse2 = ListOnDemandCertsResponses[keyof ListOnDemandCertsResponses];
 
 export type CancelDomainOrderData = {
     body?: never;
@@ -33633,6 +34090,11 @@ export type DeployFromImageUploadData = {
          * If not provided, a unique tag will be generated
          */
         tag?: string | null;
+        /**
+         * Optional HTTP health-check path override (e.g. "/api/healthz").
+         * Must start with '/'. When omitted, defaults to "/".
+         */
+        health_check_path?: string | null;
     };
     url: '/projects/{project_id}/environments/{environment_id}/deploy/image-upload';
 };
