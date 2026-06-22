@@ -20,7 +20,7 @@ pub const SQLITE_DB_NAME: &str = "temps.db";
 
 use rand::Rng;
 use serde_derive::{Deserialize, Serialize};
-use temps_core::AppSettings;
+use temps_core::{AppSettings, PublicHostnameStrategy};
 
 #[derive(Error, Debug)]
 pub enum ConfigServiceError {
@@ -898,8 +898,9 @@ impl ConfigService {
             ("http".to_string(), Some(self.proxy_port()))
         };
 
-        let hostname = settings
-            .public_hostnames
+        // Deployment hostnames are identical across hostname strategies (single
+        // label below the base domain), so no per-domain resolution is needed here.
+        let hostname = PublicHostnameStrategy::Standard
             .deployment_hostname(&settings.preview_domain, deployment_slug);
 
         // Construct the URL as [protocol]://{host}[:port]

@@ -79,7 +79,7 @@ pub async fn load(platform_config: &Arc<ConfigService>) -> PreviewUrlParts {
                 ("https".to_string(), None)
             };
 
-            let domain = s.public_hostnames.base_domain(&s.preview_domain);
+            let domain = temps_core::public_base_domain(&s.preview_domain);
 
             let port = port.filter(|p| {
                 !((protocol == "https" && *p == 443) || (protocol == "http" && *p == 80))

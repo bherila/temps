@@ -48,6 +48,8 @@ pub struct AppState {
     /// guaranteed to already be present by this point. See
     /// [`temps_core::DeploymentGate`].
     pub deployment_gate: Option<Arc<dyn temps_core::DeploymentGate>>,
+    /// Resolves the per-managed-domain public hostname strategy (Standard/Flat).
+    pub hostname_resolver: Arc<dyn temps_core::PublicHostnameResolver>,
 }
 
 use crate::services::types::Deployment;

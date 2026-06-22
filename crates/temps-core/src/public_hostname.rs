@@ -7,12 +7,17 @@ const DNS_LABEL_MAX_LEN: usize = 63;
 const SHORT_HASH_LEN: usize = 8;
 
 /// Public hostname generation mode for Temps-managed preview routes.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+///
+/// The mode is stored per managed domain (`dns_managed_domains.generated_hostname_mode`)
+/// rather than globally, so a provider such as Cloudflare can offer the flat layout
+/// required by its Universal SSL wildcard cert without changing every domain's behaviour.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicHostnameStrategy {
-    /// Preserve Temps' existing generated hostname layout.
+    /// Preserve Temps' existing generated hostname layout (`{service}-{env}.base`).
     Standard,
-    /// Force generated hostnames to one label below `preview_domain`.
+    /// Force generated service hostnames to one label below `preview_domain`
+    /// (`{env}-{service}.base`) so a single-label wildcard cert covers them.
     Flat,
 }
 
@@ -22,141 +27,75 @@ impl Default for PublicHostnameStrategy {
     }
 }
 
-/// Operator-configurable templates for generated public hostnames.
-///
-/// Templates may use `{base_domain}`, `{environment}`, `{service}`,
-/// `{deployment}`, `{project}`, `{app}`, `{branch}`, `{preview_slug}`, and
-/// `{short_hash}`. When `strategy = flat`, all generated labels before
-/// `{base_domain}` are collapsed into a single DNS label.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-#[serde(default)]
-pub struct PublicHostnameSettings {
-    pub strategy: PublicHostnameStrategy,
-    pub environment_template: Option<String>,
-    pub service_template: Option<String>,
-    pub deployment_template: Option<String>,
-}
-
-impl Default for PublicHostnameSettings {
-    fn default() -> Self {
-        Self {
-            strategy: PublicHostnameStrategy::Standard,
-            environment_template: None,
-            service_template: None,
-            deployment_template: None,
+impl PublicHostnameStrategy {
+    /// Stable string used to persist the strategy in `dns_managed_domains`.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            PublicHostnameStrategy::Standard => "standard",
+            PublicHostnameStrategy::Flat => "flat",
         }
     }
-}
 
-#[derive(Debug, Clone, Default)]
-pub struct PublicHostnameContext<'a> {
-    pub app: Option<&'a str>,
-    pub project: Option<&'a str>,
-    pub environment: Option<&'a str>,
-    pub service: Option<&'a str>,
-    pub deployment: Option<&'a str>,
-    pub branch: Option<&'a str>,
-    pub preview_slug: Option<&'a str>,
-}
-
-impl PublicHostnameSettings {
-    /// Normalize the configured preview domain into the base domain used for
-    /// generated public hosts. Accepts both `example.com` and `*.example.com`.
-    pub fn base_domain(&self, preview_domain: &str) -> String {
-        normalize_base_domain(preview_domain)
+    /// Parse the persisted strategy string. Unknown values fall back to
+    /// `Standard` so an unrecognised column value never breaks hostname
+    /// generation (forward-compatible).
+    pub fn from_db_str(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "flat" => PublicHostnameStrategy::Flat,
+            _ => PublicHostnameStrategy::Standard,
+        }
     }
 
-    pub fn environment_hostname(&self, preview_domain: &str, environment: &str) -> String {
-        let template = self
-            .environment_template
-            .as_deref()
-            .unwrap_or("{environment}.{base_domain}");
-        self.render_hostname(
-            preview_domain,
-            template,
-            PublicHostnameContext {
-                environment: Some(environment),
-                preview_slug: Some(environment),
-                ..Default::default()
-            },
-        )
+    fn force_single_label(self) -> bool {
+        matches!(self, PublicHostnameStrategy::Flat)
     }
 
-    pub fn service_hostname(
-        &self,
-        preview_domain: &str,
-        environment: &str,
-        service: &str,
-    ) -> String {
-        let template = self
-            .service_template
-            .as_deref()
-            .unwrap_or(match self.strategy {
-                PublicHostnameStrategy::Standard => "{service}-{environment}.{base_domain}",
-                PublicHostnameStrategy::Flat => "{environment}-{service}.{base_domain}",
-            });
-        self.render_hostname(
-            preview_domain,
-            template,
-            PublicHostnameContext {
-                environment: Some(environment),
-                service: Some(service),
-                preview_slug: Some(environment),
-                ..Default::default()
-            },
-        )
+    /// Environment public host: `{environment}.{base_domain}` (identical for both
+    /// strategies; already a single label below the base).
+    pub fn environment_hostname(self, preview_domain: &str, environment: &str) -> String {
+        let base = normalize_base_domain(preview_domain);
+        let raw = format!("{environment}.{base}");
+        normalize_hostname(&raw, &base, self.force_single_label())
     }
 
-    pub fn deployment_hostname(&self, preview_domain: &str, deployment: &str) -> String {
-        let template = self
-            .deployment_template
-            .as_deref()
-            .unwrap_or("{deployment}.{base_domain}");
-        self.render_hostname(
-            preview_domain,
-            template,
-            PublicHostnameContext {
-                deployment: Some(deployment),
-                ..Default::default()
-            },
-        )
+    /// Per-service public host. This is the only layout that differs between
+    /// strategies: Standard yields `{service}-{environment}.base`, Flat yields
+    /// `{environment}-{service}.base`.
+    pub fn service_hostname(self, preview_domain: &str, environment: &str, service: &str) -> String {
+        let base = normalize_base_domain(preview_domain);
+        let raw = match self {
+            PublicHostnameStrategy::Standard => format!("{service}-{environment}.{base}"),
+            PublicHostnameStrategy::Flat => format!("{environment}-{service}.{base}"),
+        };
+        normalize_hostname(&raw, &base, self.force_single_label())
     }
 
+    /// Deployment public host: `{deployment}.{base_domain}` (single label for both).
+    pub fn deployment_hostname(self, preview_domain: &str, deployment: &str) -> String {
+        let base = normalize_base_domain(preview_domain);
+        let raw = format!("{deployment}.{base}");
+        normalize_hostname(&raw, &base, self.force_single_label())
+    }
+
+    /// Calculated project/deployment host: `{project}-{environment}-{deployment}.base`
+    /// (single label for both strategies).
     pub fn project_deployment_hostname(
-        &self,
+        self,
         preview_domain: &str,
         project: &str,
         environment: &str,
         deployment: &str,
     ) -> String {
-        self.render_hostname(
-            preview_domain,
-            "{project}-{environment}-{deployment}.{base_domain}",
-            PublicHostnameContext {
-                app: Some(project),
-                project: Some(project),
-                environment: Some(environment),
-                deployment: Some(deployment),
-                preview_slug: Some(environment),
-                ..Default::default()
-            },
-        )
+        let base = normalize_base_domain(preview_domain);
+        let raw = format!("{project}-{environment}-{deployment}.{base}");
+        normalize_hostname(&raw, &base, self.force_single_label())
     }
+}
 
-    pub fn render_hostname(
-        &self,
-        preview_domain: &str,
-        template: &str,
-        context: PublicHostnameContext<'_>,
-    ) -> String {
-        let base_domain = self.base_domain(preview_domain);
-        let rendered = render_template(template, &base_domain, &context);
-        normalize_hostname(
-            &rendered,
-            &base_domain,
-            matches!(self.strategy, PublicHostnameStrategy::Flat),
-        )
-    }
+/// Normalize the configured preview domain into the base domain used for
+/// generated public hosts. Accepts both `example.com` and `*.example.com`.
+pub fn base_domain(preview_domain: &str) -> String {
+    normalize_base_domain(preview_domain)
 }
 
 fn normalize_base_domain(preview_domain: &str) -> String {
@@ -171,51 +110,6 @@ fn normalize_base_domain(preview_domain: &str) -> String {
     } else {
         trimmed
     }
-}
-
-fn render_template(
-    template: &str,
-    base_domain: &str,
-    context: &PublicHostnameContext<'_>,
-) -> String {
-    let seed = [
-        base_domain,
-        context.app.unwrap_or(""),
-        context.project.unwrap_or(""),
-        context.environment.unwrap_or(""),
-        context.service.unwrap_or(""),
-        context.deployment.unwrap_or(""),
-        context.branch.unwrap_or(""),
-        context.preview_slug.unwrap_or(""),
-    ]
-    .join("|");
-    let short_hash = short_hash(&seed);
-
-    let replacements = [
-        ("{base_domain}", base_domain),
-        ("{app}", context.app.or(context.project).unwrap_or("")),
-        ("{project}", context.project.or(context.app).unwrap_or("")),
-        ("{environment}", context.environment.unwrap_or("")),
-        ("{env}", context.environment.unwrap_or("")),
-        ("{service}", context.service.unwrap_or("")),
-        ("{deployment}", context.deployment.unwrap_or("")),
-        ("{branch}", context.branch.unwrap_or("")),
-        (
-            "{preview_slug}",
-            context.preview_slug.or(context.environment).unwrap_or(""),
-        ),
-        (
-            "{preview}",
-            context.preview_slug.or(context.environment).unwrap_or(""),
-        ),
-        ("{short_hash}", short_hash.as_str()),
-    ];
-
-    replacements
-        .iter()
-        .fold(template.to_string(), |acc, (needle, value)| {
-            acc.replace(needle, value)
-        })
 }
 
 fn normalize_hostname(raw: &str, base_domain: &str, force_single_label: bool) -> String {
@@ -314,51 +208,60 @@ mod tests {
 
     #[test]
     fn base_domain_strips_wildcard_prefix() {
-        let settings = PublicHostnameSettings::default();
-        assert_eq!(settings.base_domain("*.Example.COM."), "example.com");
+        assert_eq!(base_domain("*.Example.COM."), "example.com");
     }
 
     #[test]
     fn standard_service_hostname_preserves_existing_order() {
-        let settings = PublicHostnameSettings::default();
         assert_eq!(
-            settings.service_hostname("*.example.com", "staging", "files"),
+            PublicHostnameStrategy::Standard.service_hostname("*.example.com", "staging", "files"),
             "files-staging.example.com"
         );
     }
 
     #[test]
     fn flat_service_hostname_uses_environment_first() {
-        let settings = PublicHostnameSettings {
-            strategy: PublicHostnameStrategy::Flat,
-            ..Default::default()
-        };
         assert_eq!(
-            settings.service_hostname("example.com", "staging", "files"),
+            PublicHostnameStrategy::Flat.service_hostname("example.com", "staging", "files"),
             "staging-files.example.com"
         );
     }
 
     #[test]
-    fn flat_strategy_collapses_nested_template_to_one_label() {
-        let settings = PublicHostnameSettings {
-            strategy: PublicHostnameStrategy::Flat,
-            service_template: Some("{service}.{environment}.{base_domain}".to_string()),
-            ..Default::default()
-        };
+    fn environment_hostname_is_strategy_independent() {
+        let env = "preview-123";
         assert_eq!(
-            settings.service_hostname("example.com", "preview-123", "api"),
-            "api-preview-123.example.com"
+            PublicHostnameStrategy::Standard.environment_hostname("example.com", env),
+            PublicHostnameStrategy::Flat.environment_hostname("example.com", env),
+        );
+        assert_eq!(
+            PublicHostnameStrategy::Flat.environment_hostname("*.example.com", env),
+            "preview-123.example.com"
+        );
+    }
+
+    #[test]
+    fn db_str_round_trips_and_defaults() {
+        assert_eq!(PublicHostnameStrategy::Standard.as_db_str(), "standard");
+        assert_eq!(PublicHostnameStrategy::Flat.as_db_str(), "flat");
+        assert_eq!(
+            PublicHostnameStrategy::from_db_str("flat"),
+            PublicHostnameStrategy::Flat
+        );
+        assert_eq!(
+            PublicHostnameStrategy::from_db_str("FLAT"),
+            PublicHostnameStrategy::Flat
+        );
+        // Unknown / legacy values fall back to Standard.
+        assert_eq!(
+            PublicHostnameStrategy::from_db_str("bogus"),
+            PublicHostnameStrategy::Standard
         );
     }
 
     #[test]
     fn long_generated_label_gets_stable_hash_suffix() {
-        let settings = PublicHostnameSettings {
-            strategy: PublicHostnameStrategy::Flat,
-            ..Default::default()
-        };
-        let host = settings.service_hostname(
+        let host = PublicHostnameStrategy::Flat.service_hostname(
             "example.com",
             "preview-this-branch-name-is-deliberately-long-and-keeps-going",
             "extremely-long-service-name-that-would-overflow-the-dns-label",
@@ -367,7 +270,7 @@ mod tests {
         assert!(label.len() <= DNS_LABEL_MAX_LEN);
         assert_eq!(
             host,
-            settings.service_hostname(
+            PublicHostnameStrategy::Flat.service_hostname(
                 "example.com",
                 "preview-this-branch-name-is-deliberately-long-and-keeps-going",
                 "extremely-long-service-name-that-would-overflow-the-dns-label",

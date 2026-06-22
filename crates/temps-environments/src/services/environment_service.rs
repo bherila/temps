@@ -6,7 +6,9 @@ use serde::Serialize;
 use slug::slugify;
 use std::sync::Arc;
 use temps_core::problemdetails::Problem;
-use temps_core::{EnvironmentCreatedJob, EnvironmentDeletedJob, Job, JobQueue};
+use temps_core::{
+    EnvironmentCreatedJob, EnvironmentDeletedJob, Job, JobQueue, PublicHostnameStrategy,
+};
 use temps_entities::{environment_domains, environments, projects};
 use thiserror::Error;
 use tracing::{info, warn};
@@ -128,8 +130,9 @@ impl EnvironmentService {
             }
         };
 
-        let domain = settings
-            .public_hostnames
+        // Environment hostnames are identical across strategies, so no per-domain
+        // resolution is needed here.
+        let domain = PublicHostnameStrategy::Standard
             .environment_hostname(&settings.preview_domain, environment_slug);
 
         // Determine protocol - use https if external_url is configured, otherwise http
@@ -176,8 +179,7 @@ impl EnvironmentService {
     /// Compute the full FQDN for an environment (without protocol)
     pub async fn compute_environment_fqdn(&self, environment_slug: &str) -> String {
         let settings = self.config_service.get_settings().await.unwrap_or_default();
-        settings
-            .public_hostnames
+        PublicHostnameStrategy::Standard
             .environment_hostname(&settings.preview_domain, environment_slug)
     }
 

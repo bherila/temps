@@ -10120,13 +10120,56 @@ export type ManagedDomainResponse = {
     auto_manage: boolean;
     created_at: string;
     domain: string;
+    /**
+     * Generated hostname layout: "standard" or "flat".
+     */
+    generated_hostname_mode: string;
     id: number;
     provider_id: number;
+    /**
+     * Whether generated hostnames are reconciled into the provider's DNS zone.
+     */
+    sync_generated_records: boolean;
     updated_at: string;
     verification_error?: string | null;
     verified: boolean;
     verified_at?: string | null;
+    /**
+     * Last token zone-access check result (null if unchecked).
+     */
+    zone_access_ok?: boolean | null;
+    zone_access_error?: string | null;
     zone_id?: string | null;
+};
+
+/**
+ * A single generated-hostname change in a flatten preview/apply.
+ */
+export type HostnameChange = {
+    id: number;
+    kind: string;
+    new: string;
+    old: string;
+};
+
+/**
+ * A single DNS record change the sync would make.
+ */
+export type DnsRecordChange = {
+    action: string;
+    name: string;
+    record_type: string;
+    value: string;
+};
+
+/**
+ * Combined preview of a hostname-mode change.
+ */
+export type HostnamePreviewResponse = {
+    dns_changes: Array<DnsRecordChange>;
+    hostname_changes: Array<HostnameChange>;
+    total: number;
+    zone_access_ok?: boolean | null;
 };
 
 export type MagicLinkRequest = {
@@ -13406,6 +13449,11 @@ export type DnsProviderResponse = {
      */
     credentials: unknown;
     description?: string | null;
+    /**
+     * Whether this provider benefits from the flat hostname mode (e.g. Cloudflare
+     * Universal SSL). The UI surfaces/recommends the Flat toggle when true.
+     */
+    flat_hostnames_supported: boolean;
     id: number;
     is_active: boolean;
     last_error?: string | null;
