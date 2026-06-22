@@ -124,14 +124,8 @@ export interface MonitoringSettings {
   clickhouse_url?: string | null
 }
 
+/** Per-managed-domain hostname layout (configured under DNS providers, not here). */
 export type PublicHostnameStrategy = 'standard' | 'flat'
-
-export interface PublicHostnameSettings {
-  strategy: PublicHostnameStrategy
-  environment_template?: string | null
-  service_template?: string | null
-  deployment_template?: string | null
-}
 
 // Re-export the types from the API for consistency
 export interface PlatformSettings extends Omit<AppSettings, 'agent_sandbox'> {
@@ -140,7 +134,8 @@ export interface PlatformSettings extends Omit<AppSettings, 'agent_sandbox'> {
   internal_url: string | null
   letsencrypt: LetsEncryptSettings
   preview_domain: string
-  public_hostnames: PublicHostnameSettings
+  /** Public address synced DNS records point at (IP → A/AAAA, else CNAME). */
+  edge_target?: string | null
   screenshots: ScreenshotSettings
   security_headers: SecurityHeadersSettings
   rate_limiting: RateLimitSettings
@@ -210,7 +205,7 @@ export async function updatePlatformSettings(
     internal_url: updated.internal_url,
     letsencrypt: updated.letsencrypt,
     preview_domain: updated.preview_domain,
-    public_hostnames: updated.public_hostnames,
+    edge_target: updated.edge_target,
     screenshots: updated.screenshots,
     security_headers: updated.security_headers,
     rate_limiting: updated.rate_limiting,

@@ -40,14 +40,10 @@ import { toast } from 'sonner'
 
 type SettingsFormData = Pick<
   PlatformSettings,
-  | 'external_url'
-  | 'internal_url'
-  | 'preview_domain'
-  | 'public_hostnames'
-  | 'screenshots'
+  'external_url' | 'internal_url' | 'preview_domain' | 'edge_target' | 'screenshots'
 >
 
-function optionalTemplate(value: string | null | undefined): string | null {
+function optionalString(value: string | null | undefined): string | null {
   const trimmed = value?.trim() ?? ''
   return trimmed.length > 0 ? trimmed : null
 }
@@ -70,12 +66,7 @@ export function Settings() {
       external_url: '',
       internal_url: '',
       preview_domain: 'localho.st',
-      public_hostnames: {
-        strategy: 'standard',
-        environment_template: '',
-        service_template: '',
-        deployment_template: '',
-      },
+      edge_target: '',
       screenshots: {
         enabled: false,
         provider: 'local',
@@ -85,10 +76,6 @@ export function Settings() {
   })
 
   const screenshots = useWatch({ control, name: 'screenshots' })
-  const hostnameStrategy = useWatch({
-    control,
-    name: 'public_hostnames.strategy',
-  })
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Settings' }])
@@ -102,14 +89,7 @@ export function Settings() {
         external_url: settings.external_url || '',
         internal_url: settings.internal_url || '',
         preview_domain: settings.preview_domain || 'localho.st',
-        public_hostnames: {
-          strategy: settings.public_hostnames?.strategy || 'standard',
-          environment_template:
-            settings.public_hostnames?.environment_template || '',
-          service_template: settings.public_hostnames?.service_template || '',
-          deployment_template:
-            settings.public_hostnames?.deployment_template || '',
-        },
+        edge_target: settings.edge_target || '',
         screenshots: settings.screenshots || {
           enabled: false,
           provider: 'local',
@@ -123,30 +103,12 @@ export function Settings() {
     try {
       const normalized: SettingsFormData = {
         ...data,
-        public_hostnames: {
-          strategy: data.public_hostnames?.strategy || 'standard',
-          environment_template: optionalTemplate(
-            data.public_hostnames?.environment_template
-          ),
-          service_template: optionalTemplate(
-            data.public_hostnames?.service_template
-          ),
-          deployment_template: optionalTemplate(
-            data.public_hostnames?.deployment_template
-          ),
-        },
+        edge_target: optionalString(data.edge_target),
       }
       await updateSettings.mutateAsync(normalized)
       reset({
         ...normalized,
-        public_hostnames: {
-          ...normalized.public_hostnames,
-          environment_template:
-            normalized.public_hostnames.environment_template || '',
-          service_template: normalized.public_hostnames.service_template || '',
-          deployment_template:
-            normalized.public_hostnames.deployment_template || '',
-        },
+        edge_target: normalized.edge_target || '',
       })
       toast.success('Settings saved successfully')
     } catch (err: any) {
@@ -298,57 +260,20 @@ export function Settings() {
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="hostname-strategy">Hostname Strategy</Label>
-            <Select
-              value={hostnameStrategy || 'standard'}
-              onValueChange={(value: 'standard' | 'flat') =>
-                setValue('public_hostnames.strategy', value, {
-                  shouldDirty: true,
-                })
-              }
-            >
-              <SelectTrigger id="hostname-strategy">
-                <SelectValue placeholder="Select hostname strategy" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="standard">Standard</SelectItem>
-                <SelectItem value="flat">Flat wildcard</SelectItem>
-              </SelectContent>
-            </Select>
+            <Label htmlFor="edge-target">Edge target (for DNS sync)</Label>
+            <Input
+              id="edge-target"
+              type="text"
+              placeholder="203.0.113.10 or edge.example.com"
+              {...register('edge_target')}
+            />
             <p className="text-sm text-muted-foreground">
-              Flat wildcard keeps generated service hostnames one label under
-              the preview domain for providers such as Cloudflare Universal SSL.
+              Public address that generated DNS records point at when a managed
+              domain opts into record sync. An IP creates A/AAAA records; a
+              hostname creates CNAME records. Leave blank to disable DNS sync.
+              The Standard vs Flat hostname layout is configured per managed
+              domain under DNS providers.
             </p>
-          </div>
-
-          <div className="grid gap-4 md:grid-cols-3">
-            <div className="space-y-2">
-              <Label htmlFor="environment-template">Environment Template</Label>
-              <Input
-                id="environment-template"
-                type="text"
-                placeholder="{environment}.{base_domain}"
-                {...register('public_hostnames.environment_template')}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="service-template">Service Template</Label>
-              <Input
-                id="service-template"
-                type="text"
-                placeholder="{environment}-{service}.{base_domain}"
-                {...register('public_hostnames.service_template')}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="deployment-template">Deployment Template</Label>
-              <Input
-                id="deployment-template"
-                type="text"
-                placeholder="{deployment}.{base_domain}"
-                {...register('public_hostnames.deployment_template')}
-              />
-            </div>
           </div>
         </CardContent>
       </Card>

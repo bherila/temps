@@ -15,6 +15,7 @@ pub mod openapi;
 pub mod plugin;
 pub mod problemdetails;
 pub mod public_hostname;
+pub mod public_hostname_resolver;
 pub mod retry;
 pub mod telemetry;
 pub mod tls;
@@ -49,7 +50,10 @@ pub use error::*;
 pub use error_builder::*;
 pub use jobs::*;
 pub use on_demand::*;
-pub use public_hostname::{PublicHostnameContext, PublicHostnameSettings, PublicHostnameStrategy};
+pub use public_hostname::{base_domain as public_base_domain, PublicHostnameStrategy};
+pub use public_hostname_resolver::{
+    match_strategy, PublicHostnameResolver, StandardHostnameResolver,
+};
 pub use telemetry::{NoopTelemetryReporter, TelemetryEvent, TelemetryEventKind, TelemetryReporter};
 pub use utils::*;
 

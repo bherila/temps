@@ -22,7 +22,7 @@ use futures::SinkExt;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
-use temps_core::{AppSettings, AuditContext, RequestMetadata};
+use temps_core::{AppSettings, AuditContext, PublicHostnameStrategy, RequestMetadata};
 use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
 
@@ -59,11 +59,13 @@ fn public_url_for_hostname(settings: &AppSettings, hostname: &str) -> String {
     }
 }
 
-fn public_service_url(settings: &AppSettings, environment: &str, service: &str) -> String {
-    let hostname =
-        settings
-            .public_hostnames
-            .service_hostname(&settings.preview_domain, environment, service);
+fn public_service_url(
+    settings: &AppSettings,
+    strategy: PublicHostnameStrategy,
+    environment: &str,
+    service: &str,
+) -> String {
+    let hostname = strategy.service_hostname(&settings.preview_domain, environment, service);
     public_url_for_hostname(settings, &hostname)
 }
 
@@ -858,6 +860,13 @@ pub async fn list_containers(
         .flatten()
         .map(|e| e.subdomain);
 
+    // Resolve the hostname strategy for this instance's preview domain once,
+    // before the synchronous response-building closure below.
+    let hostname_strategy = state
+        .hostname_resolver
+        .strategy_for(&app_settings.preview_domain)
+        .await;
+
     // Read public_ports from project's preset_config
     let public_ports: Vec<temps_entities::preset::ComposePublicPort> =
         temps_entities::projects::Entity::find_by_id(project_id)
@@ -888,7 +897,7 @@ pub async fn list_containers(
                 }
                 env_subdomain
                     .as_ref()
-                    .map(|sub| public_service_url(&app_settings, sub, svc))
+                    .map(|sub| public_service_url(&app_settings, hostname_strategy, sub, svc))
             });
             ContainerInfoResponse::from_info(info, node_name, service_name, service_url)
         })
@@ -1630,7 +1639,13 @@ pub async fn get_container_detail(
                 .flatten()
                 .map(|e| e.subdomain);
 
-            env_subdomain.map(|sub| public_service_url(&app_settings, &sub, svc_name))
+            let hostname_strategy = state
+                .hostname_resolver
+                .strategy_for(&app_settings.preview_domain)
+                .await;
+
+            env_subdomain
+                .map(|sub| public_service_url(&app_settings, hostname_strategy, &sub, svc_name))
         } else {
             None
         }
@@ -3249,6 +3264,8 @@ mod tests {
                 bollard::Docker::connect_with_local_defaults()
                     .unwrap_or_else(|_| bollard::Docker::connect_with_defaults().unwrap()),
             ),
+            hostname_resolver: Arc::new(temps_core::StandardHostnameResolver)
+                as Arc<dyn temps_core::PublicHostnameResolver>,
         })
     }
 

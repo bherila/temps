@@ -28,6 +28,7 @@ use crate::services::types::{
     Deployment, DeploymentDomain, DeploymentEnvironment, DeploymentListResponse,
 };
 use crate::UpdateDeploymentSettingsRequest;
+use temps_core::PublicHostnameStrategy;
 use temps_core::WorkflowTask;
 
 /// Parameters for container log retrieval
@@ -2385,8 +2386,7 @@ impl DeploymentService {
     async fn compute_deployment_url(&self, deployment_slug: &str) -> anyhow::Result<String> {
         let settings = self.config_service.get_settings().await.unwrap_or_default();
 
-        let domain = settings
-            .public_hostnames
+        let domain = PublicHostnameStrategy::Standard
             .deployment_hostname(&settings.preview_domain, deployment_slug);
 
         // Determine protocol and port from external_url if set, otherwise default to http
@@ -2435,8 +2435,7 @@ impl DeploymentService {
     async fn compute_environment_url(&self, env_subdomain: &str) -> anyhow::Result<String> {
         let settings = self.config_service.get_settings().await.unwrap_or_default();
 
-        let domain = settings
-            .public_hostnames
+        let domain = PublicHostnameStrategy::Standard
             .environment_hostname(&settings.preview_domain, env_subdomain);
 
         // Determine protocol and port from external_url if set, otherwise default to http
@@ -2607,7 +2606,7 @@ impl DeploymentService {
             })?;
 
         let deployment_label = deployment.id.to_string();
-        let domain = settings.public_hostnames.project_deployment_hostname(
+        let domain = PublicHostnameStrategy::Standard.project_deployment_hostname(
             &settings.preview_domain,
             &project.slug,
             &environment.slug,

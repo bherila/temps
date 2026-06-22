@@ -17,12 +17,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supported in the query explorer, existing MariaDB/MySQL-compatible containers
   can be imported as MariaDB services, and full logical backup/restore uses
   `mariadb-dump` with `mysqldump` fallback for non-system databases.
-- **Configurable public hostname strategy**: platform settings now support
-  `public_hostnames` templates for generated environment, deployment, and
-  public compose-service routes. Operators can switch to the `flat` strategy to
-  keep generated hostnames one label beneath `preview_domain` for proxied
-  wildcard TLS providers such as Cloudflare Universal SSL; labels are sanitized
+- **Per-managed-domain flat hostname mode**: each DNS managed domain now has a
+  `generated_hostname_mode` (`standard`/`flat`), selected where the provider is
+  configured rather than in global settings. The `flat` mode keeps generated
+  service hostnames one label beneath `preview_domain` so a provider's
+  single-label wildcard cert (e.g. Cloudflare Free/Pro Universal SSL) covers
+  them. Providers advertise a `flat_hostnames` capability so the UI surfaces and
+  recommends the option only where it helps (Cloudflare). Labels are sanitized
   and truncated with stable short-hash suffixes when they exceed DNS limits.
+- **Hostname-mode preview & apply**: switching a domain to flat shows an impact
+  preview (changed hostnames + the DNS records a sync would reconcile + the
+  token's zone-access state) before an explicit apply that recomputes hostnames
+  and triggers a route reload.
+- **Per-hostname DNS zone sync**: opt-in per managed domain
+  (`sync_generated_records`). When a public `edge_target` is configured, the
+  apply step reconciles one proxied record per generated hostname against the
+  provider's live zone (A/AAAA for an IP target, otherwise CNAME), only ever
+  removing records that match Temps-generated hosts.
+- **Token zone-access flag**: Cloudflare 401/403 responses now surface as a
+  distinct permission error, and verifying a managed domain records whether the
+  token can actually manage the zone (`zone_access_ok` / `zone_access_error`) so
+  the UI can warn about a mis-scoped token.
 - **Managed S3 backend driver contract**: `temps-providers` now defines a `ManagedS3Backend` protocol for RustFS-compatible and Garage-compatible object-storage lifecycle operations, keeping `rustfs` as the default while requiring `garage` to be managed by an out-of-process provider over `provider_socket` so AGPL storage engines are not compiled into the Temps binary.
 - **MinIO as an S3 backend option**: Managed `s3` services can now select `backend=minio` alongside the default `rustfs` and Garage backend selector, so operators can keep MinIO compatibility without creating a separate current service type.
 - **Hosted website memory protection**: new projects and their default `production` environments now seed the hosted-website small resource profile with `memory_limit=512` MB (`memory_swap` pinned to the same value so the cap is a real hard limit), admission accounts for memory already reserved by running managed containers against the Docker host's capacity, and `memory_limit` gains an explicit uncapped sentinel (`0`) distinct from "inherit default" so operators can opt dedicated workloads out of the cap.
@@ -35,6 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   service UI now presents MariaDB as a shared database server whose linked
   projects get separate databases, reducing accidental one-container-per-website
   installs on 4 GiB and 8 GiB hosts.
+- The global `public_hostnames` platform setting (strategy + templates) is
+  removed in favour of the per-managed-domain mode above. On upgrade, an
+  instance that had the global strategy set to `flat` has that intent carried
+  onto its existing managed domains; instances with no managed domains revert to
+  the standard layout for future generation. A new global `edge_target` setting
+  configures where synced DNS records point.
 
 ### Fixed
 - **Laravel MariaDB docs use runtime service env vars**: the Laravel tutorial

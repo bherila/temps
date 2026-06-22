@@ -35,6 +35,8 @@ pub struct AppState {
     pub encryption_service: Arc<temps_core::EncryptionService>,
     /// Docker client for container exec/terminal
     pub docker: Arc<bollard::Docker>,
+    /// Resolves the per-managed-domain public hostname strategy (Standard/Flat).
+    pub hostname_resolver: Arc<dyn temps_core::PublicHostnameResolver>,
 }
 
 use crate::services::types::Deployment;

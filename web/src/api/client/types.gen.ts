@@ -759,22 +759,8 @@ export type ApiKeyResponse = {
 };
 
 /**
- * Operator-configurable templates for generated public hostnames.
- *
- * Templates may use `{base_domain}`, `{environment}`, `{service}`,
- * `{deployment}`, `{project}`, `{app}`, `{branch}`, `{preview_slug}`, and
- * `{short_hash}`. When `strategy = flat`, all generated labels before
- * `{base_domain}` are collapsed into a single DNS label.
- */
-export type PublicHostnameSettings = {
-    deployment_template?: string | null;
-    environment_template?: string | null;
-    service_template?: string | null;
-    strategy?: PublicHostnameStrategy;
-};
-
-/**
  * Public hostname generation mode for Temps-managed preview routes.
+ * Stored per managed domain (`generated_hostname_mode`), not globally.
  */
 export type PublicHostnameStrategy = 'standard' | 'flat';
 
@@ -834,9 +820,9 @@ export type AppSettings = {
      */
     monitoring?: MonitoringSettings;
     multi_node?: MultiNodeSettings;
+    edge_target?: string | null;
     preview_domain?: string;
     preview_gateway?: PreviewGatewaySettings;
-    public_hostnames?: PublicHostnameSettings;
     rate_limiting?: RateLimitSettings;
     screenshots?: ScreenshotSettings;
     security_headers?: SecurityHeadersSettings;
@@ -875,9 +861,9 @@ export type AppSettingsResponse = {
     letsencrypt: LetsEncryptSettings;
     monitoring: MonitoringSettingsMasked;
     multi_node: MultiNodeSettingsMasked;
+    edge_target?: string | null;
     preview_domain: string;
     preview_gateway: PreviewGatewaySettingsMasked;
-    public_hostnames: PublicHostnameSettings;
     rate_limiting: RateLimitSettings;
     screenshots: ScreenshotSettings;
     security_headers: SecurityHeadersSettings;
@@ -4058,6 +4044,11 @@ export type DnsProviderResponse = {
      */
     credentials: unknown;
     description?: string | null;
+    /**
+     * Whether this provider benefits from the flat hostname mode (e.g. Cloudflare
+     * Universal SSL). The UI surfaces/recommends the Flat toggle when true.
+     */
+    flat_hostnames_supported: boolean;
     id: number;
     is_active: boolean;
     last_error?: string | null;
@@ -7730,13 +7721,56 @@ export type ManagedDomainResponse = {
     auto_manage: boolean;
     created_at: string;
     domain: string;
+    /**
+     * Generated hostname layout: "standard" or "flat".
+     */
+    generated_hostname_mode: string;
     id: number;
     provider_id: number;
+    /**
+     * Whether generated hostnames are reconciled into the provider's DNS zone.
+     */
+    sync_generated_records: boolean;
     updated_at: string;
     verification_error?: string | null;
     verified: boolean;
     verified_at?: string | null;
+    /**
+     * Last token zone-access check result (null if unchecked).
+     */
+    zone_access_ok?: boolean | null;
+    zone_access_error?: string | null;
     zone_id?: string | null;
+};
+
+/**
+ * A single generated-hostname change in a flatten preview/apply.
+ */
+export type HostnameChange = {
+    kind: string;
+    id: number;
+    old: string;
+    new: string;
+};
+
+/**
+ * A single DNS record change the sync would make.
+ */
+export type DnsRecordChange = {
+    action: string;
+    name: string;
+    record_type: string;
+    value: string;
+};
+
+/**
+ * Combined preview of a hostname-mode change.
+ */
+export type HostnamePreviewResponse = {
+    hostname_changes: Array<HostnameChange>;
+    dns_changes: Array<DnsRecordChange>;
+    zone_access_ok?: boolean | null;
+    total: number;
 };
 
 /**
