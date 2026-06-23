@@ -950,8 +950,8 @@ impl CachedPeerTable {
                         deployment_id,
                         wake_timeout_seconds: wake_timeout,
                     });
-                    let full_domain =
-                        PublicHostnameStrategy::Standard.environment_hostname(&preview_domain, main_url);
+                    let full_domain = PublicHostnameStrategy::Standard
+                        .environment_hostname(&preview_domain, main_url);
                     sleeping_environments.push(SleepingEnvironmentEntry {
                         domain: full_domain,
                         environment_id: env.id,
@@ -1150,8 +1150,8 @@ impl CachedPeerTable {
                     }
 
                     // Also add route with preview_domain suffix if configured
-                    let full_domain =
-                        PublicHostnameStrategy::Standard.environment_hostname(&preview_domain, main_url);
+                    let full_domain = PublicHostnameStrategy::Standard
+                        .environment_hostname(&preview_domain, main_url);
                     if !routes.contains_key(&full_domain) {
                         routes.insert(
                             full_domain.clone(),
@@ -1423,8 +1423,8 @@ impl CachedPeerTable {
 
                     // Generate a fallback route using deployment slug if no other routes exist
                     // This ensures every active deployment is accessible
-                    let fallback_domain =
-                        PublicHostnameStrategy::Standard.deployment_hostname(&preview_domain, &deployment.slug);
+                    let fallback_domain = PublicHostnameStrategy::Standard
+                        .deployment_hostname(&preview_domain, &deployment.slug);
 
                     if !routes.contains_key(&fallback_domain) {
                         routes.insert(

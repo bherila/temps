@@ -16,8 +16,8 @@ use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiConfigSettings, AppSettings, AuditContext, AuditLogger,
     AuditOperation, ContainerLogSettings, DiskSpaceAlertSettings, LetsEncryptSettings,
-    MetricsStoreKind, RateLimitSettings,
-    RequestMetadata, ScreenshotSettings, SecurityHeadersSettings,
+    MetricsStoreKind, RateLimitSettings, RequestMetadata, ScreenshotSettings,
+    SecurityHeadersSettings,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
