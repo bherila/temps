@@ -122,6 +122,7 @@ mod m20260618_000001_create_on_demand_cert_attempts;
 mod m20260618_000002_add_domains_on_demand_backoff;
 mod m20260619_000001_add_settings_change_trigger;
 mod m20260622_000001_managed_domain_hostnames;
+mod m20260623_000001_add_external_services_default_backup_provisioned;
 
 pub struct Migrator;
 
@@ -247,6 +248,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260618_000002_add_domains_on_demand_backoff::Migration),
             Box::new(m20260619_000001_add_settings_change_trigger::Migration),
             Box::new(m20260622_000001_managed_domain_hostnames::Migration),
+            Box::new(
+                m20260623_000001_add_external_services_default_backup_provisioned::Migration,
+            ),
         ]
     }
 }
