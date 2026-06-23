@@ -781,6 +781,13 @@ export type AppSettings = {
      */
     build_limits?: BuildLimitsSettings;
     /**
+     * Nightly Docker/disk cleanup behaviour — retention windows for unused
+     * deployment images and BuildKit cache, plus the schedule. Operator-tunable
+     * at runtime; the cleanup scheduler re-reads this on every run, so changes
+     * take effect without a restart.
+     */
+    cleanup?: CleanupSettings;
+    /**
      * Binary version tag (e.g. "v0.1.0") of the *console* process
      * (`temps serve`, role=all or role=console) that last started. Written
      * on console startup; read by the standalone `temps proxy` to detect
@@ -830,6 +837,13 @@ export type AppSettings = {
     monitoring?: MonitoringSettings;
     multi_node?: MultiNodeSettings;
     on_demand_tls?: OnDemandTlsSettings;
+    /**
+     * OpenTelemetry ingest (OTLP/HTTP) settings. Instance-global kill-switch
+     * for the inbound metrics/traces/logs ingest endpoints under
+     * `/api/otel/v1*`. Distinct from `monitoring`, which governs the
+     * *outbound* Prometheus scraper (a different data source).
+     */
+    otel_ingest?: OtelIngestSettings;
     preview_domain?: string;
     preview_gateway?: PreviewGatewaySettings;
     rate_limiting?: RateLimitSettings;
@@ -850,6 +864,7 @@ export type AppSettings = {
 export type AppSettingsResponse = {
     agent_sandbox: AgentSandboxSettingsMasked;
     ai_config: AiConfigSettings;
+    cleanup: CleanupSettings;
     container_logs: ContainerLogSettings;
     disk_space_alert: DiskSpaceAlertSettings;
     dns_provider: DnsProviderSettingsMasked;
@@ -874,6 +889,14 @@ export type AppSettingsResponse = {
     letsencrypt: LetsEncryptSettings;
     monitoring: MonitoringSettingsMasked;
     multi_node: MultiNodeSettingsMasked;
+    /**
+     * Whether OTLP/HTTP ingestion is currently accepted. Mirrors
+     * `otel_ingest.enabled`. Flipped via the dedicated
+     * `PATCH /settings/otel-ingest` endpoint (guarded by `otel:write`), not
+     * the generic settings PUT — but surfaced here so the UI can render the
+     * current state without a second request.
+     */
+    otel_ingest_enabled: boolean;
     preview_domain: string;
     preview_gateway: PreviewGatewaySettingsMasked;
     rate_limiting: RateLimitSettings;
@@ -1622,6 +1645,60 @@ export type ChildBackupListResponse = {
      * Zero or more child backup entries ordered by `external_service_backups.id` ASC.
      */
     children: Array<ChildBackupEntryResponse>;
+};
+
+/**
+ * Nightly Docker/disk cleanup settings.
+ *
+ * Governs the background `DockerCleanupService` that reclaims disk on each
+ * node: dangling images, superseded *tagged* deployment images, and BuildKit
+ * build cache. Defaults are conservative — safe for a multi-tenant control
+ * plane — and every value is operator-tunable at runtime (the scheduler
+ * re-reads settings on every run, so no restart is needed).
+ *
+ * Image removal is always DB-driven: an image is only ever removed if its tag
+ * belongs to a known deployment that is neither live nor inside the
+ * per-environment rollback window. Base images and in-flight builds are never
+ * touched, regardless of these values.
+ */
+export type CleanupSettings = {
+    /**
+     * Maximum *unused* age (days) for BuildKit build cache. Cache not touched
+     * by a build within this window is reclaimed on the next run. Lower =
+     * reclaims disk sooner but causes more cold (slow) builds. Default 7.
+     * Typical: 1 (daily-deploy/disk-tight), 3 (weekday-active), 7 (default).
+     */
+    build_cache_max_age_days?: number;
+    /**
+     * Hard cap on total BuildKit build-cache size, in megabytes. Enforced
+     * independently of the age window, so a burst of builds cannot fill the
+     * disk before the next nightly run. `0` (default) means "no size cap —
+     * age window only". When set, the least-recently-used cache beyond this
+     * size is reclaimed regardless of age.
+     */
+    build_cache_max_size_mb?: number;
+    /**
+     * Master switch for the nightly cleanup. When `false`, no images or build
+     * cache are pruned (the static-asset/chunk cleanup still runs, as it is
+     * unrelated to Docker). Defaults to `true`.
+     */
+    enabled?: boolean;
+    /**
+     * Minimum age (days) an unreferenced deployment image must reach before it
+     * is eligible for removal. Acts as a safety floor against racing a deploy
+     * whose DB row hasn't reached a live state yet. Default 7.
+     */
+    image_max_age_days?: number;
+    /**
+     * How many of the most-recent deployments *per environment* to keep images
+     * for, so a rollback is always possible even when those deployments are no
+     * longer live. Default 3. Set 0 to keep only currently-live images.
+     */
+    keep_deployments_per_env?: number;
+    /**
+     * Hour of day (UTC, 0–23) the nightly cleanup runs. Default 2 (02:00 UTC).
+     */
+    run_hour_utc?: number;
 };
 
 export type CliDeviceApproveRequest = {
@@ -3399,9 +3476,11 @@ export type DeploymentConfig = {
      */
     antiAffinity?: boolean;
     /**
-     * Enable automatic deployments on git push
+     * Enable automatic deployments on git push.
+     * `None` = inherit from project config; `Some(true/false)` = explicit override.
+     * Stored as JSONB so absent key → `None` (inherit), never silently defaults to false.
      */
-    automaticDeploy?: boolean;
+    automaticDeploy?: boolean | null;
     /**
      * Enable container exec/shell access (disabled by default for security)
      */
@@ -8807,6 +8886,33 @@ export type OperationResultResponse = {
 export type OperationResultsResponse = {
     deployment_id: string;
     operations: Array<OperationResultResponse>;
+};
+
+/**
+ * OpenTelemetry ingest (OTLP/HTTP) settings.
+ *
+ * Controls the inbound OTLP receiver endpoints (`/api/otel/v1/metrics`,
+ * `/traces`, `/logs`, and their path-scoped variants). This is the
+ * data path where deployed applications and infrastructure services
+ * *push* telemetry into Temps — it is NOT temps self-instrumentation
+ * (temps does not emit its own OTLP) and NOT the Prometheus scraper
+ * (see [`MonitoringSettings`], a separate pull-based source).
+ */
+export type OtelIngestSettings = {
+    /**
+     * Master switch for OTLP ingest. When `false`, the ingest handlers
+     * short-circuit *before* auth/decompress/decode/store and return an
+     * empty OTLP success envelope (HTTP 200) so SDK exporters treat the
+     * batch as delivered and do not retry-storm. The background OTel
+     * analysis loops (anomaly detection, health compute) also pause while
+     * this is `false`.
+     *
+     * Defaults to `true`: OTLP ingest is a pre-existing always-on receiver,
+     * so a `settings` row written before this field existed deserializes to
+     * `enabled = true` (preserving current behaviour on upgrade — no silent
+     * telemetry loss).
+     */
+    enabled?: boolean;
 };
 
 /**
@@ -14555,6 +14661,28 @@ export type UpdateOidcProviderRequest = {
     scopes?: string | null;
     template?: string | null;
     trust_idp_email?: boolean | null;
+};
+
+/**
+ * Request body for the OTLP ingest kill-switch.
+ */
+export type UpdateOtelIngestRequest = {
+    /**
+     * Whether OTLP/HTTP ingestion (`/api/otel/v1*`) is accepted. When
+     * `false`, the ingest endpoints accept-and-discard (HTTP 200) and the
+     * OTel analysis loops pause.
+     */
+    enabled: boolean;
+};
+
+/**
+ * Response for the OTLP ingest kill-switch update.
+ */
+export type UpdateOtelIngestResponse = {
+    /**
+     * The effective state after the update.
+     */
+    enabled: boolean;
 };
 
 export type UpdatePreferencesRequest = {
@@ -39888,6 +40016,37 @@ export type UpdateGlobalMcpResponses = {
 };
 
 export type UpdateGlobalMcpResponse = UpdateGlobalMcpResponses[keyof UpdateGlobalMcpResponses];
+
+export type UpdateOtelIngestData = {
+    body: UpdateOtelIngestRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/otel-ingest';
+};
+
+export type UpdateOtelIngestErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions (requires otel:write)
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateOtelIngestResponses = {
+    /**
+     * OTLP ingest toggle updated
+     */
+    200: UpdateOtelIngestResponse;
+};
+
+export type UpdateOtelIngestResponse2 = UpdateOtelIngestResponses[keyof UpdateOtelIngestResponses];
 
 export type RefreshRouteTableData = {
     body?: never;
