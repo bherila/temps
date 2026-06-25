@@ -6,6 +6,7 @@
 
 use bollard::Docker;
 use serde::{Deserialize, Serialize};
+use serde_yaml::Value as YamlValue;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +26,9 @@ pub enum ComposeError {
 
     #[error("Docker API error: {0}")]
     Docker(String),
+
+    #[error("Compose file rejected by safety policy: {message}")]
+    Validation { message: String },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -98,6 +102,14 @@ impl ComposeExecutor {
     ) -> Result<Vec<ComposeServiceResult>, ComposeError> {
         let project_dir = self.project_dir(&request.project_name);
         let project_name = request.project_name.clone();
+
+        Self::validate_compose_policy("compose_content", &request.compose_content)?;
+        if let Some(ref compose_override) = request.compose_override {
+            if !compose_override.trim().is_empty() {
+                Self::validate_compose_policy("compose_override", compose_override)?;
+            }
+        }
+
         let has_build = self.has_build_directives(&request.compose_content);
 
         // Always use the repo checkout directory when available.
@@ -393,6 +405,120 @@ impl ComposeExecutor {
         );
 
         Ok(())
+    }
+
+    fn validate_compose_policy(source: &str, compose_content: &str) -> Result<(), ComposeError> {
+        let doc: YamlValue =
+            serde_yaml::from_str(compose_content).map_err(|e| ComposeError::Validation {
+                message: format!("{source} is not valid YAML: {e}"),
+            })?;
+
+        let Some(services) = doc.get("services").and_then(YamlValue::as_mapping) else {
+            return Ok(());
+        };
+
+        for (service_name, service) in services {
+            let service_name = service_name.as_str().unwrap_or("<unknown>");
+            let Some(service) = service.as_mapping() else {
+                continue;
+            };
+
+            Self::reject_bool(service, service_name, "privileged")?;
+            Self::reject_host_namespace(service, service_name, "network_mode")?;
+            Self::reject_host_namespace(service, service_name, "pid")?;
+            Self::reject_host_namespace(service, service_name, "ipc")?;
+            Self::reject_dangerous_volumes(service, service_name)?;
+        }
+
+        Ok(())
+    }
+
+    fn reject_bool(
+        service: &serde_yaml::Mapping,
+        service_name: &str,
+        key: &str,
+    ) -> Result<(), ComposeError> {
+        if service
+            .get(YamlValue::String(key.to_string()))
+            .and_then(YamlValue::as_bool)
+            == Some(true)
+        {
+            return Err(ComposeError::Validation {
+                message: format!("service '{service_name}' sets forbidden option '{key}: true'"),
+            });
+        }
+        Ok(())
+    }
+
+    fn reject_host_namespace(
+        service: &serde_yaml::Mapping,
+        service_name: &str,
+        key: &str,
+    ) -> Result<(), ComposeError> {
+        let Some(value) = service.get(YamlValue::String(key.to_string())) else {
+            return Ok(());
+        };
+        if value.as_str() == Some("host") {
+            return Err(ComposeError::Validation {
+                message: format!("service '{service_name}' sets forbidden option '{key}: host'"),
+            });
+        }
+        Ok(())
+    }
+
+    fn reject_dangerous_volumes(
+        service: &serde_yaml::Mapping,
+        service_name: &str,
+    ) -> Result<(), ComposeError> {
+        let Some(volumes) = service.get(YamlValue::String("volumes".to_string())) else {
+            return Ok(());
+        };
+        let Some(volumes) = volumes.as_sequence() else {
+            return Ok(());
+        };
+
+        for volume in volumes {
+            if Self::is_dangerous_volume(volume) {
+                return Err(ComposeError::Validation {
+                    message: format!(
+                        "service '{service_name}' mounts a forbidden host path or Docker socket"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn is_dangerous_volume(volume: &YamlValue) -> bool {
+        if let Some(short) = volume.as_str() {
+            return Self::short_volume_source(short)
+                .map(Self::is_dangerous_host_path)
+                .unwrap_or_else(|| short.contains("/var/run/docker.sock"));
+        }
+
+        let Some(mapping) = volume.as_mapping() else {
+            return false;
+        };
+        let source = mapping
+            .get(YamlValue::String("source".to_string()))
+            .or_else(|| mapping.get(YamlValue::String("src".to_string())))
+            .or_else(|| mapping.get(YamlValue::String("host".to_string())))
+            .and_then(YamlValue::as_str);
+
+        source.map(Self::is_dangerous_host_path).unwrap_or(false)
+    }
+
+    fn short_volume_source(volume: &str) -> Option<&str> {
+        let first = volume.split(':').next()?.trim();
+        if first.is_empty() || !first.starts_with('/') {
+            return None;
+        }
+        Some(first)
+    }
+
+    fn is_dangerous_host_path(path: &str) -> bool {
+        let trimmed = path.trim();
+        trimmed == "/" || trimmed == "/var/run/docker.sock"
     }
 
     /// Check if a compose file contains build: directives (services that need building)
@@ -1095,6 +1221,72 @@ services:
         assert!(override_yaml.contains(".env.temps"));
         // Each service should have env_file
         assert_eq!(override_yaml.matches("env_file:").count(), 3);
+    }
+
+    #[test]
+    fn test_compose_policy_allows_safe_services() {
+        let compose = r#"
+services:
+  web:
+    image: nginx:1.27
+    ports:
+      - "8080:80"
+    volumes:
+      - app-data:/usr/share/nginx/html
+volumes:
+  app-data:
+"#;
+
+        assert!(ComposeExecutor::validate_compose_policy("compose_content", compose).is_ok());
+    }
+
+    #[test]
+    fn test_compose_policy_rejects_privileged_service() {
+        let compose = r#"
+services:
+  web:
+    image: alpine
+    privileged: true
+"#;
+
+        let err = ComposeExecutor::validate_compose_policy("compose_content", compose).unwrap_err();
+        assert!(err.to_string().contains("privileged: true"));
+    }
+
+    #[test]
+    fn test_compose_policy_rejects_host_namespaces() {
+        for forbidden in ["network_mode: host", "pid: host", "ipc: host"] {
+            let compose = format!("services:\n  web:\n    image: alpine\n    {forbidden}\n");
+            let err =
+                ComposeExecutor::validate_compose_policy("compose_content", &compose).unwrap_err();
+            assert!(err.to_string().contains(&forbidden));
+        }
+    }
+
+    #[test]
+    fn test_compose_policy_rejects_host_root_and_docker_socket_mounts() {
+        let root_mount = r#"
+services:
+  web:
+    image: alpine
+    volumes:
+      - /:/host:rw
+"#;
+        let socket_mount = r#"
+services:
+  web:
+    image: alpine
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+"#;
+
+        for compose in [root_mount, socket_mount] {
+            let err =
+                ComposeExecutor::validate_compose_policy("compose_content", compose).unwrap_err();
+            assert!(err.to_string().contains("forbidden host path"));
+        }
     }
 
     #[test]

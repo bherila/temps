@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Compose deployment safety policy**: `temps-deployer` now rejects Compose services that request host-equivalent privileges (`privileged: true`, host namespaces, `/` bind mounts, or `/var/run/docker.sock`) before invoking `docker compose`, preventing low-privilege stack authors from escalating to control-plane host access.
+
 
 
 ## [0.1.0-beta.35] - 2026-06-19
