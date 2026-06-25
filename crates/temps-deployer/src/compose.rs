@@ -6,6 +6,7 @@
 
 use bollard::Docker;
 use serde::{Deserialize, Serialize};
+use serde_yaml::Value as YamlValue;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +26,19 @@ pub enum ComposeError {
 
     #[error("Docker API error: {0}")]
     Docker(String),
+
+    #[error("Compose security policy rejected {field} for service '{service}': {reason}")]
+    SecurityPolicyViolation {
+        service: String,
+        field: String,
+        reason: String,
+    },
+
+    #[error("Failed to parse compose YAML for '{compose_source}': {reason}")]
+    InvalidComposeYaml {
+        compose_source: String,
+        reason: String,
+    },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -98,6 +112,10 @@ impl ComposeExecutor {
     ) -> Result<Vec<ComposeServiceResult>, ComposeError> {
         let project_dir = self.project_dir(&request.project_name);
         let project_name = request.project_name.clone();
+        self.validate_compose_security_policy("compose file", &request.compose_content)?;
+        if let Some(ref compose_override) = request.compose_override {
+            self.validate_compose_security_policy("compose override", compose_override)?;
+        }
         let has_build = self.has_build_directives(&request.compose_content);
 
         // Always use the repo checkout directory when available.
@@ -359,6 +377,18 @@ impl ComposeExecutor {
                 })?;
         }
 
+        // Write Temps security override (injects sandbox hardening into every service).
+        let security_content = self.generate_security_override(&request.compose_content);
+        if !security_content.is_empty() {
+            let security_override_path = project_dir.join("docker-compose.temps-security.yml");
+            tokio::fs::write(&security_override_path, &security_content)
+                .await
+                .map_err(|e| ComposeError::FileWriteFailed {
+                    path: security_override_path.display().to_string(),
+                    reason: e.to_string(),
+                })?;
+        }
+
         // Write Temps labels override (injects sh.temps.* labels into every service for log collection)
         if !request.labels.is_empty() {
             let labels_override_path = project_dir.join("docker-compose.temps-labels.yml");
@@ -393,6 +423,178 @@ impl ComposeExecutor {
         );
 
         Ok(())
+    }
+
+    fn validate_compose_security_policy(
+        &self,
+        source: &str,
+        compose_content: &str,
+    ) -> Result<(), ComposeError> {
+        if compose_content.trim().is_empty() {
+            return Ok(());
+        }
+
+        let root: YamlValue = serde_yaml::from_str(compose_content).map_err(|e| {
+            ComposeError::InvalidComposeYaml {
+                compose_source: source.to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+
+        let Some(services) = root.get("services").and_then(YamlValue::as_mapping) else {
+            return Ok(());
+        };
+
+        for (service_key, service_value) in services {
+            let service_name = service_key.as_str().unwrap_or("<unknown>");
+            let Some(service) = service_value.as_mapping() else {
+                continue;
+            };
+
+            self.reject_bool(
+                service,
+                service_name,
+                "privileged",
+                true,
+                "privileged containers can bypass the host sandbox",
+            )?;
+            self.reject_present(
+                service,
+                service_name,
+                "cap_add",
+                "adding Linux capabilities is not allowed for compose deployments",
+            )?;
+            self.reject_present(
+                service,
+                service_name,
+                "devices",
+                "host device passthrough is not allowed for compose deployments",
+            )?;
+            self.reject_present(
+                service,
+                service_name,
+                "device_cgroup_rules",
+                "device cgroup rules can grant host device access",
+            )?;
+            self.reject_present(
+                service,
+                service_name,
+                "security_opt",
+                "custom security options can disable no-new-privileges or confinement",
+            )?;
+            self.reject_host_namespace(service, service_name, "network_mode")?;
+            self.reject_host_namespace(service, service_name, "pid")?;
+            self.reject_host_namespace(service, service_name, "ipc")?;
+            self.validate_service_volumes(service, service_name)?;
+        }
+
+        Ok(())
+    }
+
+    fn reject_bool(
+        &self,
+        service: &serde_yaml::Mapping,
+        service_name: &str,
+        field: &str,
+        rejected: bool,
+        reason: &str,
+    ) -> Result<(), ComposeError> {
+        if service
+            .get(YamlValue::String(field.to_string()))
+            .and_then(YamlValue::as_bool)
+            == Some(rejected)
+        {
+            return Err(ComposeError::SecurityPolicyViolation {
+                service: service_name.to_string(),
+                field: field.to_string(),
+                reason: reason.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn reject_present(
+        &self,
+        service: &serde_yaml::Mapping,
+        service_name: &str,
+        field: &str,
+        reason: &str,
+    ) -> Result<(), ComposeError> {
+        if service.contains_key(YamlValue::String(field.to_string())) {
+            return Err(ComposeError::SecurityPolicyViolation {
+                service: service_name.to_string(),
+                field: field.to_string(),
+                reason: reason.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn reject_host_namespace(
+        &self,
+        service: &serde_yaml::Mapping,
+        service_name: &str,
+        field: &str,
+    ) -> Result<(), ComposeError> {
+        let Some(value) = service.get(YamlValue::String(field.to_string())) else {
+            return Ok(());
+        };
+        if value.as_str().is_some_and(|v| v == "host") {
+            return Err(ComposeError::SecurityPolicyViolation {
+                service: service_name.to_string(),
+                field: field.to_string(),
+                reason: "host namespace sharing is not allowed for compose deployments".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_service_volumes(
+        &self,
+        service: &serde_yaml::Mapping,
+        service_name: &str,
+    ) -> Result<(), ComposeError> {
+        let Some(volumes) = service.get(YamlValue::String("volumes".to_string())) else {
+            return Ok(());
+        };
+        let Some(entries) = volumes.as_sequence() else {
+            return Ok(());
+        };
+
+        for entry in entries {
+            let Some(source) = Self::volume_source(entry) else {
+                continue;
+            };
+            if source == "/"
+                || source.starts_with("/var/run/docker.sock")
+                || source.starts_with("/run/docker.sock")
+                || source.starts_with("/etc")
+                || source.starts_with("/var/lib/docker")
+                || source.starts_with("/proc")
+                || source.starts_with("/sys")
+                || (source.starts_with('/') && !source.starts_with("/tmp/"))
+            {
+                return Err(ComposeError::SecurityPolicyViolation {
+                    service: service_name.to_string(),
+                    field: "volumes".to_string(),
+                    reason: format!("host bind mount source '{source}' is not allowed"),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn volume_source(entry: &YamlValue) -> Option<String> {
+        if let Some(value) = entry.as_str() {
+            return value.split(':').next().map(str::to_string);
+        }
+
+        let mapping = entry.as_mapping()?;
+        mapping
+            .get(YamlValue::String("source".to_string()))
+            .and_then(YamlValue::as_str)
+            .map(str::to_string)
     }
 
     /// Check if a compose file contains build: directives (services that need building)
@@ -496,6 +698,12 @@ impl ComposeExecutor {
         let temps_override = project_dir.join("docker-compose.temps-env.yml");
         if temps_override.exists() {
             cmd.args(["-f", "docker-compose.temps-env.yml"]);
+        }
+
+        // Include Temps security override (injects sandbox hardening)
+        let security_override = project_dir.join("docker-compose.temps-security.yml");
+        if security_override.exists() {
+            cmd.args(["-f", "docker-compose.temps-security.yml"]);
         }
 
         // Include Temps labels override (injects sh.temps.* labels for log collection)
@@ -744,6 +952,29 @@ impl ComposeExecutor {
             override_yaml.push_str(&format!("  {}:\n", service));
             override_yaml.push_str("    env_file:\n");
             override_yaml.push_str(&format!("      - {}\n", env_file));
+        }
+
+        override_yaml
+    }
+
+    /// Generate a docker-compose override that applies the same baseline sandboxing
+    /// used by the single-container Docker runtime.
+    fn generate_security_override(&self, compose_content: &str) -> String {
+        let services = self.parse_service_names(compose_content);
+
+        if services.is_empty() {
+            return String::new();
+        }
+
+        let mut override_yaml = String::from("services:\n");
+        for service in &services {
+            override_yaml.push_str(&format!("  {}:\n", service));
+            override_yaml.push_str("    cap_drop:\n");
+            override_yaml.push_str("      - ALL\n");
+            override_yaml.push_str("    security_opt:\n");
+            override_yaml.push_str("      - no-new-privileges:true\n");
+            override_yaml.push_str("    pids_limit: 512\n");
+            override_yaml.push_str("    init: true\n");
         }
 
         override_yaml
@@ -1209,6 +1440,88 @@ services:
         assert!(!result.contains("8123:8123"));
         assert!(!result.contains("9000:9000"));
         assert!(!result.contains("9181:9181"));
+    }
+
+    #[test]
+    fn test_validate_compose_security_policy_rejects_privileged_host_escape() {
+        let docker = Docker::connect_with_defaults();
+        if docker.is_err() {
+            return;
+        }
+        let executor = ComposeExecutor::new(Arc::new(docker.unwrap()), PathBuf::from("/tmp/test"));
+
+        let compose = r#"
+services:
+  pwn:
+    image: alpine
+    privileged: true
+    network_mode: host
+    pid: host
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/host:rw
+"#;
+
+        let error = executor
+            .validate_compose_security_policy("compose file", compose)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ComposeError::SecurityPolicyViolation { field, .. } if field == "privileged"
+        ));
+    }
+
+    #[test]
+    fn test_validate_compose_security_policy_rejects_docker_socket_mount() {
+        let docker = Docker::connect_with_defaults();
+        if docker.is_err() {
+            return;
+        }
+        let executor = ComposeExecutor::new(Arc::new(docker.unwrap()), PathBuf::from("/tmp/test"));
+
+        let compose = r#"
+services:
+  worker:
+    image: alpine
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+"#;
+
+        let error = executor
+            .validate_compose_security_policy("compose file", compose)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ComposeError::SecurityPolicyViolation { field, .. } if field == "volumes"
+        ));
+    }
+
+    #[test]
+    fn test_generate_security_override() {
+        let docker = Docker::connect_with_defaults();
+        if docker.is_err() {
+            return;
+        }
+        let executor = ComposeExecutor::new(Arc::new(docker.unwrap()), PathBuf::from("/tmp/test"));
+
+        let compose = r#"
+services:
+  web:
+    image: nginx
+  worker:
+    image: alpine
+"#;
+        let override_yaml = executor.generate_security_override(compose);
+
+        assert_eq!(override_yaml.matches("cap_drop:").count(), 2);
+        assert_eq!(override_yaml.matches("no-new-privileges:true").count(), 2);
+        assert_eq!(override_yaml.matches("pids_limit: 512").count(), 2);
+        assert_eq!(override_yaml.matches("init: true").count(), 2);
     }
 
     #[test]
