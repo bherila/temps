@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Compose deployment sandbox hardening**: Docker Compose deployments now reject dangerous service directives such as `privileged`, `cap_add`, host namespace modes, host device access, and sensitive absolute host bind mounts before running `docker compose up`, and Temps writes a `docker-compose.temps-security.yml` override that applies `cap_drop: [ALL]`, `no-new-privileges`, `pids_limit`, and `init` to every compose service so repository-provided compose files cannot bypass the single-container Docker sandbox protections.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
