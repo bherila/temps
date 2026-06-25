@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Deployment token control-plane authorization bypass**: `dt_` deployment tokens, including auto-generated `TEMPS_API_TOKEN` values with `["*"]`, no longer satisfy arbitrary standard control-plane permissions such as `UsersWrite`, `DeploymentTokensCreate`, or `SettingsWrite`. Deployment-token `FullAccess` is now limited to explicitly mapped deployment-token API permissions so deployed applications cannot reuse their environment token for unrelated admin APIs.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
