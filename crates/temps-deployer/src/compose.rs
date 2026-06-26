@@ -595,9 +595,7 @@ impl ComposeExecutor {
                     return Err(ComposeError::SecurityPolicyViolation {
                         service: format!("{key}.{name}"),
                         field: format!("{key}.file"),
-                        reason: format!(
-                            "host file '{file}' exposed through {key} is not allowed"
-                        ),
+                        reason: format!("host file '{file}' exposed through {key} is not allowed"),
                     });
                 }
             }
@@ -1991,12 +1989,18 @@ secrets:
             return;
         };
         for (field, compose) in [
-            ("cgroup", "services:\n  app:\n    image: alpine\n    cgroup: host\n"),
+            (
+                "cgroup",
+                "services:\n  app:\n    image: alpine\n    cgroup: host\n",
+            ),
             (
                 "userns_mode",
                 "services:\n  app:\n    image: alpine\n    userns_mode: \"host\"\n",
             ),
-            ("uts", "services:\n  app:\n    image: alpine\n    uts: \"host\"\n"),
+            (
+                "uts",
+                "services:\n  app:\n    image: alpine\n    uts: \"host\"\n",
+            ),
         ] {
             let err = executor
                 .validate_compose_security_policy("compose file", compose)
