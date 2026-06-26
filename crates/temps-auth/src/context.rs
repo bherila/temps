@@ -181,6 +181,11 @@ impl AuthContext {
             let required_dt_perm = match permission {
                 Permission::AnalyticsRead => DeploymentTokenPermission::AnalyticsRead,
                 Permission::AnalyticsWrite => DeploymentTokenPermission::VisitorsEnrich,
+                // Deployed apps inject their deployment token as TEMPS_API_TOKEN
+                // and use it to call POST /emails (guarded by EmailsSend). This
+                // is documented, project-scoped machine access, so map it to the
+                // matching deployment-token permission.
+                Permission::EmailsSend => DeploymentTokenPermission::EmailsSend,
                 // No implicit bridge from deployment-token permissions to
                 // general control-plane permissions.
                 _ => return false,
@@ -374,6 +379,29 @@ mod tests {
 
         assert!(ctx.has_permission(&Permission::AnalyticsRead));
         assert!(ctx.has_permission(&Permission::AnalyticsWrite));
+    }
+
+    #[test]
+    fn deployment_token_full_access_grants_emails_send() {
+        // Deployed apps use their injected deployment token to call POST /emails;
+        // FullAccess must keep satisfying EmailsSend.
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::FullAccess]);
+        assert!(ctx.has_permission(&Permission::EmailsSend));
+    }
+
+    #[test]
+    fn deployment_token_emails_send_permission_grants_emails_send() {
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::EmailsSend]);
+        assert!(ctx.has_permission(&Permission::EmailsSend));
+        // ...but a narrow emails:send token must not gain analytics access.
+        assert!(!ctx.has_permission(&Permission::AnalyticsRead));
+        assert!(!ctx.has_permission(&Permission::AnalyticsWrite));
+    }
+
+    #[test]
+    fn deployment_token_without_emails_send_is_denied_emails_send() {
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::AnalyticsRead]);
+        assert!(!ctx.has_permission(&Permission::EmailsSend));
     }
 
     #[test]

@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
-- **Deployment token control-plane authorization bypass**: `dt_` deployment tokens, including auto-generated `TEMPS_API_TOKEN` values with `["*"]`, no longer satisfy arbitrary standard control-plane permissions such as `UsersWrite`, `DeploymentTokensCreate`, or `SettingsWrite`. Deployment-token `FullAccess` is now limited to explicitly mapped deployment-token API permissions so deployed applications cannot reuse their environment token for unrelated admin APIs.
+- **Deployment token control-plane authorization bypass**: `dt_` deployment tokens, including auto-generated `TEMPS_API_TOKEN` values with `["*"]`, no longer satisfy arbitrary standard control-plane permissions such as `UsersWrite`, `DeploymentTokensCreate`, or `SettingsWrite`. Deployment-token `FullAccess` is now limited to explicitly mapped deployment-token API permissions so deployed applications cannot reuse their environment token for unrelated admin APIs. The documented `emails:send` capability is preserved: deployment tokens (and `FullAccess`) still satisfy `EmailsSend` so deployed apps can keep calling `POST /emails`.
+- **Cross-project analytics access via deployment tokens (IDOR)**: project-bound deployment tokens — even with `FullAccess` — can no longer read or write another project's analytics. The `/projects/{project_id}/events*` query and ingest endpoints now enforce the token's bound project via `project_scope_guard!`, and the cross-project `dashboard/projects-analytics` batch endpoint rejects deployment tokens outright.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
