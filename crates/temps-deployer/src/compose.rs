@@ -1544,7 +1544,8 @@ services:
 
     #[test]
     fn test_compose_policy_rejects_relative_path_escape() {
-        let compose = "services:\n  web:\n    image: alpine\n    volumes:\n      - ../../../etc:/host\n";
+        let compose =
+            "services:\n  web:\n    image: alpine\n    volumes:\n      - ../../../etc:/host\n";
         let err = ComposeExecutor::validate_compose_policy("compose_content", compose).unwrap_err();
         assert!(err.to_string().contains("forbidden host path"));
     }
