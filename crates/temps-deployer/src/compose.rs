@@ -7,7 +7,7 @@
 use bollard::Docker;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -103,12 +103,10 @@ impl ComposeExecutor {
         let project_dir = self.project_dir(&request.project_name);
         let project_name = request.project_name.clone();
 
-        Self::validate_compose_policy("compose_content", &request.compose_content)?;
-        if let Some(ref compose_override) = request.compose_override {
-            if !compose_override.trim().is_empty() {
-                Self::validate_compose_policy("compose_override", compose_override)?;
-            }
-        }
+        Self::validate_compose_safety(
+            &request.compose_content,
+            request.compose_override.as_deref(),
+        )?;
 
         let has_build = self.has_build_directives(&request.compose_content);
 
@@ -407,11 +405,56 @@ impl ComposeExecutor {
         Ok(())
     }
 
+    /// Fields whose value (or any nested value) must never contain `${...}`
+    /// interpolation. An attacker could otherwise smuggle host/privileged access
+    /// past the static checks via env defaults like `network_mode: ${NET:-host}`
+    /// or `privileged: ${P:-true}`.
+    const INTERPOLATION_GUARDED_FIELDS: &'static [&'static str] = &[
+        "privileged",
+        "use_api_socket",
+        "network_mode",
+        "pid",
+        "ipc",
+        "userns_mode",
+        "uts",
+        "cgroup",
+        "cap_add",
+        "devices",
+        "volumes",
+        "security_opt",
+        "group_add",
+        "device_cgroup_rules",
+    ];
+
+    /// Host-namespace fields that must never be set to `host`.
+    const HOST_NAMESPACE_FIELDS: &'static [&'static str] =
+        &["network_mode", "pid", "ipc", "userns_mode", "uts", "cgroup"];
+
+    /// Public preflight: validate compose content (and optional override) against
+    /// the safety policy WITHOUT any side effects. Callers should run this before
+    /// tearing down an existing stack so a rejected config never causes downtime.
+    pub fn validate_compose_safety(
+        compose_content: &str,
+        compose_override: Option<&str>,
+    ) -> Result<(), ComposeError> {
+        Self::validate_compose_policy("compose_content", compose_content)?;
+        if let Some(compose_override) = compose_override {
+            if !compose_override.trim().is_empty() {
+                Self::validate_compose_policy("compose_override", compose_override)?;
+            }
+        }
+        Ok(())
+    }
+
     fn validate_compose_policy(source: &str, compose_content: &str) -> Result<(), ComposeError> {
         let doc: YamlValue =
             serde_yaml::from_str(compose_content).map_err(|e| ComposeError::Validation {
                 message: format!("{source} is not valid YAML: {e}"),
             })?;
+
+        // Named volumes whose driver_opts bind to a forbidden host device/socket.
+        // Any service mounting one of these is rejected.
+        let dangerous_named_volumes = Self::dangerous_named_volumes(&doc);
 
         let Some(services) = doc.get("services").and_then(YamlValue::as_mapping) else {
             return Ok(());
@@ -423,14 +466,45 @@ impl ComposeExecutor {
                 continue;
             };
 
+            Self::reject_interpolation(service, service_name)?;
             Self::reject_bool(service, service_name, "privileged")?;
-            Self::reject_host_namespace(service, service_name, "network_mode")?;
-            Self::reject_host_namespace(service, service_name, "pid")?;
-            Self::reject_host_namespace(service, service_name, "ipc")?;
-            Self::reject_dangerous_volumes(service, service_name)?;
+            Self::reject_bool(service, service_name, "use_api_socket")?;
+            for key in Self::HOST_NAMESPACE_FIELDS {
+                Self::reject_host_namespace(service, service_name, key)?;
+            }
+            Self::reject_dangerous_volumes(service, service_name, &dangerous_named_volumes)?;
         }
 
         Ok(())
+    }
+
+    /// Reject `${...}` interpolation appearing anywhere within a guarded field.
+    fn reject_interpolation(
+        service: &serde_yaml::Mapping,
+        service_name: &str,
+    ) -> Result<(), ComposeError> {
+        for key in Self::INTERPOLATION_GUARDED_FIELDS {
+            let Some(value) = service.get(YamlValue::String((*key).to_string())) else {
+                continue;
+            };
+            if Self::contains_interpolation(value) {
+                return Err(ComposeError::Validation {
+                    message: format!(
+                        "service '{service_name}' uses '${{...}}' interpolation in guarded field '{key}'; this is forbidden because it can smuggle host/privileged access via env defaults"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn contains_interpolation(value: &YamlValue) -> bool {
+        match value {
+            YamlValue::String(s) => s.contains("${"),
+            YamlValue::Sequence(seq) => seq.iter().any(Self::contains_interpolation),
+            YamlValue::Mapping(map) => map.values().any(Self::contains_interpolation),
+            _ => false,
+        }
     }
 
     fn reject_bool(
@@ -458,6 +532,7 @@ impl ComposeExecutor {
         let Some(value) = service.get(YamlValue::String(key.to_string())) else {
             return Ok(());
         };
+        // `cgroup: host` is plain `host`; namespaces may also be `host` directly.
         if value.as_str() == Some("host") {
             return Err(ComposeError::Validation {
                 message: format!("service '{service_name}' sets forbidden option '{key}: host'"),
@@ -466,9 +541,44 @@ impl ComposeExecutor {
         Ok(())
     }
 
+    /// Inspect top-level `volumes.<name>.driver_opts.device` and return the set of
+    /// named volumes that bind to a forbidden host path / Docker socket. A service
+    /// can mount a named volume that is really a `o: bind` to `/var/run/docker.sock`
+    /// or `/`, so those named volumes must be treated as dangerous.
+    fn dangerous_named_volumes(doc: &YamlValue) -> HashSet<String> {
+        let mut set = HashSet::new();
+        let Some(volumes) = doc.get("volumes").and_then(YamlValue::as_mapping) else {
+            return set;
+        };
+        for (name, def) in volumes {
+            let Some(name) = name.as_str() else {
+                continue;
+            };
+            let Some(def) = def.as_mapping() else {
+                continue;
+            };
+            let Some(opts) = def
+                .get(YamlValue::String("driver_opts".to_string()))
+                .and_then(YamlValue::as_mapping)
+            else {
+                continue;
+            };
+            if let Some(device) = opts
+                .get(YamlValue::String("device".to_string()))
+                .and_then(YamlValue::as_str)
+            {
+                if device.contains("${") || Self::is_dangerous_host_path(device) {
+                    set.insert(name.to_string());
+                }
+            }
+        }
+        set
+    }
+
     fn reject_dangerous_volumes(
         service: &serde_yaml::Mapping,
         service_name: &str,
+        dangerous_named_volumes: &HashSet<String>,
     ) -> Result<(), ComposeError> {
         let Some(volumes) = service.get(YamlValue::String("volumes".to_string())) else {
             return Ok(());
@@ -478,10 +588,10 @@ impl ComposeExecutor {
         };
 
         for volume in volumes {
-            if Self::is_dangerous_volume(volume) {
+            if Self::is_dangerous_volume(volume, dangerous_named_volumes) {
                 return Err(ComposeError::Validation {
                     message: format!(
-                        "service '{service_name}' mounts a forbidden host path or Docker socket"
+                        "service '{service_name}' mounts a forbidden host path, Docker socket, or unsafe named volume"
                     ),
                 });
             }
@@ -489,36 +599,137 @@ impl ComposeExecutor {
         Ok(())
     }
 
-    fn is_dangerous_volume(volume: &YamlValue) -> bool {
-        if let Some(short) = volume.as_str() {
-            return Self::short_volume_source(short)
-                .map(Self::is_dangerous_host_path)
-                .unwrap_or_else(|| short.contains("/var/run/docker.sock"));
-        }
-
-        let Some(mapping) = volume.as_mapping() else {
+    fn is_dangerous_volume(volume: &YamlValue, dangerous_named_volumes: &HashSet<String>) -> bool {
+        let source = Self::volume_source(volume);
+        let Some(source) = source else {
             return false;
         };
-        let source = mapping
+        let source = source.trim();
+        if source.is_empty() {
+            return false;
+        }
+        // Interpolation in the source is forbidden (e.g. `${SRC:-/}:/host`).
+        if source.contains("${") {
+            return true;
+        }
+        // A path (absolute or relative) is a host bind mount; a bare name is a
+        // named volume reference.
+        if source.starts_with('/') || source.starts_with('.') || source.contains('/') {
+            Self::is_dangerous_host_path(source)
+        } else {
+            dangerous_named_volumes.contains(source)
+        }
+    }
+
+    /// Extract the host-side source from a short (`src:dst:opts`) or long
+    /// (`{ source/src/host: ... }`) volume entry.
+    fn volume_source(volume: &YamlValue) -> Option<String> {
+        if let Some(short) = volume.as_str() {
+            let first = short.split(':').next()?.trim();
+            if first.is_empty() {
+                return None;
+            }
+            return Some(first.to_string());
+        }
+        let mapping = volume.as_mapping()?;
+        mapping
             .get(YamlValue::String("source".to_string()))
             .or_else(|| mapping.get(YamlValue::String("src".to_string())))
             .or_else(|| mapping.get(YamlValue::String("host".to_string())))
-            .and_then(YamlValue::as_str);
-
-        source.map(Self::is_dangerous_host_path).unwrap_or(false)
+            .and_then(YamlValue::as_str)
+            .map(|s| s.to_string())
     }
 
-    fn short_volume_source(volume: &str) -> Option<&str> {
-        let first = volume.split(':').next()?.trim();
-        if first.is_empty() || !first.starts_with('/') {
-            return None;
+    /// Normalize an absolute path: resolve `.`/`..` components and collapse the
+    /// `/var/run` -> `/run` alias so socket checks can't be bypassed.
+    fn normalize_abs_path(path: &str) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        for comp in path.split('/') {
+            match comp {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
         }
-        Some(first)
+        let joined = if parts.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", parts.join("/"))
+        };
+        // /var/run is a symlink to /run on modern distros; treat them as one.
+        if joined == "/var/run" {
+            "/run".to_string()
+        } else if let Some(rest) = joined.strip_prefix("/var/run/") {
+            format!("/run/{rest}")
+        } else {
+            joined
+        }
     }
 
     fn is_dangerous_host_path(path: &str) -> bool {
         let trimmed = path.trim();
-        trimmed == "/" || trimmed == "/var/run/docker.sock"
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        // Relative path: reject if any `..` component escapes upward out of the
+        // allowed (project) tree, e.g. `../../../etc:/host`.
+        if !trimmed.starts_with('/') {
+            let mut depth: i32 = 0;
+            for comp in trimmed.split('/') {
+                match comp {
+                    "" | "." => {}
+                    ".." => {
+                        depth -= 1;
+                        if depth < 0 {
+                            return true;
+                        }
+                    }
+                    _ => depth += 1,
+                }
+            }
+            return false;
+        }
+
+        let norm = Self::normalize_abs_path(trimmed);
+
+        // The Docker socket (normalized form) and anything resolving to it.
+        const SOCKET: &str = "/run/docker.sock";
+        if norm == SOCKET {
+            return true;
+        }
+        // An ancestor of the socket (e.g. `/`, `/run`) — mounting it exposes the
+        // socket, so reject it.
+        if SOCKET.starts_with(&format!("{}/", norm.trim_end_matches('/'))) {
+            return true;
+        }
+
+        // Sensitive host roots: reject the path itself or anything beneath it.
+        // Note: `/` itself is already rejected by the socket-ancestor check above.
+        const FORBIDDEN_ROOTS: &[&str] = &[
+            "/etc",
+            "/proc",
+            "/sys",
+            "/boot",
+            "/dev",
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib64",
+            "/root",
+            "/run",
+            "/var/run",
+            "/var/lib/docker",
+        ];
+        for root in FORBIDDEN_ROOTS {
+            if norm == *root || norm.starts_with(&format!("{}/", root.trim_end_matches('/'))) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Check if a compose file contains build: directives (services that need building)
@@ -1255,12 +1466,122 @@ services:
 
     #[test]
     fn test_compose_policy_rejects_host_namespaces() {
-        for forbidden in ["network_mode: host", "pid: host", "ipc: host"] {
+        for forbidden in [
+            "network_mode: host",
+            "pid: host",
+            "ipc: host",
+            "userns_mode: host",
+            "uts: host",
+            "cgroup: host",
+        ] {
             let compose = format!("services:\n  web:\n    image: alpine\n    {forbidden}\n");
             let err =
                 ComposeExecutor::validate_compose_policy("compose_content", &compose).unwrap_err();
-            assert!(err.to_string().contains(&forbidden));
+            assert!(err.to_string().contains(forbidden));
         }
+    }
+
+    #[test]
+    fn test_compose_policy_rejects_interpolation_in_guarded_fields() {
+        // network_mode via env default
+        let net = "services:\n  web:\n    image: alpine\n    network_mode: ${NET_MODE:-host}\n";
+        let err = ComposeExecutor::validate_compose_policy("compose_content", net).unwrap_err();
+        assert!(err.to_string().contains("interpolation"));
+        assert!(err.to_string().contains("network_mode"));
+
+        // privileged via env default
+        let priv_compose = "services:\n  web:\n    image: alpine\n    privileged: ${P:-true}\n";
+        let err =
+            ComposeExecutor::validate_compose_policy("compose_content", priv_compose).unwrap_err();
+        assert!(err.to_string().contains("interpolation"));
+
+        // volume source via env default
+        let vol = "services:\n  web:\n    image: alpine\n    volumes:\n      - ${SRC:-/}:/host\n";
+        let err = ComposeExecutor::validate_compose_policy("compose_content", vol).unwrap_err();
+        assert!(err.to_string().contains("interpolation"));
+    }
+
+    #[test]
+    fn test_compose_policy_rejects_use_api_socket() {
+        let compose = "services:\n  web:\n    image: alpine\n    use_api_socket: true\n";
+        let err = ComposeExecutor::validate_compose_policy("compose_content", compose).unwrap_err();
+        assert!(err.to_string().contains("use_api_socket: true"));
+    }
+
+    #[test]
+    fn test_compose_policy_rejects_socket_aliases_and_parents() {
+        for source in [
+            "/var/run:/var/run",
+            "/run/docker.sock:/var/run/docker.sock",
+            "/var/run/docker.sock:/var/run/docker.sock",
+            "/run:/run",
+            "/var/run/./docker.sock:/sock",
+        ] {
+            let compose =
+                format!("services:\n  web:\n    image: alpine\n    volumes:\n      - {source}\n");
+            let err =
+                ComposeExecutor::validate_compose_policy("compose_content", &compose).unwrap_err();
+            assert!(
+                err.to_string().contains("forbidden host path"),
+                "expected rejection for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compose_policy_rejects_sensitive_absolute_binds() {
+        for source in ["/etc:/host-etc", "/proc/sys:/x", "/var/lib/docker:/d"] {
+            let compose =
+                format!("services:\n  web:\n    image: alpine\n    volumes:\n      - {source}\n");
+            let err =
+                ComposeExecutor::validate_compose_policy("compose_content", &compose).unwrap_err();
+            assert!(
+                err.to_string().contains("forbidden host path"),
+                "expected rejection for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compose_policy_rejects_relative_path_escape() {
+        let compose = "services:\n  web:\n    image: alpine\n    volumes:\n      - ../../../etc:/host\n";
+        let err = ComposeExecutor::validate_compose_policy("compose_content", compose).unwrap_err();
+        assert!(err.to_string().contains("forbidden host path"));
+    }
+
+    #[test]
+    fn test_compose_policy_rejects_named_volume_bound_to_socket() {
+        let compose = r#"
+services:
+  web:
+    image: alpine
+    volumes:
+      - dockersock:/var/run/docker.sock
+volumes:
+  dockersock:
+    driver_opts:
+      type: none
+      o: bind
+      device: /var/run/docker.sock
+"#;
+        let err = ComposeExecutor::validate_compose_policy("compose_content", compose).unwrap_err();
+        assert!(err.to_string().contains("unsafe named volume"));
+    }
+
+    #[test]
+    fn test_compose_policy_allows_safe_relative_and_named_volumes() {
+        let compose = r#"
+services:
+  web:
+    image: nginx:1.27
+    volumes:
+      - ./data:/usr/share/nginx/html
+      - app-data:/var/lib/app
+      - /srv/myapp/config:/config:ro
+volumes:
+  app-data:
+"#;
+        assert!(ComposeExecutor::validate_compose_policy("compose_content", compose).is_ok());
     }
 
     #[test]

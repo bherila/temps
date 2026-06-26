@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
-- **Compose deployment safety policy**: `temps-deployer` now rejects Compose services that request host-equivalent privileges (`privileged: true`, host namespaces, `/` bind mounts, or `/var/run/docker.sock`) before invoking `docker compose`, preventing low-privilege stack authors from escalating to control-plane host access.
+- **Compose deployment safety policy**: `temps-deployer` now rejects Compose services that request host-equivalent privileges (`privileged: true`, host namespaces, `/` bind mounts, or `/var/run/docker.sock`) before invoking `docker compose`, preventing low-privilege stack authors from escalating to control-plane host access. Hardened against several bypasses: `${...}` interpolation in guarded fields (e.g. `network_mode: ${NET:-host}`, `privileged: ${P:-true}`), Docker socket aliases and parent directories (`/var/run`, `/run`, `/run/docker.sock`), Compose API socket delegation (`use_api_socket: true`), named volumes whose `driver_opts` bind to the socket or `/`, the remaining host namespace modes (`userns_mode`, `uts`, `cgroup`), relative-path bind escapes (`../../../etc`), and sensitive absolute host binds (`/etc`, `/proc`, `/var/lib/docker`, etc.). The policy is now also enforced as a preflight in `DeployComposeJob` before the existing stack is torn down, so a rejected config no longer causes downtime.
 
 
 
