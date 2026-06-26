@@ -287,6 +287,21 @@ impl WorkflowTask for DeployComposeJob {
             None
         };
 
+        // Validate the compose security policy BEFORE tearing down the existing
+        // stack. Rejecting after teardown would cause downtime on the running
+        // deployment for what is purely a configuration problem.
+        if let Err(e) = self
+            .compose_executor
+            .preflight_validate(&compose_content, self.compose_override.as_deref())
+        {
+            let error_msg = format!("Compose security policy rejected deployment: {}", e);
+            tracing::error!(error = %error_msg, "Docker Compose preflight validation failed");
+            if let Some(ref log_id) = self.log_id {
+                let _ = self.log_service.log_error(log_id, &error_msg).await;
+            }
+            return Err(WorkflowError::JobExecutionFailed(error_msg));
+        }
+
         // Tear down previous containers (preserve volumes for data persistence)
         if let Some(ref log_id) = self.log_id {
             let _ = self
