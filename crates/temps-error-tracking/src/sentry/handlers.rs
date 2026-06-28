@@ -4,9 +4,9 @@
 use axum::{
     body::Bytes,
     extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-    routing::post,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::{get, post},
     Json, Router,
 };
 use flate2::read::GzDecoder;
@@ -20,9 +20,11 @@ use utoipa::OpenApi;
 use crate::providers::{sentry::SentryProvider, AuthContext, ErrorProvider};
 use crate::sentry::dsn_service::{public_key_prefix, DSNService};
 use crate::sentry::envelope::peek_envelope_dsn;
+use crate::sentry::envelope::CheckIn;
 use crate::sentry::rate_limiter::{Admission, IngestRateLimiter};
 use crate::sentry::types::{SentryEventRequest, SentryEventResponse};
 use crate::services::error_tracking_service::ErrorTrackingService;
+use crate::services::monitor_service::MonitorService;
 use temps_geo::IpAddressService;
 use temps_proxy::CachedPeerTable;
 
@@ -88,6 +90,8 @@ pub struct AppState {
     /// this is a separate injection rather than an accessor on the provider.
     pub dsn_service: Arc<DSNService>,
     pub rate_limiter: IngestRateLimiter,
+    /// Monitor (cron check-in) service. Optional so unit tests can omit it.
+    pub monitor_service: Option<Arc<MonitorService>>,
 }
 
 /// Maximum compressed body size for Sentry ingest routes (2 MiB).
@@ -110,7 +114,16 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/{project_id}/store/", post(ingest_sentry_event))
         .route("/{project_id}/envelope/", post(ingest_sentry_envelope))
-        .route(SENTRY_TUNNEL_ROUTE_PATH, post(ingest_tunneled_envelope))
+        // Sentry simple cron check-in "ping" URL (GET or POST), e.g.
+        // /api/{project_id}/cron/{monitor_slug}/{sentry_key}/?status=ok
+        .route(
+            "/{project_id}/cron/{monitor_slug}/{sentry_key}/",
+            get(ingest_cron_ping).post(ingest_cron_ping),
+        )
+        .route(
+            "/{project_id}/cron/{monitor_slug}/{sentry_key}",
+            get(ingest_cron_ping).post(ingest_cron_ping),
+        )
         // Fix #3: cap compressed body to 2 MiB before any buffering occurs.
         // This prevents slow-POST DoS where a client drip-feeds a large body
         // to hold a Tokio worker thread indefinitely.
@@ -976,6 +989,35 @@ async fn process_parsed_envelope(
     decompressed_body: &Bytes,
     client_ip: &str,
 ) -> Response {
+    // Process monitor check-ins (a separate concern from error events). An
+    // envelope may contain only check-ins, only events, or a mix.
+    if let Some(monitor_service) = state.monitor_service.as_ref() {
+        match state.sentry_provider.parse_check_ins(decompressed_body) {
+            Ok(check_ins) => {
+                for ci in &check_ins {
+                    match monitor_service
+                        .record_check_in(auth.project_id, auth.environment_id, ci)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(e) => tracing::error!(
+                            "Failed to record check-in for project {}: {}",
+                            auth.project_id,
+                            e
+                        ),
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to parse check-ins for project {}: {}",
+                    auth.project_id,
+                    e
+                );
+            }
+        }
+    }
+
     // Parse envelope using the provider
     let parsed_events = match state
         .sentry_provider
@@ -1034,6 +1076,70 @@ async fn process_parsed_envelope(
     }
 
     StatusCode::OK.into_response()
+}
+
+/// Ingest a Sentry "simple" cron check-in via URL (GET or POST).
+///
+/// Format: `/{project_id}/cron/{monitor_slug}/{sentry_key}/?status=ok`
+/// The status query param defaults to `ok`; `check_in_id` may be supplied to
+/// correlate an `in_progress` start with its terminal report.
+async fn ingest_cron_ping(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, monitor_slug, sentry_key)): Path<(i32, String, String)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let monitor_service = match state.monitor_service.as_ref() {
+        Some(svc) => svc,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Monitor service unavailable".to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    let auth = match state
+        .sentry_provider
+        .authenticate(project_id, &sentry_key)
+        .await
+    {
+        Ok(auth) => auth,
+        Err(e) => {
+            tracing::error!("Cron ping authentication failed: {:?}", e);
+            return (StatusCode::UNAUTHORIZED, e.to_string()).into_response();
+        }
+    };
+
+    let status = params
+        .get("status")
+        .cloned()
+        .unwrap_or_else(|| "ok".to_string());
+
+    let check_in = CheckIn {
+        check_in_id: params.get("check_in_id").cloned(),
+        monitor_slug: Some(monitor_slug),
+        status,
+        duration: params.get("duration").and_then(|d| d.parse::<f64>().ok()),
+        release: params.get("release").cloned(),
+        environment: params.get("environment").cloned(),
+        monitor_config: None,
+    };
+
+    match monitor_service
+        .record_check_in(auth.project_id, auth.environment_id, &check_in)
+        .await
+    {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => {
+            tracing::error!(
+                "Failed to record cron ping for project {}: {}",
+                project_id,
+                e
+            );
+            (StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        }
+    }
 }
 
 /// Maximum decompressed size to prevent decompression bombs (10 MB)
@@ -1317,6 +1423,7 @@ mod tests {
             route_table: route_table.clone(),
             dsn_service: dsn_service.clone(),
             rate_limiter: crate::sentry::rate_limiter::IngestRateLimiter::new(),
+            monitor_service: None,
         });
 
         TestContext {
