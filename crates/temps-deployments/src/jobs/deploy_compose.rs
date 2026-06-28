@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_deployer::compose::{ComposeDeployRequest, ComposeExecutor};
@@ -222,6 +222,8 @@ impl WorkflowTask for DeployComposeJob {
 
         // Read compose file from repo checkout or inline content
         let compose_file_name = self.compose_path.as_deref().unwrap_or("docker-compose.yml");
+        validate_relative_path(compose_file_name, "compose_path")?;
+        validate_relative_path(&self.directory, "directory")?;
 
         let compose_content = if let Some(ref inline) = self.compose_content {
             // Inline compose content (manual project, no git repo)
@@ -450,4 +452,28 @@ impl WorkflowTask for DeployComposeJob {
 
         Ok(JobResult::success(context))
     }
+}
+
+fn validate_relative_path(path: &str, field: &str) -> Result<(), WorkflowError> {
+    let path = Path::new(path);
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(WorkflowError::JobValidationFailed(format!(
+            "{} must be a non-empty relative path",
+            field
+        )));
+    }
+
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(WorkflowError::JobValidationFailed(format!(
+            "{} must not contain '..' or absolute path components",
+            field
+        )));
+    }
+
+    Ok(())
 }

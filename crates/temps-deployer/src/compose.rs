@@ -7,7 +7,7 @@
 use bollard::Docker;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -28,6 +28,9 @@ pub enum ComposeError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Invalid compose configuration: {reason}")]
+    InvalidConfig { reason: String },
 }
 
 /// Request to deploy a Docker Compose stack.
@@ -98,6 +101,18 @@ impl ComposeExecutor {
     ) -> Result<Vec<ComposeServiceResult>, ComposeError> {
         let project_dir = self.project_dir(&request.project_name);
         let project_name = request.project_name.clone();
+        validate_relative_path(
+            request
+                .compose_path
+                .as_deref()
+                .unwrap_or("docker-compose.yml"),
+            "compose_path",
+        )?;
+        validate_compose_security(&request.compose_content)?;
+        if let Some(ref compose_override) = request.compose_override {
+            validate_compose_security(compose_override)?;
+        }
+
         let has_build = self.has_build_directives(&request.compose_content);
 
         // Always use the repo checkout directory when available.
@@ -280,6 +295,7 @@ impl ComposeExecutor {
             .compose_path
             .as_deref()
             .unwrap_or("docker-compose.yml");
+        validate_relative_path(compose_file, "compose_path")?;
         let compose_path = project_dir.join(compose_file);
 
         // Ensure parent directories exist (for nested paths like "subdir/docker-compose.yml")
@@ -1229,5 +1245,185 @@ services:
         // No services to strip — output should be identical
         let result = executor.strip_ports_for_services(compose, &[]);
         assert!(result.contains("80:80"));
+    }
+}
+
+fn validate_relative_path(path: &str, field: &str) -> Result<(), ComposeError> {
+    let path = Path::new(path);
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(ComposeError::InvalidConfig {
+            reason: format!("{} must be a non-empty relative path", field),
+        });
+    }
+
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(ComposeError::InvalidConfig {
+            reason: format!(
+                "{} must not contain '..' or absolute path components",
+                field
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn service_bool(service: &serde_yaml::Mapping, key: &str) -> bool {
+    service
+        .get(serde_yaml::Value::String(key.to_string()))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+fn service_string_eq(service: &serde_yaml::Mapping, key: &str, expected: &str) -> bool {
+    service
+        .get(serde_yaml::Value::String(key.to_string()))
+        .and_then(|value| value.as_str())
+        .map(|value| value.eq_ignore_ascii_case(expected))
+        .unwrap_or(false)
+}
+
+fn insecure_compose_option(service_name: &str, option: &str) -> ComposeError {
+    ComposeError::InvalidConfig {
+        reason: format!(
+            "service '{}' uses host-level Docker Compose option '{}'",
+            service_name, option
+        ),
+    }
+}
+
+fn reject_host_escape_volumes(
+    service_name: &str,
+    volumes: &serde_yaml::Value,
+) -> Result<(), ComposeError> {
+    let Some(volumes) = volumes.as_sequence() else {
+        return Ok(());
+    };
+
+    for volume in volumes {
+        let source = if let Some(volume) = volume.as_str() {
+            volume.split(':').next().unwrap_or_default()
+        } else if let Some(volume) = volume.as_mapping() {
+            volume
+                .get(serde_yaml::Value::String("source".to_string()))
+                .and_then(|source| source.as_str())
+                .unwrap_or_default()
+        } else {
+            ""
+        };
+
+        if source == "/" || source.starts_with("/var/run/docker.sock") {
+            return Err(ComposeError::InvalidConfig {
+                reason: format!(
+                    "service '{}' mounts prohibited host path '{}'",
+                    service_name, source
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_compose_security(compose_content: &str) -> Result<(), ComposeError> {
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(compose_content).map_err(|e| ComposeError::InvalidConfig {
+            reason: format!("compose YAML could not be parsed: {}", e),
+        })?;
+
+    let Some(services) = doc.get("services").and_then(|v| v.as_mapping()) else {
+        return Ok(());
+    };
+
+    for (service_name, service) in services {
+        let service_name = service_name.as_str().unwrap_or("<unknown>");
+        let Some(service) = service.as_mapping() else {
+            continue;
+        };
+
+        if service_bool(service, "privileged") {
+            return Err(insecure_compose_option(service_name, "privileged"));
+        }
+
+        for key in ["network_mode", "pid", "ipc"] {
+            if service_string_eq(service, key, "host") {
+                return Err(insecure_compose_option(service_name, key));
+            }
+        }
+
+        for key in ["devices", "device_cgroup_rules"] {
+            if service.contains_key(serde_yaml::Value::String(key.to_string())) {
+                return Err(insecure_compose_option(service_name, key));
+            }
+        }
+
+        if let Some(volumes) = service.get(serde_yaml::Value::String("volumes".to_string())) {
+            reject_host_escape_volumes(service_name, volumes)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn validate_relative_path_rejects_escape_paths() {
+        assert!(validate_relative_path("docker-compose.yml", "compose_path").is_ok());
+        assert!(validate_relative_path("apps/web/compose.yml", "compose_path").is_ok());
+        assert!(validate_relative_path("/tmp/compose.yml", "compose_path").is_err());
+        assert!(validate_relative_path("../compose.yml", "compose_path").is_err());
+        assert!(validate_relative_path("apps/../../compose.yml", "compose_path").is_err());
+    }
+
+    #[test]
+    fn validate_compose_security_rejects_host_level_options() {
+        let compose = r#"
+services:
+  app:
+    image: alpine
+    privileged: true
+"#;
+
+        assert!(validate_compose_security(compose).is_err());
+
+        let compose = r#"
+services:
+  app:
+    image: alpine
+    network_mode: host
+"#;
+
+        assert!(validate_compose_security(compose).is_err());
+    }
+
+    #[test]
+    fn validate_compose_security_rejects_host_escape_mounts() {
+        let root_mount = r#"
+services:
+  app:
+    image: alpine
+    volumes:
+      - /:/host
+"#;
+        assert!(validate_compose_security(root_mount).is_err());
+
+        let docker_sock_mount = r#"
+services:
+  app:
+    image: alpine
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+"#;
+        assert!(validate_compose_security(docker_sock_mount).is_err());
     }
 }

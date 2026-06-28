@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Docker Compose deployment hardening**: Compose deployments now reject absolute or parent-traversing `compose_path`/`directory` values and block host-level Compose options such as privileged containers, host namespaces, devices, and Docker socket/root bind mounts so project writers cannot escape the intended checkout/work directory or control-plane host.
+
 
 
 ## [0.1.0-beta.35] - 2026-06-19
