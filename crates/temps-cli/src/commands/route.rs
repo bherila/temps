@@ -141,7 +141,10 @@ pub fn parse_upstream(upstream: &str) -> anyhow::Result<(String, i32)> {
 
     let host = host.trim();
     // Allow, but strip, brackets around IPv6 literals.
-    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
 
     if host.is_empty() {
         return Err(anyhow::anyhow!("Upstream '{}' has an empty host", upstream));
@@ -153,7 +156,10 @@ pub fn parse_upstream(upstream: &str) -> anyhow::Result<(String, i32)> {
         .with_context(|| format!("Upstream '{}' has an invalid port '{}'", upstream, port_str))?;
 
     if port == 0 {
-        return Err(anyhow::anyhow!("Upstream '{}' port must be 1-65535", upstream));
+        return Err(anyhow::anyhow!(
+            "Upstream '{}' port must be 1-65535",
+            upstream
+        ));
     }
 
     Ok((host.to_string(), port as i32))
@@ -204,7 +210,11 @@ async fn execute_add(cmd: AddRouteCommand) -> anyhow::Result<()> {
         println!(
             "      {}  (ACME)   or   {}  (custom/self-signed)",
             format!("temps domain add -d {} -c dns-01", cmd.domain).bright_white(),
-            format!("temps domain import -d {} -c cert.pem -k key.pem", cmd.domain).bright_white()
+            format!(
+                "temps domain import -d {} -c cert.pem -k key.pem",
+                cmd.domain
+            )
+            .bright_white()
         );
     }
 
@@ -269,7 +279,11 @@ async fn execute_show(cmd: ShowRouteCommand) -> anyhow::Result<()> {
     }
 
     println!();
-    println!("  {} {}", "Domain:".bright_white(), route.domain.bright_cyan());
+    println!(
+        "  {} {}",
+        "Domain:".bright_white(),
+        route.domain.bright_cyan()
+    );
     println!(
         "  {} {}:{}",
         "Upstream:".bright_white(),
