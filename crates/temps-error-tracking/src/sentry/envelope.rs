@@ -187,6 +187,61 @@ pub struct ItemHeader {
     pub length: Option<usize>,
 }
 
+/// Monitor schedule as supplied in a check-in's `monitor_config`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckInSchedule {
+    /// `"crontab"` or `"interval"`.
+    #[serde(rename = "type")]
+    pub schedule_type: String,
+    /// Crontab expression (string) or interval count (number).
+    pub value: serde_json::Value,
+    /// Interval unit (`minute`, `hour`, `day`, ...), only for `interval` schedules.
+    #[serde(default)]
+    pub unit: Option<String>,
+}
+
+/// Optional monitor configuration carried by a check-in, used to upsert the
+/// monitor's schedule and thresholds on first sight.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CheckInMonitorConfig {
+    #[serde(default)]
+    pub schedule: Option<CheckInSchedule>,
+    /// Grace period in minutes before a missing check-in is flagged.
+    #[serde(default)]
+    pub checkin_margin: Option<i64>,
+    /// Maximum runtime in minutes before an in-progress check-in times out.
+    #[serde(default)]
+    pub max_runtime: Option<i64>,
+    #[serde(default)]
+    pub timezone: Option<String>,
+}
+
+/// A Sentry monitor check-in payload.
+///
+/// See <https://develop.sentry.dev/sdk/check-ins/>. A check-in either reports a
+/// terminal status (`ok`/`error`) or marks the start of a job (`in_progress`),
+/// correlated to its terminal report via `check_in_id`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckIn {
+    /// App-generated UUID identifying this check-in.
+    #[serde(default)]
+    pub check_in_id: Option<String>,
+    /// Stable identifier of the monitor this check-in belongs to.
+    #[serde(default)]
+    pub monitor_slug: Option<String>,
+    /// `in_progress`, `ok`, or `error`.
+    pub status: String,
+    /// Job duration in seconds (float), if reported.
+    #[serde(default)]
+    pub duration: Option<f64>,
+    #[serde(default)]
+    pub release: Option<String>,
+    #[serde(default)]
+    pub environment: Option<String>,
+    #[serde(default)]
+    pub monitor_config: Option<CheckInMonitorConfig>,
+}
+
 /// Represents an item in a Sentry envelope
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -208,6 +263,9 @@ pub enum EnvelopeItem {
 
     /// SessionAggregates
     SessionAggregates(SessionAggregates),
+
+    /// Monitor check-in (cron monitoring)
+    CheckIn(CheckIn),
 }
 
 #[derive(Debug)]
@@ -316,6 +374,12 @@ impl Envelope {
                     })?;
                     Some(EnvelopeItem::SessionAggregates(aggregates))
                 }
+                ItemType::CheckIn => {
+                    let check_in: CheckIn = serde_json::from_str(payload).map_err(|e| {
+                        EnvelopeError::InvalidPayload(format!("Failed to parse check-in: {}", e))
+                    })?;
+                    Some(EnvelopeItem::CheckIn(check_in))
+                }
                 // Unimplemented item types - skip them
                 ItemType::Security
                 | ItemType::Attachment
@@ -330,7 +394,6 @@ impl Envelope {
                 | ItemType::ReplayEvent
                 | ItemType::ReplayRecording
                 | ItemType::ReplayVideo
-                | ItemType::CheckIn
                 | ItemType::Log
                 | ItemType::TraceMetric
                 | ItemType::UserReportV2
