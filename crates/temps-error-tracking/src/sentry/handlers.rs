@@ -1,9 +1,9 @@
 use axum::{
     body::Bytes,
     extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-    routing::post,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::{get, post},
     Json, Router,
 };
 use flate2::read::GzDecoder;
@@ -14,10 +14,11 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::debug;
 use utoipa::OpenApi;
 
-use crate::providers::{sentry::SentryProvider, AuthContext, ErrorProvider};
-use crate::sentry::rate_limiter::IngestRateLimiter;
+use crate::providers::{sentry::SentryProvider, ErrorProvider};
+use crate::sentry::envelope::CheckIn;
 use crate::sentry::types::{SentryEventRequest, SentryEventResponse};
 use crate::services::error_tracking_service::ErrorTrackingService;
+use crate::services::monitor_service::MonitorService;
 use temps_geo::IpAddressService;
 use temps_proxy::CachedPeerTable;
 
@@ -66,10 +67,8 @@ pub struct AppState {
     pub ip_address_service: Option<Arc<IpAddressService>>,
     pub db: Option<Arc<sea_orm::DatabaseConnection>>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
-    /// Host -> project/environment/deployment resolution for the tunneled
-    /// ingest route, which has no DSN to authenticate with.
-    pub route_table: Arc<CachedPeerTable>,
-    pub rate_limiter: IngestRateLimiter,
+    /// Monitor (cron check-in) service. Optional so unit tests can omit it.
+    pub monitor_service: Option<Arc<MonitorService>>,
 }
 
 /// Maximum compressed body size for Sentry ingest routes (2 MiB).
@@ -92,7 +91,16 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/{project_id}/store/", post(ingest_sentry_event))
         .route("/{project_id}/envelope/", post(ingest_sentry_envelope))
-        .route(SENTRY_TUNNEL_ROUTE_PATH, post(ingest_tunneled_envelope))
+        // Sentry simple cron check-in "ping" URL (GET or POST), e.g.
+        // /api/{project_id}/cron/{monitor_slug}/{sentry_key}/?status=ok
+        .route(
+            "/{project_id}/cron/{monitor_slug}/{sentry_key}/",
+            get(ingest_cron_ping).post(ingest_cron_ping),
+        )
+        .route(
+            "/{project_id}/cron/{monitor_slug}/{sentry_key}",
+            get(ingest_cron_ping).post(ingest_cron_ping),
+        )
         // Fix #3: cap compressed body to 2 MiB before any buffering occurs.
         // This prevents slow-POST DoS where a client drip-feeds a large body
         // to hold a Tokio worker thread indefinitely.
@@ -289,17 +297,57 @@ async fn ingest_sentry_envelope(
         }
     };
 
-    if !state
-        .rate_limiter
-        .check(auth.project_id, auth.rate_limit_per_minute)
+    // Process monitor check-ins (a separate concern from error events). An
+    // envelope may contain only check-ins, only events, or a mix.
+    let mut check_ins_processed = 0usize;
+    if let Some(monitor_service) = state.monitor_service.as_ref() {
+        match state.sentry_provider.parse_check_ins(&decompressed_body) {
+            Ok(check_ins) => {
+                for ci in &check_ins {
+                    match monitor_service
+                        .record_check_in(auth.project_id, auth.environment_id, ci)
+                        .await
+                    {
+                        Ok(()) => check_ins_processed += 1,
+                        Err(e) => tracing::error!(
+                            "Failed to record check-in for project {}: {}",
+                            project_id,
+                            e
+                        ),
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to parse check-ins for project {}: {}",
+                    project_id,
+                    e
+                );
+            }
+        }
+    }
+
+    // Parse envelope using the provider
+    let parsed_events = match state
+        .sentry_provider
+        .parse_events(&decompressed_body, &auth)
         .await
     {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "Rate limit exceeded".to_string(),
-        )
-            .into_response();
-    }
+        Ok(events) => events,
+        Err(e) => {
+            // A check-in-only envelope legitimately contains no error events;
+            // having processed at least one check-in, that is a success.
+            if check_ins_processed > 0 {
+                return StatusCode::OK.into_response();
+            }
+            tracing::error!(
+                "Failed to parse envelope for project {}: {:?}",
+                project_id,
+                e
+            );
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+    };
 
     // Fix #2: resolve the real client IP using proxy-trust logic.
     // XFF is honored only when the direct TCP peer is loopback (our trusted Pingora proxy).
@@ -513,6 +561,70 @@ async fn process_parsed_envelope(
     }
 
     StatusCode::OK.into_response()
+}
+
+/// Ingest a Sentry "simple" cron check-in via URL (GET or POST).
+///
+/// Format: `/{project_id}/cron/{monitor_slug}/{sentry_key}/?status=ok`
+/// The status query param defaults to `ok`; `check_in_id` may be supplied to
+/// correlate an `in_progress` start with its terminal report.
+async fn ingest_cron_ping(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, monitor_slug, sentry_key)): Path<(i32, String, String)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let monitor_service = match state.monitor_service.as_ref() {
+        Some(svc) => svc,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Monitor service unavailable".to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    let auth = match state
+        .sentry_provider
+        .authenticate(project_id, &sentry_key)
+        .await
+    {
+        Ok(auth) => auth,
+        Err(e) => {
+            tracing::error!("Cron ping authentication failed: {:?}", e);
+            return (StatusCode::UNAUTHORIZED, e.to_string()).into_response();
+        }
+    };
+
+    let status = params
+        .get("status")
+        .cloned()
+        .unwrap_or_else(|| "ok".to_string());
+
+    let check_in = CheckIn {
+        check_in_id: params.get("check_in_id").cloned(),
+        monitor_slug: Some(monitor_slug),
+        status,
+        duration: params.get("duration").and_then(|d| d.parse::<f64>().ok()),
+        release: params.get("release").cloned(),
+        environment: params.get("environment").cloned(),
+        monitor_config: None,
+    };
+
+    match monitor_service
+        .record_check_in(auth.project_id, auth.environment_id, &check_in)
+        .await
+    {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => {
+            tracing::error!(
+                "Failed to record cron ping for project {}: {}",
+                project_id,
+                e
+            );
+            (StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        }
+    }
 }
 
 /// Maximum decompressed size to prevent decompression bombs (10 MB)
@@ -778,8 +890,7 @@ mod tests {
             ip_address_service: None,
             db: None,
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
-            route_table: route_table.clone(),
-            rate_limiter: crate::sentry::rate_limiter::IngestRateLimiter::new(),
+            monitor_service: None,
         });
 
         TestContext {
