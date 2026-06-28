@@ -38,13 +38,13 @@ pub struct MonitorAppState {
 
 pub fn configure_monitor_routes() -> Router<Arc<MonitorAppState>> {
     Router::new()
-        .route("/projects/{project_id}/monitors", get(list_monitors))
+        .route("/projects/{project_id}/cron-monitors", get(list_monitors))
         .route(
-            "/projects/{project_id}/monitors/{monitor_id}",
+            "/projects/{project_id}/cron-monitors/{monitor_id}",
             get(get_monitor).patch(update_monitor),
         )
         .route(
-            "/projects/{project_id}/monitors/{monitor_id}/check-ins",
+            "/projects/{project_id}/cron-monitors/{monitor_id}/check-ins",
             get(list_monitor_check_ins),
         )
 }
@@ -159,7 +159,7 @@ pub struct MonitorCheckInListResponse {
 
 #[utoipa::path(
     get,
-    path = "/projects/{project_id}/monitors",
+    path = "/projects/{project_id}/cron-monitors",
     params(("project_id" = i32, Path, description = "Project ID"), PaginationQuery),
     responses(
         (status = 200, description = "List of monitors", body = MonitorListResponse),
@@ -191,7 +191,7 @@ pub async fn list_monitors(
 
 #[utoipa::path(
     get,
-    path = "/projects/{project_id}/monitors/{monitor_id}",
+    path = "/projects/{project_id}/cron-monitors/{monitor_id}",
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("monitor_id" = i32, Path, description = "Monitor ID")
@@ -220,7 +220,7 @@ pub async fn get_monitor(
 
 #[utoipa::path(
     patch,
-    path = "/projects/{project_id}/monitors/{monitor_id}",
+    path = "/projects/{project_id}/cron-monitors/{monitor_id}",
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("monitor_id" = i32, Path, description = "Monitor ID")
@@ -261,7 +261,7 @@ pub async fn update_monitor(
 
 #[utoipa::path(
     get,
-    path = "/projects/{project_id}/monitors/{monitor_id}/check-ins",
+    path = "/projects/{project_id}/cron-monitors/{monitor_id}/check-ins",
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("monitor_id" = i32, Path, description = "Monitor ID"),
