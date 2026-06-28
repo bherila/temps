@@ -120,7 +120,9 @@ pub mod status_incidents;
 pub mod status_monitors;
 
 // Metrics alert rules
+pub mod monitor_check_ins;
 pub mod monitoring_alert_rules;
+pub mod monitors;
 
 // Webhook entities
 pub mod webhook_deliveries;
