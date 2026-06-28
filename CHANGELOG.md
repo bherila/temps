@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **changelog:** Skip preview comment on fork PRs
 
 ### Fixed
+- **Container exec scope enforcement**: `POST /projects/{project_id}/environments/{environment_id}/containers/{container_id}/exec` and `GET /projects/{project_id}/environments/{environment_id}/containers/{container_id}/terminal` now verify the requested container belongs to the path project/environment, enforce deployment-token project/environment/deployment scope, and require `container_exec_enabled=true` before opening Docker exec access, preventing cross-project container command execution.
 
 - **deployer:** Stop temps-dns-resolver being a container DNS SPOF
 
