@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **changelog:** Skip preview comment on fork PRs
 
 ### Fixed
+- **Compose deploy container conflict handling**: Removed pre-deploy Docker container deletion based on user-controlled `container_name` values so a Compose name collision fails safely instead of allowing one deployment to stop or remove unrelated host containers.
+
 
 - **deployer:** Stop temps-dns-resolver being a container DNS SPOF
 
