@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0-beta.41] - 2026-07-02
 
 ### CI
+### Added
+- **`temps route` — first-class reverse-proxy route management.** A new CLI
+  command group (`add`, `list`/`ls`, `show`, `rm`) maps an external hostname to
+  an arbitrary upstream `host:port` that Temps does not itself deploy — the
+  building block for fronting a side-car service (self-hosted Sentry, an object
+  store, a legacy app) on the `:443` Temps already owns. This surfaces the
+  existing `custom_routes` table + `LbService` backend that previously required
+  hand-written `INSERT`s. `--type http` (default) terminates TLS at the proxy
+  (needs a `temps domain` cert for the hostname); `--type tls` does SNI
+  passthrough. The database URL is read from `TEMPS_DATABASE_URL` and scrubbed
+  from argv. See `docs/adr/020-reverse-proxy-routes.md`.
 
 - **changelog:** Skip preview comment on fork PRs
 
