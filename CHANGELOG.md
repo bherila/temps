@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Inline Docker Compose override hardening**: Project settings now reject dashboard-supplied `composeOverride` YAML that adds services or uses host-affecting Compose directives such as `privileged`, `network_mode`, `pid`, `cap_add`, `devices`, `security_opt`, `sysctls`, or `volumes`, so low-privilege project editors cannot bypass repository review and hand dangerous options directly to the host Docker daemon.
+
+### Security
+- **Inline Docker Compose override hardening**: Dashboard-provided Docker Compose overrides are now validated before `docker compose` runs; host-level options and new services must live in the repository compose file where normal code review controls apply.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
