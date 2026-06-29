@@ -283,6 +283,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now seeds the engine's default alert rules (idempotent, all engines) and, for
   OTLP-push engines (rustfs/s3), provisions and applies the OTLP ingest key at
   creation. All monitoring setup is best-effort and never fails service creation.
+- **Hosted website memory protection**: new projects and their default `production` environments now seed the hosted-website small resource profile with `memory_limit=512` MB in addition to the existing CPU/memory requests, so Docker enforces a cgroup cap by default on small single-node installs while operators can still raise or clear the limit for standard/dedicated workloads.
 
 ### Changed
 -
