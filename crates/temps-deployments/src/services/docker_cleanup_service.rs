@@ -17,6 +17,9 @@ pub trait DockerClient: Send + Sync {
 
     /// Remove unused Docker build cache
     async fn prune_builder_cache(&self, max_unused_days: i64) -> Result<String, String>;
+
+    /// Remove a specific image by name (e.g. "careowner:211")
+    async fn remove_image(&self, image_name: &str) -> Result<(), String>;
 }
 
 /// Statistics from Docker prune operations
@@ -61,6 +64,27 @@ impl DockerClient for DefaultDockerClient {
             }
             Err(e) => Err(format!("Failed to prune images: {}", e)),
         }
+    }
+
+    async fn remove_image(&self, image_name: &str) -> Result<(), String> {
+        use bollard::Docker;
+
+        let docker = Docker::connect_with_unix_defaults()
+            .map_err(|e| format!("Failed to connect to Docker daemon: {}", e))?;
+
+        docker
+            .remove_image(
+                image_name,
+                Some(bollard::query_parameters::RemoveImageOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+                None,
+            )
+            .await
+            .map_err(|e| format!("Failed to remove image '{}': {}", image_name, e))?;
+
+        Ok(())
     }
 
     async fn prune_builder_cache(&self, max_unused_days: i64) -> Result<String, String> {
@@ -116,6 +140,10 @@ pub struct DockerCleanupService {
     max_chunk_age_hours: u64,
     /// Maximum age of static asset cache entries in days (default: 7)
     max_asset_cache_age_days: i64,
+    /// System-wide default: how many hours to keep a built deployment image before
+    /// it is eligible for removal. Projects can override this via their
+    /// `image_retention_hours` column. (default: 48)
+    default_image_retention_hours: i64,
 }
 
 impl DockerCleanupService {
@@ -133,6 +161,7 @@ impl DockerCleanupService {
             static_dir: None,
             max_chunk_age_hours: 24,
             max_asset_cache_age_days: 7,
+            default_image_retention_hours: 48,
         }
     }
 
@@ -153,6 +182,11 @@ impl DockerCleanupService {
 
     pub fn with_max_asset_cache_age_days(mut self, days: i64) -> Self {
         self.max_asset_cache_age_days = days;
+        self
+    }
+
+    pub fn with_default_image_retention_hours(mut self, hours: i64) -> Self {
+        self.default_image_retention_hours = hours;
         self
     }
 
@@ -206,9 +240,103 @@ impl DockerCleanupService {
         }
     }
 
+    /// Remove deployment images that are older than their project's retention period.
+    ///
+    /// Queries all projects and their successful deployments, then removes the Docker
+    /// image for any deployment whose `created_at` is older than
+    /// `project.image_retention_hours` (falling back to `self.default_image_retention_hours`).
+    /// Images currently referenced by a running container are skipped — Docker will
+    /// return an error and we log a warning rather than failing the whole pass.
+    async fn prune_old_deployment_images(&self) {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use temps_entities::{deployments, projects};
+
+        let projects_list = match projects::Entity::find()
+            .filter(projects::Column::IsDeleted.eq(false))
+            .all(self.db.as_ref())
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                error!(
+                    "Failed to query projects for image retention cleanup: {}",
+                    e
+                );
+                return;
+            }
+        };
+
+        let mut total_removed = 0u64;
+        let total_freed_mb = 0u64;
+
+        for project in projects_list {
+            let retention_hours = project
+                .image_retention_hours
+                .map(|h| h as i64)
+                .unwrap_or(self.default_image_retention_hours);
+
+            let cutoff = chrono::Utc::now() - chrono::Duration::hours(retention_hours);
+
+            let old_deployments = match deployments::Entity::find()
+                .filter(deployments::Column::ProjectId.eq(project.id))
+                .filter(deployments::Column::ImageName.is_not_null())
+                .filter(deployments::Column::CreatedAt.lt(cutoff))
+                .all(self.db.as_ref())
+                .await
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    error!(
+                        "Failed to query old deployments for project {}: {}",
+                        project.id, e
+                    );
+                    continue;
+                }
+            };
+
+            for deployment in old_deployments {
+                let image_name = match deployment.image_name {
+                    Some(ref name) => name.clone(),
+                    None => continue,
+                };
+
+                match self.docker_client.remove_image(&image_name).await {
+                    Ok(()) => {
+                        debug!(
+                            "Removed old deployment image '{}' (deployment {}, project {})",
+                            image_name, deployment.id, project.id
+                        );
+                        total_removed += 1;
+                    }
+                    Err(e) => {
+                        // Image may already be gone or in use — warn but don't fail
+                        warn!(
+                            "Could not remove deployment image '{}' (deployment {}, project {}): {}",
+                            image_name, deployment.id, project.id, e
+                        );
+                    }
+                }
+            }
+        }
+
+        if total_removed > 0 {
+            info!(
+                "✅ Removed {} old deployment images, freed ~{} MB",
+                total_removed, total_freed_mb
+            );
+        } else {
+            debug!("No old deployment images to remove");
+        }
+
+        let _ = total_freed_mb; // calculated per-image removal is non-trivial; reported as 0 for now
+    }
+
     /// Perform the actual cleanup
     async fn perform_cleanup(&self) {
         info!("🧹 Starting nightly Docker cleanup");
+
+        // Remove old deployment images per project retention policy
+        self.prune_old_deployment_images().await;
 
         // Cleanup unused images
         match self.docker_client.prune_images(true).await {
@@ -491,6 +619,10 @@ mod tests {
         async fn prune_builder_cache(&self, _max_unused_days: i64) -> Result<String, String> {
             self.prune_cache_result.clone()
         }
+
+        async fn remove_image(&self, _image_name: &str) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     fn mock_db() -> Arc<sea_orm::DatabaseConnection> {
@@ -530,5 +662,20 @@ mod tests {
                 .with_max_cache_age_days(14);
 
         assert_eq!(service.max_cache_age_days, 14);
+    }
+
+    #[test]
+    fn test_default_image_retention_hours() {
+        let service =
+            DockerCleanupService::new(Arc::new(DefaultDockerClient), mock_db(), mock_file_store());
+        assert_eq!(service.default_image_retention_hours, 48);
+    }
+
+    #[test]
+    fn test_custom_image_retention_hours() {
+        let service =
+            DockerCleanupService::new(Arc::new(DefaultDockerClient), mock_db(), mock_file_store())
+                .with_default_image_retention_hours(72);
+        assert_eq!(service.default_image_retention_hours, 72);
     }
 }

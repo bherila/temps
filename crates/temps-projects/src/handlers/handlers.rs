@@ -616,6 +616,7 @@ pub async fn update_project_settings(
             settings.ai_debug_chat_enabled,
             settings.ai_write_actions_enabled,
             settings.cross_project_trace_sharing,
+            settings.image_retention_hours,
         )
         .await
         .map_err(Problem::from)?;

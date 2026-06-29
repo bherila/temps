@@ -107,6 +107,9 @@ pub struct Model {
     /// to FALSE; cross-project links to this project will then be suppressed.
     #[sea_orm(default_value = "true")]
     pub cross_project_trace_sharing: bool,
+    /// How long (in hours) to retain built Docker images before the nightly
+    /// cleanup removes them. NULL means use the system default (48 hours).
+    pub image_retention_hours: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
