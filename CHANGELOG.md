@@ -260,6 +260,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Container exec scope enforcement**: `POST /projects/{project_id}/environments/{environment_id}/containers/{container_id}/exec` and `GET /projects/{project_id}/environments/{environment_id}/containers/{container_id}/terminal` now verify the requested container belongs to the path project/environment, enforce deployment-token project/environment/deployment scope, and require `container_exec_enabled=true` before opening Docker exec access, preventing cross-project container command execution.
 - **Compose deploy container conflict handling**: Removed pre-deploy Docker container deletion based on user-controlled `container_name` values so a Compose name collision fails safely instead of allowing one deployment to stop or remove unrelated host containers.
 
+- **Edge cache-miss token isolation**: cacheable static asset misses in `temps edge` no longer attach the edge control-plane bearer token when fetching tenant-routed origin paths. This preserves pull-through caching while preventing deployed applications from observing node/join credentials in the `Authorization` header.
+
+### Security
+- **Edge origin fetch credential leak**: removed the privileged bearer credential from cache-miss origin requests that use the public `Host` header for routing, because those requests can be handled by untrusted deployed application code.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
