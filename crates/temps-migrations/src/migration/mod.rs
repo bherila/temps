@@ -127,6 +127,7 @@ mod m20260626_000002_create_metric_alert_rules;
 mod m20260627_000001_add_ai_alert_summaries;
 mod m20260627_000002_create_ai_conversations;
 mod m20260628_000001_otel_spans_root_index;
+mod m20260628_000001_create_monitors;
 
 pub struct Migrator;
 
@@ -257,6 +258,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260627_000001_add_ai_alert_summaries::Migration),
             Box::new(m20260627_000002_create_ai_conversations::Migration),
             Box::new(m20260628_000001_otel_spans_root_index::Migration),
+            Box::new(m20260628_000001_create_monitors::Migration),
         ]
     }
 }

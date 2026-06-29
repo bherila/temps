@@ -139,6 +139,11 @@ impl SentryIngestionService {
                 super::envelope::EnvelopeItem::Span(_) => {
                     tracing::debug!("Received span item (not yet implemented)");
                 }
+                super::envelope::EnvelopeItem::CheckIn(_) => {
+                    // Monitor check-ins are handled by the ingest handler via
+                    // MonitorService, not through this error-event path.
+                    tracing::debug!("Received check-in item (handled separately)");
+                }
             }
         }
 
