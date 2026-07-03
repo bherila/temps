@@ -1351,10 +1351,7 @@ mod tests {
 
     /// Build an app whose auth middleware injects a deployment token bound to
     /// `token_project_id` with FullAccess — the worst case for cross-tenant IDOR.
-    fn setup_deployment_token_app(
-        state: Arc<AppState>,
-        token_project_id: i32,
-    ) -> axum::Router {
+    fn setup_deployment_token_app(state: Arc<AppState>, token_project_id: i32) -> axum::Router {
         let auth_middleware = middleware::from_fn(
             move |mut req: Request<Body>, next: axum::middleware::Next| async move {
                 let auth_context = temps_auth::AuthContext::new_deployment_token(
@@ -1370,9 +1367,7 @@ mod tests {
             },
         );
 
-        configure_routes()
-            .layer(auth_middleware)
-            .with_state(state)
+        configure_routes().layer(auth_middleware).with_state(state)
     }
 
     #[tokio::test]
