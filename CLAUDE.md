@@ -907,6 +907,16 @@ FORCE_WEB_BUILD=1 cargo build               # Debug with web UI
 
 **Build discipline**: Only run `cargo build`/`cargo check` when at least 99% confident the code will compile. Fix all warnings before considering work complete.
 
+**Local resource awareness**: This is a 51-crate workspace -- a full `cargo build`/`cargo test --workspace` (especially `--release`) can pin every core and pull several GB of RAM for minutes at a time. Before running a heavy local build or test pass, check the box isn't already loaded:
+
+```bash
+uptime           # 1-min load average vs. nproc -- avoid piling on if load >= core count
+free -h           # bail if available memory is low (a full build wants a few GB headroom)
+nproc
+```
+
+If the box looks marginal (load already at/above core count, or little free memory), don't run the full build/test suite locally -- push the branch and let the GitHub-hosted Actions runners (`rust-tests.yml`, `ubuntu-latest`) validate it instead. Scoped commands (`cargo check --lib`, `cargo test --lib -p <crate>`) are cheap enough to run locally even under moderate load; it's the workspace-wide `--all-targets`/`--release`/`--workspace` runs that should defer to CI when resources are tight.
+
 ### Conventional Commits
 
 ```
