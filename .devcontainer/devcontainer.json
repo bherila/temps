@@ -1,0 +1,60 @@
+{
+  "name": "temps",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+
+  // 4 cores (standardLinux32gb) trades some included core-hour quota for
+  // meaningfully faster `cargo check`/`cargo build` across the 51-crate
+  // workspace. Region/machine are still selected at `gh codespace create`
+  // time (see below) -- this just tells GitHub not to pick anything smaller.
+  "hostRequirements": {
+    "cpus": 4
+  },
+
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    }
+  },
+
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  "forwardPorts": [3000, 8080, 9000, 5432, 6379],
+  "portsAttributes": {
+    "3000": { "label": "web (rsbuild dev)" },
+    "8080": { "label": "temps API (cargo run -- serve)" },
+    "9000": { "label": "console API" },
+    "5432": { "label": "postgres" },
+    "6379": { "label": "redis" }
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "esbenp.prettier-vscode",
+        "dbaeumer.vscode-eslint",
+        "bradlc.vscode-tailwindcss"
+      ]
+    },
+    // Grants the codespace's auto-issued GITHUB_TOKEN scoped access to the
+    // upstream repo, so `gh pr create --repo gotempsh/temps` and friends work
+    // from this fork's codespace without a separate PAT.
+    "codespaces": {
+      "repositories": {
+        "gotempsh/temps": {
+          "permissions": {
+            "contents": "read",
+            "pull_requests": "write",
+            "issues": "write"
+          }
+        }
+      }
+    }
+  },
+
+  "remoteEnv": {
+    "TEMPS_DATABASE_URL": "postgresql://temps:temps@localhost:5432/temps"
+  }
+}
