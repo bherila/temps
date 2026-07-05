@@ -1066,45 +1066,102 @@ function PublicPortsInline({
 // Repo change dialog — wraps the existing repo selector flow without re-implementing it.
 export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   const navigate = useNavigate()
-  const isPublicRepo = !project?.git_provider_connection_id
   const updateGit = useMutation({ ...updateGitSettingsMutation() })
   const { data: connectionsData } = useQuery({ ...listConnectionsOptions() })
   const { data: providersData } = useQuery({ ...listGitProvidersOptions() })
   const providers = providersData || []
+  const connections = connectionsData?.connections ?? []
+
+  // Source mode: a connected provider (pick a repo) or a public URL. Default to
+  // the connection flow whenever the user has any connected provider — a project
+  // without its own connection (e.g. one being converted from docker/static)
+  // must still be able to pick from the connections it DOES have.
+  const [mode, setMode] = useState<'connection' | 'public'>(
+    project.git_provider_connection_id ? 'connection' : 'public'
+  )
+  const [modeTouched, setModeTouched] = useState(false)
+  useEffect(() => {
+    if (
+      !modeTouched &&
+      !project.git_provider_connection_id &&
+      connections.length > 0
+    ) {
+      setMode('connection')
+    }
+  }, [modeTouched, connections.length, project.git_provider_connection_id])
 
   const [selectedConnectionId, setSelectedConnectionId] = useState<number | null>(
-    project.git_provider_connection_id || null,
+    project.git_provider_connection_id || null
+  )
+  useEffect(() => {
+    if (mode === 'connection' && !selectedConnectionId && connections.length > 0) {
+      setSelectedConnectionId(connections[0].id)
+    }
+  }, [mode, selectedConnectionId, connections])
+
+  const [selectedRepo, setSelectedRepo] = useState<RepositoryResponse | null>(
+    null
   )
   const [publicUrl, setPublicUrl] = useState('')
-  const [parsedPublic, setParsedPublic] = useState<{ owner: string; name: string } | null>(null)
+  const [parsedPublic, setParsedPublic] = useState<{
+    owner: string
+    name: string
+  } | null>(null)
+  const [directory, setDirectory] = useState(project.directory || './')
+  const [preset, setPreset] = useState<string>(project.preset || '')
+
+  // Detect frameworks/presets for the chosen connected repo.
+  const presetQuery = useQuery({
+    ...getRepositoryPresetLiveOptions({
+      path: { repository_id: (selectedRepo as { id?: number })?.id || 0 },
+    }),
+    enabled: mode === 'connection' && !!(selectedRepo as { id?: number })?.id,
+  })
+  useEffect(() => {
+    const detected = (
+      presetQuery.data as { presets?: { preset: string }[] } | undefined
+    )?.presets?.[0]?.preset
+    if (detected) setPreset(detected)
+  }, [presetQuery.data])
 
   const back = () => navigate(`/projects/${project.slug}/git`)
 
-  const handleRepoSelect = async (repo: RepositoryResponse) => {
-    const presetCfg = (project.preset_config as any) || {}
+  const repoToConnect =
+    mode === 'public'
+      ? parsedPublic
+      : selectedRepo
+        ? { owner: selectedRepo.owner, name: selectedRepo.name }
+        : null
+
+  const handleConnect = async () => {
+    if (!repoToConnect) return
     const body: Record<string, unknown> = {
-      repo_owner: repo.owner,
-      repo_name: repo.name,
-      directory: project.directory || './',
-      preset: project.preset,
-      preset_config: presetCfg,
-      main_branch: project.main_branch || repo.default_branch || 'main',
+      repo_owner: repoToConnect.owner,
+      repo_name: repoToConnect.name,
+      directory: directory || './',
+      preset: preset || project.preset || 'custom',
+      main_branch:
+        (selectedRepo as { default_branch?: string })?.default_branch ||
+        project.main_branch ||
+        'main',
     }
-    if (isPublicRepo) {
-      body.git_url = `https://github.com/${repo.owner}/${repo.name}`
+    if (mode === 'public') {
+      body.git_url = `https://github.com/${repoToConnect.owner}/${repoToConnect.name}`
       body.is_public_repo = true
       body.git_provider_connection_id = null
     } else {
-      body.git_provider_connection_id =
-        selectedConnectionId ?? project.git_provider_connection_id ?? null
+      body.git_provider_connection_id = selectedConnectionId
     }
     try {
-      await updateGit.mutateAsync({ body: body as any, path: { project_id: project.id } })
-      toast.success('Repository changed')
+      await updateGit.mutateAsync({
+        body: body as any,
+        path: { project_id: project.id },
+      })
+      toast.success('Repository connected')
       refetch()
       back()
     } catch {
-      toast.error('Failed to change repository')
+      toast.error('Failed to connect repository')
     }
   }
 
@@ -1112,10 +1169,10 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
     <div className="space-y-6">
       <div className="flex items-center justify-between gap-2">
         <div>
-          <h2 className="text-xl font-semibold">Change repository</h2>
+          <h2 className="text-xl font-semibold">Connect repository</h2>
           <p className="text-sm text-muted-foreground">
-            Connect <span className="font-mono">{project.slug}</span> to a
-            different repository.
+            Connect <span className="font-mono">{project.slug}</span> to a Git
+            repository.
           </p>
         </div>
         <Button variant="ghost" size="sm" onClick={back}>
@@ -1123,63 +1180,48 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
         </Button>
       </div>
 
-      {isPublicRepo ? (
-        <Card>
-          <CardContent className="p-6 space-y-2">
-            <Label>Public repository URL</Label>
-            <Input
-              placeholder="https://github.com/owner/repo"
-              value={publicUrl}
-              onChange={(e) => {
-                const url = e.target.value
-                setPublicUrl(url)
-                const m = url
-                  .trim()
-                  .match(/(?:github\.com|gitlab\.com)[/:]([^/\s]+)\/([^/\s.]+)/)
-                if (m) {
-                  setParsedPublic({ owner: m[1], name: m[2].replace(/\.git$/, '') })
-                } else {
-                  setParsedPublic(null)
-                }
-              }}
-            />
-            {parsedPublic && (
-              <div className="flex flex-col gap-2 pt-2 sm:flex-row sm:items-center sm:justify-between">
-                <p className="text-sm text-muted-foreground">
-                  Will connect to{' '}
-                  <span className="font-mono text-foreground">
-                    {parsedPublic.owner}/{parsedPublic.name}
-                  </span>
-                </p>
-                <Button
-                  size="sm"
-                  onClick={() =>
-                    handleRepoSelect({
-                      owner: parsedPublic.owner,
-                      name: parsedPublic.name,
-                    } as RepositoryResponse)
-                  }
-                >
-                  Connect
-                </Button>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      ) : (
+      {connections.length > 0 && (
+        <div className="inline-flex rounded-lg border p-0.5">
+          <Button
+            variant={mode === 'connection' ? 'secondary' : 'ghost'}
+            size="sm"
+            onClick={() => {
+              setMode('connection')
+              setModeTouched(true)
+            }}
+          >
+            Connected provider
+          </Button>
+          <Button
+            variant={mode === 'public' ? 'secondary' : 'ghost'}
+            size="sm"
+            onClick={() => {
+              setMode('public')
+              setModeTouched(true)
+            }}
+          >
+            Public URL
+          </Button>
+        </div>
+      )}
+
+      {mode === 'connection' ? (
         <div className="space-y-4">
           <Card>
-            <CardContent className="p-6 space-y-2">
+            <CardContent className="space-y-2 p-6">
               <Label>Git provider connection</Label>
               <Select
                 value={selectedConnectionId?.toString()}
-                onValueChange={(v) => setSelectedConnectionId(Number(v))}
+                onValueChange={(v) => {
+                  setSelectedConnectionId(Number(v))
+                  setSelectedRepo(null)
+                }}
               >
                 <SelectTrigger>
-                  <SelectValue />
+                  <SelectValue placeholder="Select a connection..." />
                 </SelectTrigger>
                 <SelectContent>
-                  {(connectionsData?.connections ?? []).map((c) => {
+                  {connections.map((c) => {
                     const provider = providers.find((p) => p.id === c.provider_id)
                     return (
                       <SelectItem key={c.id} value={c.id.toString()}>
@@ -1203,13 +1245,85 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
           {selectedConnectionId && (
             <RepositorySelector
               connectionId={selectedConnectionId}
-              onSelect={(repo) => repo && handleRepoSelect(repo)}
-              selectedRepository={null}
+              onSelect={(repo) => setSelectedRepo(repo)}
+              selectedRepository={selectedRepo}
               title="Select repository"
               description="Choose a repository from the connected provider."
               showAsCard
             />
           )}
+        </div>
+      ) : (
+        <Card>
+          <CardContent className="space-y-2 p-6">
+            <Label>Public repository URL</Label>
+            <Input
+              placeholder="https://github.com/owner/repo"
+              value={publicUrl}
+              onChange={(e) => {
+                const url = e.target.value
+                setPublicUrl(url)
+                const m = url
+                  .trim()
+                  .match(/(?:github\.com|gitlab\.com)[/:]([^/\s]+)\/([^/\s.]+)/)
+                setParsedPublic(
+                  m ? { owner: m[1], name: m[2].replace(/\.git$/, '') } : null
+                )
+              }}
+            />
+            {parsedPublic && (
+              <p className="pt-1 text-sm text-muted-foreground">
+                Will connect to{' '}
+                <span className="font-mono text-foreground">
+                  {parsedPublic.owner}/{parsedPublic.name}
+                </span>
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Framework + root directory — shown once a repository is chosen. */}
+      {repoToConnect && (
+        <Card>
+          <CardContent className="space-y-4 p-6">
+            <div className="space-y-2">
+              <Label>Framework / preset</Label>
+              <FrameworkSelector
+                presetData={presetQuery.data as any}
+                isLoading={presetQuery.isLoading}
+                selectedPreset={preset}
+                onSelectPreset={setPreset}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="root-dir">Root directory</Label>
+              <Input
+                id="root-dir"
+                value={directory}
+                onChange={(e) => setDirectory(e.target.value)}
+                placeholder="./"
+              />
+              <p className="text-xs text-muted-foreground">
+                Subdirectory to build from (for monorepos). Defaults to the
+                repository root.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {repoToConnect && (
+        <div className="flex justify-end">
+          <Button
+            onClick={handleConnect}
+            disabled={updateGit.isPending || !preset}
+          >
+            {updateGit.isPending && (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            )}
+            Connect repository
+          </Button>
         </div>
       )}
     </div>

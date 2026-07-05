@@ -23,6 +23,79 @@ use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
 
+/// Extracts `nameserver` entries from resolv.conf-formatted text, excluding
+/// loopback addresses — meaningless inside a container's own network
+/// namespace, and the classic case for systemd-resolved's `127.0.0.53`
+/// stub. Pure/deterministic so it's unit-testable without touching the
+/// filesystem; see [`host_default_dns_servers`] for the I/O side.
+fn parse_non_loopback_nameservers(resolv_conf: &str) -> Vec<String> {
+    resolv_conf
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("nameserver"))
+        .map(str::trim)
+        .filter(|ip| {
+            ip.parse::<std::net::IpAddr>()
+                .map(|addr| !addr.is_loopback())
+                .unwrap_or(false)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Best-effort read of the host's own already-configured DNS servers, so
+/// they — not a hardcoded public resolver — can be appended as a fallback
+/// after the per-node Hickory resolver. Air-gapped/on-prem installs often
+/// route DNS to an internal-only server; assuming 1.1.1.1/8.8.8.8 would be
+/// unreachable there, and would leak queries externally for operators who
+/// specifically kept resolution internal.
+///
+/// Checks `/etc/resolv.conf` first. On systemd-resolved hosts that file is
+/// usually just the loopback stub (`127.0.0.53`, unreachable from inside a
+/// container's own netns), so this falls through to
+/// `/run/systemd/resolve/resolv.conf`, which systemd-resolved maintains
+/// specifically to expose the *real* upstream servers to tools — Docker's
+/// own embedded-DNS "ExtServers" detection reads the same file for the same
+/// reason.
+fn host_default_dns_servers() -> Vec<String> {
+    for path in ["/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"] {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let servers = parse_non_loopback_nameservers(&contents);
+            if !servers.is_empty() {
+                return servers;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Appends entries from `fallback_pool` to `primary`, deduplicated and
+/// capped at 3 total entries — glibc and musl both fail over to the next
+/// `nameserver` line once the current one times out, but both also ignore
+/// anything past the third line in `/etc/resolv.conf`.
+fn merge_dns_with_fallback(mut primary: Vec<String>, fallback_pool: &[String]) -> Vec<String> {
+    for fallback in fallback_pool {
+        if primary.len() >= 3 {
+            break;
+        }
+        if !primary.contains(fallback) {
+            primary.push(fallback.clone());
+        }
+    }
+    primary
+}
+
+/// Appends the host's own already-configured DNS servers (see
+/// [`host_default_dns_servers`]) to `primary`, so `temps-dns-resolver` is
+/// never a single point of failure for outbound DNS.
+///
+/// Shared by the app-container path ([`DockerRuntime::dns_for_container`])
+/// and the managed-service path (`temps_agent::service_handlers`) so
+/// neither one can silently regress into wiring the Hickory resolver as the
+/// sole nameserver.
+pub fn dns_with_fallback(primary: Vec<String>) -> Vec<String> {
+    merge_dns_with_fallback(primary, &host_default_dns_servers())
+}
+
 pub struct DockerRuntime {
     docker: Arc<Docker>,
     use_buildkit: bool,
@@ -40,13 +113,19 @@ pub struct DockerRuntime {
     /// fixed-IP setups; in the live agent we use
     /// [`Self::with_overlay_dns_slot`] instead, which reads the bridge
     /// IP dynamically from the network_sync loop's shared slot (the
-    /// bridge IP isn't known until the overlay has bootstrapped).
+    /// bridge IP isn't known until the overlay has bootstrapped). Never
+    /// used as-is: [`Self::dns_for_container`] appends the host's own
+    /// default DNS servers ([`dns_with_fallback`]) so this is never the
+    /// sole nameserver.
     dns_servers: Vec<String>,
     /// Optional dynamic DNS slot — populated by the agent's
     /// `network_sync` loop after the overlay bridge is up. Read on
     /// every `deploy_container` so containers booted after the
     /// overlay is up get the per-node Hickory resolver wired in. The
     /// static `dns_servers` field takes precedence when both are set.
+    /// Never used as-is: [`Self::dns_for_container`] appends the host's
+    /// own default DNS servers ([`dns_with_fallback`]) so this is never the
+    /// sole nameserver.
     overlay_dns_slot: Option<Arc<std::sync::RwLock<Option<std::net::IpAddr>>>>,
     /// Shared snapshot of overlay peers, refreshed by the agent's
     /// `network_sync` loop. After dual-attaching a container to the
@@ -428,6 +507,32 @@ impl DockerRuntime {
         self
     }
 
+    /// Nameservers to write into a new container's `/etc/resolv.conf`.
+    ///
+    /// The per-node Hickory resolver goes first (static `dns_servers` wins
+    /// when set — test/manual setups — otherwise the dynamic
+    /// `overlay_dns_slot` the agent's `network_sync` loop publishes), but
+    /// [`dns_with_fallback`] ensures it's never the *only* entry, so a
+    /// crashed or unreachable resolver degrades to "no `*.temps.local`"
+    /// instead of "no DNS at all" for every container on the node.
+    ///
+    /// Returns `None` when no primary resolver is configured yet (overlay
+    /// not bootstrapped), leaving `HostConfig.dns` unset so Docker falls
+    /// back to its embedded resolver, which already forwards to the host's
+    /// own default DNS — i.e. the safe behaviour, not a regression.
+    fn dns_for_container(&self) -> Option<Vec<String>> {
+        let primary = if !self.dns_servers.is_empty() {
+            self.dns_servers.clone()
+        } else {
+            self.overlay_dns_slot
+                .as_ref()
+                .and_then(|slot| slot.read().ok().and_then(|guard| *guard))
+                .map(|ip| vec![ip.to_string()])?
+        };
+
+        Some(dns_with_fallback(primary))
+    }
+
     /// Set the host bind address for container port mappings.
     /// Use "0.0.0.0" on agent nodes so containers are reachable from the private network.
     pub fn with_host_bind_address(mut self, address: String) -> Self {
@@ -603,6 +708,30 @@ impl DockerRuntime {
         }
 
         Ok(())
+    }
+
+    /// Read the IPv4 gateway of the app bridge network (`self.network_name`),
+    /// e.g. `172.19.0.1`. Used to bind the control-plane DNS resolver on the
+    /// bridge gateway (ADR-024). Returns `None` on any inspect failure or if
+    /// Docker assigned no IPv4 gateway. We explicitly skip any IPv6 IPAM
+    /// config: the resolver binds IPv4, and a dual-stack network can list its
+    /// configs in either order — taking the first gateway regardless of family
+    /// could hand back an IPv6 address we then fail to bind.
+    pub async fn inspect_app_network_gateway(&self) -> Option<std::net::IpAddr> {
+        let info = self
+            .docker
+            .inspect_network(
+                &self.network_name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+            .ok()?;
+        info.ipam?
+            .config?
+            .into_iter()
+            .filter_map(|c| c.gateway)
+            .filter_map(|gw| gw.parse::<std::net::IpAddr>().ok())
+            .find(|ip| ip.is_ipv4())
     }
 
     async fn create_tar_context_body(
@@ -1592,24 +1721,7 @@ impl ContainerDeployer for DockerRuntime {
             Some(format!("{}:/run/secrets:ro", host_dir.display()))
         };
 
-        // Wire the per-node Hickory resolver into the container's resolv.conf
-        // when configured. Without this, containers default to Docker's
-        // embedded DNS at 127.0.0.11, which can resolve names of other
-        // containers on the same Docker network but NOT `*.temps.local`
-        // cluster FQDNs that apps need to dial postgres-cluster members.
-        //
-        // Static `dns_servers` wins when set (test/manual setups);
-        // otherwise read the dynamic slot the agent's network_sync
-        // loop publishes after the overlay bridge is up.
-        let dns_for_container: Option<Vec<String>> = if !self.dns_servers.is_empty() {
-            Some(self.dns_servers.clone())
-        } else if let Some(slot) = self.overlay_dns_slot.as_ref() {
-            slot.read()
-                .ok()
-                .and_then(|guard| guard.map(|ip| vec![ip.to_string()]))
-        } else {
-            None
-        };
+        let dns_for_container = self.dns_for_container();
 
         let host_config = bollard::models::HostConfig {
             port_bindings: Some(port_bindings),
@@ -2384,6 +2496,258 @@ mod docker_tests {
             false,
             "test-network".to_string(),
         ))
+    }
+
+    /// `Docker::connect_with_local_defaults` only builds the client — it
+    /// doesn't dial the daemon — so this is safe to call without Docker
+    /// running, unlike `create_test_docker_runtime`'s async siblings.
+    fn test_runtime() -> DockerRuntime {
+        let docker = Docker::connect_with_local_defaults()
+            .expect("bollard client construction (no connection made)");
+        DockerRuntime::new(Arc::new(docker), false, "test-network".to_string())
+    }
+
+    #[test]
+    fn test_dns_for_container_none_when_no_resolver_configured() {
+        // Overlay not bootstrapped yet and no static override: `dns` stays
+        // unset so Docker falls back to its embedded resolver, which itself
+        // forwards to the host's own default DNS. Not a regression.
+        assert!(test_runtime().dns_for_container().is_none());
+    }
+
+    #[test]
+    fn test_dns_for_container_puts_overlay_resolver_first() {
+        let slot = Arc::new(std::sync::RwLock::new(Some(
+            "172.18.0.1".parse::<std::net::IpAddr>().unwrap(),
+        )));
+        let runtime = test_runtime().with_overlay_dns_slot(slot);
+
+        let dns = runtime.dns_for_container().expect("resolver is set");
+
+        assert_eq!(dns[0], "172.18.0.1", "Hickory resolver must stay primary");
+        assert!(dns.len() <= 3, "glibc/musl ignore nameservers past the 3rd");
+    }
+
+    #[test]
+    fn test_dns_for_container_overlay_slot_present_but_unpopulated() {
+        // Slot exists (agent wired it) but network_sync hasn't published the
+        // bridge IP yet — must behave like "no resolver configured", not panic.
+        let slot = Arc::new(std::sync::RwLock::new(None));
+        let runtime = test_runtime().with_overlay_dns_slot(slot);
+
+        assert!(runtime.dns_for_container().is_none());
+    }
+
+    #[test]
+    fn test_dns_for_container_static_servers_stay_primary() {
+        let runtime = test_runtime().with_dns_servers(vec!["10.0.0.53".to_string()]);
+
+        let dns = runtime.dns_for_container().expect("static servers set");
+
+        assert_eq!(dns[0], "10.0.0.53");
+        assert!(dns.len() <= 3);
+    }
+
+    // --- parse_non_loopback_nameservers: pure parsing, deterministic ---
+
+    #[test]
+    fn test_parse_non_loopback_nameservers_skips_systemd_resolved_stub() {
+        let resolv_conf = "nameserver 127.0.0.53\noptions edns0 trust-ad\n";
+        assert!(parse_non_loopback_nameservers(resolv_conf).is_empty());
+    }
+
+    #[test]
+    fn test_parse_non_loopback_nameservers_keeps_real_servers() {
+        let resolv_conf = "nameserver 10.0.0.53\nnameserver 8.8.8.8\nsearch example.com\n";
+        assert_eq!(
+            parse_non_loopback_nameservers(resolv_conf),
+            vec!["10.0.0.53", "8.8.8.8"]
+        );
+    }
+
+    #[test]
+    fn test_parse_non_loopback_nameservers_skips_ipv6_loopback_and_malformed() {
+        let resolv_conf = "nameserver ::1\nnameserver not-an-ip\nnameserver 2001:4860:4860::8888\n";
+        assert_eq!(
+            parse_non_loopback_nameservers(resolv_conf),
+            vec!["2001:4860:4860::8888"]
+        );
+    }
+
+    // --- merge_dns_with_fallback: pure merge, deterministic ---
+
+    #[test]
+    fn test_merge_dns_with_fallback_appends_pool_after_primary() {
+        let merged = merge_dns_with_fallback(
+            vec!["172.18.0.1".to_string()],
+            &["10.0.0.53".to_string(), "10.0.0.54".to_string()],
+        );
+        assert_eq!(merged, vec!["172.18.0.1", "10.0.0.53", "10.0.0.54"]);
+    }
+
+    #[test]
+    fn test_merge_dns_with_fallback_caps_at_three() {
+        let merged = merge_dns_with_fallback(
+            vec!["172.18.0.1".to_string()],
+            &[
+                "10.0.0.53".to_string(),
+                "10.0.0.54".to_string(),
+                "10.0.0.55".to_string(),
+            ],
+        );
+        assert_eq!(merged, vec!["172.18.0.1", "10.0.0.53", "10.0.0.54"]);
+    }
+
+    #[test]
+    fn test_merge_dns_with_fallback_dedupes_against_primary() {
+        // Primary already equals the host's configured server (single-host
+        // setup where the resolver IP happens to match) — must not repeat it.
+        let merged = merge_dns_with_fallback(
+            vec!["172.18.0.1".to_string(), "10.0.0.53".to_string()],
+            &["10.0.0.53".to_string()],
+        );
+        assert_eq!(merged, vec!["172.18.0.1", "10.0.0.53"]);
+    }
+
+    #[test]
+    fn test_merge_dns_with_fallback_empty_pool_leaves_primary_untouched() {
+        // Host default DNS undiscoverable (e.g. no readable resolv.conf) —
+        // must not panic or invent servers, just keep the primary resolver.
+        let merged = merge_dns_with_fallback(vec!["172.18.0.1".to_string()], &[]);
+        assert_eq!(merged, vec!["172.18.0.1"]);
+    }
+
+    /// Runs `cmd` inside `container_id` and returns combined stdout+stderr,
+    /// bounded so a hung DNS query (the exact failure mode this crate
+    /// exists to prevent) can't hang the test suite.
+    async fn exec_capture(docker: &Docker, container_id: &str, cmd: Vec<&str>) -> String {
+        let exec_config = bollard::models::ExecConfig {
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            cmd: Some(cmd.into_iter().map(str::to_string).collect()),
+            ..Default::default()
+        };
+        let exec = docker
+            .create_exec(container_id, exec_config)
+            .await
+            .expect("create_exec");
+
+        timeout(Duration::from_secs(15), async {
+            let mut combined = String::new();
+            if let Ok(bollard::exec::StartExecResults::Attached { mut output, .. }) = docker
+                .start_exec(&exec.id, None::<bollard::exec::StartExecOptions>)
+                .await
+            {
+                while let Some(Ok(msg)) = output.next().await {
+                    match msg {
+                        bollard::container::LogOutput::StdOut { message }
+                        | bollard::container::LogOutput::StdErr { message } => {
+                            combined.push_str(&String::from_utf8_lossy(&message));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            combined
+        })
+        .await
+        .unwrap_or_else(|_| "TIMED OUT".to_string())
+    }
+
+    /// End-to-end reproduction of the production incident this change
+    /// fixes: the per-node Hickory resolver becomes unreachable, and a
+    /// container that only had it as `nameserver` hung on every DNS query
+    /// (`wget api.stripe.com` never returning). Uses a real container
+    /// against the local Docker daemon — no mocks — because the bug lived
+    /// in what Docker actually writes to `/etc/resolv.conf`, not in our
+    /// in-memory list-building logic (already covered by the pure
+    /// `dns_for_container` / `merge_dns_with_fallback` tests above).
+    #[tokio::test]
+    #[serial]
+    async fn test_dns_fallback_survives_unreachable_primary_resolver() {
+        let runtime = match create_test_docker_runtime().await {
+            Ok(r) => r,
+            Err(e) => {
+                println!("🔧 Docker not available, skipping: {}", e);
+                return;
+            }
+        };
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(e) => {
+                println!("🔧 Docker not available, skipping: {}", e);
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("🔧 Docker ping failed, skipping");
+            return;
+        }
+
+        // RFC 5737 TEST-NET-3 — guaranteed non-routable, so a query to it
+        // times out exactly like a crashed/hung resolver process would,
+        // without depending on any real IP actually being unreachable.
+        let dead_resolver = "203.0.113.1";
+        let slot = Arc::new(std::sync::RwLock::new(Some(
+            dead_resolver.parse::<std::net::IpAddr>().unwrap(),
+        )));
+        let runtime = runtime.with_overlay_dns_slot(slot);
+
+        let name = "temps-dns-fallback-test";
+        let _ = runtime.remove_container(name).await;
+
+        let deploy_request = DeployRequest {
+            image_name: "alpine:latest".to_string(),
+            container_name: name.to_string(),
+            environment_vars: HashMap::new(),
+            secrets: HashMap::new(),
+            port_mappings: vec![],
+            network_name: None,
+            resource_limits: ResourceLimits {
+                cpu_limit: None,
+                memory_limit_mb: None,
+                disk_limit_mb: None,
+            },
+            restart_policy: RestartPolicy::Never,
+            log_path: PathBuf::from("/tmp/temps-dns-fallback-test.log"),
+            command: Some(vec!["sleep".to_string(), "60".to_string()]),
+            log_config: Some(ContainerLogConfig::app_default()),
+            labels: HashMap::new(),
+        };
+
+        let info = match runtime.deploy_container(deploy_request).await {
+            Ok(i) => i,
+            Err(e) => {
+                println!("🔧 Container deployment failed (may be expected): {}", e);
+                return;
+            }
+        };
+
+        let resolv_conf =
+            exec_capture(&docker, &info.container_id, vec!["cat", "/etc/resolv.conf"]).await;
+        println!("container /etc/resolv.conf:\n{resolv_conf}");
+        assert!(
+            resolv_conf.contains(dead_resolver),
+            "simulated dead resolver missing from resolv.conf — production \
+             wiring wouldn't match what this test exercises: {resolv_conf}"
+        );
+
+        // The actual incident repro: a real query must still succeed even
+        // though the FIRST nameserver never answers. Bounded well under the
+        // suite-level 15s exec timeout so a regression fails fast instead
+        // of hanging CI.
+        let lookup =
+            exec_capture(&docker, &info.container_id, vec!["nslookup", "google.com"]).await;
+        println!("nslookup google.com ->\n{lookup}");
+
+        let _ = runtime.remove_container(&info.container_id).await;
+
+        assert!(
+            lookup.contains("Address") && !lookup.contains("TIMED OUT"),
+            "external DNS resolution did not fail over to the host's own \
+             default DNS servers when the primary resolver was unreachable \
+             — temps-dns-resolver is still a SPOF: {lookup}"
+        );
     }
 
     #[test]

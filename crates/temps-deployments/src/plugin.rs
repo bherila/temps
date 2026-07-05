@@ -75,6 +75,18 @@ impl TempsPlugin for DeploymentsPlugin {
                 deployment_service.clone() as Arc<dyn temps_core::DeploymentCanceller>;
             context.register_service(deployment_canceller);
 
+            // Remote container log source — lets the log-aggregator collect logs
+            // from containers on remote worker nodes into searchable history. The
+            // aggregator picks this up via get_service and runs its reconcile
+            // loop; single-node setups simply have nothing to collect.
+            let remote_log_source = Arc::new(crate::services::RemoteLogSourceImpl::new(
+                db.clone(),
+                config_service.clone(),
+                encryption_service.clone(),
+            ))
+                as Arc<dyn temps_log_aggregator::RemoteContainerLogSource>;
+            context.register_service(remote_log_source);
+
             // Cancel any running deployments from previous server instance
             let cancel_service = deployment_service.clone();
             tokio::spawn(async move {
@@ -103,7 +115,7 @@ impl TempsPlugin for DeploymentsPlugin {
             let database_cron_service = Arc::new(crate::services::DatabaseCronConfigService::new(
                 db.clone(),
                 queue_service.clone(),
-                deployment_token_service,
+                deployment_token_service.clone(),
             ));
             let cron_service =
                 database_cron_service.clone() as Arc<dyn crate::jobs::CronConfigService>;
@@ -209,6 +221,20 @@ impl TempsPlugin for DeploymentsPlugin {
 
             // Get DSN service for automatic Sentry DSN generation (required)
             let dsn_service = context.require_service::<temps_error_tracking::DSNService>();
+
+            // Wire the shared environment-variable resolver into DeploymentService
+            // so the inline promote/rollback deploy paths resolve env from the
+            // selected environment (the SAME set as a normal deploy) instead of
+            // starting the reused image with no config. See services::env_resolver.
+            let env_resolver = Arc::new(crate::services::env_resolver::DeploymentEnvResolver {
+                db: db.clone(),
+                encryption_service: encryption_service.clone(),
+                config_service: config_service.clone(),
+                external_service_manager: external_service_manager.clone(),
+                dsn_service: dsn_service.clone(),
+                deployment_token_service: deployment_token_service.clone(),
+            });
+            deployment_service.set_env_resolver(env_resolver);
 
             // Create JobProcessor with workflow execution capability
             let job_receiver = queue_service.subscribe();
@@ -335,6 +361,7 @@ impl TempsPlugin for DeploymentsPlugin {
             audit_service,
             node_service,
             encryption_service,
+            config_service: config_service.clone(),
             docker: docker_for_exec,
         });
 

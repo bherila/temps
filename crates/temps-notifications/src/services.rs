@@ -119,6 +119,256 @@ pub struct WebhookProvider {
     pub timeout_secs: u64,
 }
 
+/// Cloudflare Email Sending provider.
+///
+/// Delivers notification emails through Cloudflare's transactional Email
+/// Sending API (`POST /accounts/{account_id}/email/sending/send`) instead of a
+/// self-managed SMTP relay. The operator only needs to configure their
+/// Cloudflare account id, an API token with the *Email Sending* permission, the
+/// verified sender, and the list of recipients — everything else (HTML/text
+/// rendering, subject) is derived from the notification itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudflareProvider {
+    /// Cloudflare account id that owns the Email Sending configuration.
+    pub account_id: String,
+    /// Cloudflare API token with the Email Sending permission. Stored encrypted.
+    pub api_token: String,
+    /// Verified sender address (must belong to a domain configured for
+    /// Cloudflare Email Sending, e.g. `welcome@infracf.example.com`).
+    pub from_address: String,
+    /// Optional human-friendly sender name shown in the recipient's inbox.
+    #[serde(default)]
+    pub from_name: Option<String>,
+    /// Recipients that should receive the notification.
+    pub to_addresses: Vec<String>,
+    /// Override for the Cloudflare API base URL. Never serialized into stored
+    /// config — it exists only so integration tests can point the provider at a
+    /// local mock server. Production always uses [`Self::API_BASE`].
+    #[serde(skip)]
+    pub api_base: Option<String>,
+}
+
+impl CloudflareProvider {
+    /// Cloudflare API base. Kept as an associated const so tests and call sites
+    /// build the same URL.
+    const API_BASE: &'static str = "https://api.cloudflare.com/client/v4";
+
+    /// Effective API base — the test override if set, otherwise the real one.
+    fn api_base(&self) -> &str {
+        self.api_base.as_deref().unwrap_or(Self::API_BASE)
+    }
+
+    fn send_endpoint(&self) -> String {
+        format!(
+            "{}/accounts/{}/email/sending/send",
+            self.api_base(),
+            self.account_id
+        )
+    }
+
+    /// Build the `from` field for the Cloudflare payload.
+    ///
+    /// Cloudflare Email Sending accepts either a bare address string or a
+    /// structured `{ "email", "name" }` object for a display name (the RFC 5322
+    /// `Name <address>` *string* form is NOT parsed — it would be treated as a
+    /// literal address). We emit the object form only when a name is set.
+    fn sender_value(&self) -> serde_json::Value {
+        match &self.from_name {
+            Some(name) if !name.trim().is_empty() => serde_json::json!({
+                "email": self.from_address,
+                "name": name,
+            }),
+            _ => serde_json::json!(self.from_address),
+        }
+    }
+
+    /// Plain-text fallback body. Cloudflare requires a `text` part alongside the
+    /// HTML one, so derive a readable version from the notification.
+    fn render_text_body(notification: &Notification) -> String {
+        let mut body = format!("{}\n\n{}", notification.title, notification.message);
+        if !notification.metadata.is_empty() {
+            body.push_str("\n\n---\n");
+            for (key, value) in &notification.metadata {
+                body.push_str(&format!("{}: {}\n", key, value));
+            }
+        }
+        body
+    }
+
+    /// POST a single rendered email to Cloudflare. Returns an error carrying the
+    /// status and response body so failures are diagnosable from the logs.
+    async fn post_email(
+        &self,
+        client: &reqwest::Client,
+        to: &str,
+        subject: &str,
+        html: &str,
+        text: &str,
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "to": to,
+            "from": self.sender_value(),
+            "subject": subject,
+            "html": html,
+            "text": text,
+        });
+
+        let response = client
+            .post(self.send_endpoint())
+            .bearer_auth(&self.api_token)
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Cloudflare email send to {} failed (request error): {}",
+                    to,
+                    e
+                )
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Cloudflare email send to {} failed with status {}: {}",
+                to,
+                status,
+                body
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl NotificationProvider for CloudflareProvider {
+    async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
+        if self.account_id.trim().is_empty() {
+            return Err(anyhow::anyhow!("Cloudflare account_id cannot be empty"));
+        }
+        if self.api_token.trim().is_empty() {
+            return Err(anyhow::anyhow!("Cloudflare api_token cannot be empty"));
+        }
+        if self.from_address.trim().is_empty() {
+            return Err(anyhow::anyhow!("Cloudflare from_address cannot be empty"));
+        }
+        if self.to_addresses.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Cloudflare provider requires at least one recipient in to_addresses"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn send(&self, notification: &Notification) -> Result<()> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+
+        let priority_prefix = match notification.priority {
+            NotificationPriority::Low => "[LOW] ",
+            NotificationPriority::Normal => "",
+            NotificationPriority::High => "[HIGH] ",
+            NotificationPriority::Critical => "[CRITICAL] ",
+        };
+        let subject = format!("{}{}", priority_prefix, notification.title);
+
+        // Reuse the shared notification email template unless the message is
+        // already a full HTML document (matching EmailProvider's behaviour).
+        let trimmed = notification.message.trim_start();
+        let is_full_document = trimmed.starts_with("<!DOCTYPE")
+            || trimmed.starts_with("<!doctype")
+            || trimmed.starts_with("<html")
+            || trimmed.starts_with("<HTML");
+        let html = if is_full_document {
+            notification.message.clone()
+        } else {
+            EmailProvider::render_notification_email(notification)
+        };
+        let text = Self::render_text_body(notification);
+
+        // De-duplicate recipients while preserving determinism.
+        let mut recipients = self.to_addresses.clone();
+        recipients.sort();
+        recipients.dedup();
+
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut delivered = false;
+        for addr in &recipients {
+            match self.post_email(&client, addr, &subject, &html, &text).await {
+                Ok(()) => delivered = true,
+                Err(e) => {
+                    error!("Failed to send Cloudflare email to {}: {}", addr, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        // Surface a failure only if every recipient failed — partial delivery
+        // still counts as a successful notification, consistent with SMTP.
+        if !delivered {
+            return Err(last_err.unwrap_or_else(|| {
+                anyhow::anyhow!("Cloudflare provider had no recipients to deliver to")
+            }));
+        }
+
+        Ok(())
+    }
+
+    async fn health_check(&self) -> Result<bool> {
+        // Validate the API token via Cloudflare's documented token-verify
+        // endpoint (`GET /user/tokens/verify`). This is a cheap, side-effect-free
+        // check that fails fast on bad/expired credentials without sending a real
+        // email. It is account-independent by design.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
+
+        let url = format!("{}/user/tokens/verify", self.api_base());
+
+        match client.get(url).bearer_auth(&self.api_token).send().await {
+            Ok(response) => Ok(response.status().is_success()),
+            Err(e) => {
+                error!("Cloudflare provider health check failed: {}", e);
+                Ok(false)
+            }
+        }
+    }
+}
+
+/// HTML-encode the five characters that can break element structure or inject
+/// new tags when user-controlled text is interpolated into an HTML template.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Escape Slack mrkdwn special characters so user-controlled text cannot inject
+/// hyperlinks (`<url|text>`), `<!channel>` mention floods, `&entity;` refs, or
+/// forge bold/italic/code/strikethrough formatting.
+fn slack_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('*', "\\*")
+        .replace('_', "\\_")
+        .replace('`', "\\`")
+        .replace('~', "\\~")
+}
+
 #[async_trait]
 pub trait NotificationProvider: Send + Sync {
     async fn initialize(&mut self, db: Arc<DatabaseConnection>) -> Result<()>;
@@ -395,11 +645,29 @@ impl EmailProvider {
             NotificationPriority::Critical => ("#dc2626", "#fef2f2", "&#128680;", "Critical"),
         };
 
-        let metadata_html = if notification.metadata.is_empty() {
+        // Inline chart (e.g. an OTel metric-alert's recent series) carried as a
+        // reserved `_chart_svg` key and rendered raw. `_`-prefixed keys are
+        // channel payloads — never shown as plain detail rows.
+        let chart_html = notification
+            .metadata
+            .get("_chart_svg")
+            .map(|svg| {
+                format!(
+                    r#"<tr><td colspan="2" style="padding: 20px 0 0;">{}</td></tr>"#,
+                    svg
+                )
+            })
+            .unwrap_or_default();
+
+        let visible_metadata: Vec<(&String, &String)> = notification
+            .metadata
+            .iter()
+            .filter(|(k, _)| !k.starts_with('_'))
+            .collect();
+        let metadata_html = if visible_metadata.is_empty() {
             String::new()
         } else {
-            let rows: String = notification
-                .metadata
+            let rows: String = visible_metadata
                 .iter()
                 .map(|(k, v)| {
                     // Format key: replace underscores with spaces and title-case
@@ -421,7 +689,7 @@ impl EmailProvider {
                             <td style="padding: 8px 12px; color: #6b7280; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; font-size: 13px; white-space: nowrap; vertical-align: top;">{}</td>
                             <td style="padding: 8px 12px; color: #1f2937; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; font-size: 13px; word-break: break-all;">{}</td>
                         </tr>"#,
-                        label, v
+                        html_escape(&label), html_escape(v)
                     )
                 })
                 .collect();
@@ -441,18 +709,11 @@ impl EmailProvider {
             )
         };
 
-        // If the message already contains HTML tags, use it directly.
-        // Otherwise escape plain text and convert newlines to <br>.
-        let message_html = if notification.message.contains("</") {
-            notification.message.clone()
-        } else {
-            notification
-                .message
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-                .replace('\n', "<br>")
-        };
+        // Always escape the message as plain text, then convert newlines to <br>.
+        // Escape must happen first so the literal <br> tags we insert are not
+        // themselves escaped in a subsequent pass.
+        let message_html = html_escape(&notification.message).replace('\n', "<br>");
+        let title_html = html_escape(&notification.title);
 
         format!(
             r#"<!DOCTYPE html>
@@ -496,6 +757,7 @@ impl EmailProvider {
                         <tr><td style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 14px; color: #374151; line-height: 1.7;">
                             {message}
                         </td></tr>
+                        {chart}
                         {metadata}
                     </table>
                 </td></tr>
@@ -514,13 +776,14 @@ impl EmailProvider {
     </table>
 </body>
 </html>"#,
-            title = notification.title,
+            title = title_html,
             timestamp = notification.timestamp.format("%b %d, %Y at %H:%M UTC"),
             accent_color = accent_color,
             bg_color = bg_color,
             icon = icon,
             label = label,
             message = message_html,
+            chart = chart_html,
             metadata = metadata_html,
             priority = notification.priority,
         )
@@ -751,21 +1014,26 @@ impl NotificationProvider for SlackProvider {
         let metadata_fields = notification
             .metadata
             .iter()
+            // `_`-prefixed keys are channel payloads (e.g. the email's `_chart_svg`),
+            // not human-facing fields — skip them here.
+            .filter(|(k, _)| !k.starts_with('_'))
             .map(|(k, v)| {
                 serde_json::json!({
-                    "title": k,
-                    "value": v,
+                    "title": slack_escape(k),
+                    "value": slack_escape(v),
                     "short": true
                 })
             })
             .collect::<Vec<_>>();
 
+        let safe_title = slack_escape(&notification.title);
+        let safe_message = slack_escape(&notification.message);
         let payload = serde_json::json!({
             "channel": self.channel,
             "attachments": [{
                 "color": color,
-                "title": notification.title,
-                "text": notification.message,
+                "title": safe_title,
+                "text": safe_message,
                 "fields": metadata_fields,
                 "footer": format!("Priority: {:?} | Type: {:?}", notification.priority, notification.notification_type)
             }]
@@ -824,7 +1092,14 @@ impl NotificationProvider for WebhookProvider {
             .timeout(std::time::Duration::from_secs(self.timeout_secs))
             .build()?;
 
-        // Build the payload with all notification data
+        // Build the payload with all notification data. `_`-prefixed keys are
+        // channel-specific payloads (e.g. the email's `_chart_svg`) — drop them
+        // so they don't bloat the webhook body.
+        let metadata: std::collections::HashMap<&String, &String> = notification
+            .metadata
+            .iter()
+            .filter(|(k, _)| !k.starts_with('_'))
+            .collect();
         let payload = serde_json::json!({
             "id": notification.id,
             "title": notification.title,
@@ -833,7 +1108,7 @@ impl NotificationProvider for WebhookProvider {
             "priority": notification.priority.to_string(),
             "severity": notification.effective_severity().to_string(),
             "timestamp": notification.timestamp.to_rfc3339(),
-            "metadata": notification.metadata,
+            "metadata": metadata,
         });
 
         // Build the request with configured method
@@ -1072,7 +1347,14 @@ impl NotificationService {
         // Pass the previous record's occurrence_count so the gap doubles per
         // ongoing-incident attempt instead of staying at the base delay forever.
         let previous_attempts = existing.as_ref().map(|e| e.occurrence_count).unwrap_or(0);
-        let metadata_json = serde_json::to_string(&notification.metadata)?;
+        // Persist only human-facing metadata; `_`-prefixed channel payloads
+        // (e.g. the email's `_chart_svg`) would bloat the row needlessly.
+        let persisted_metadata: std::collections::HashMap<&String, &String> = notification
+            .metadata
+            .iter()
+            .filter(|(k, _)| !k.starts_with('_'))
+            .collect();
+        let metadata_json = serde_json::to_string(&persisted_metadata)?;
         let next_allowed = Self::get_next_allowed_time(&notification.priority, previous_attempts);
 
         // Create new notification record
@@ -1192,6 +1474,11 @@ impl NotificationService {
             }
             "webhook" => {
                 let mut config: WebhookProvider = serde_json::from_str(&decrypted_config)?;
+                config.initialize(self.db.clone()).await?;
+                Box::new(config)
+            }
+            "cloudflare" => {
+                let mut config: CloudflareProvider = serde_json::from_str(&decrypted_config)?;
                 config.initialize(self.db.clone()).await?;
                 Box::new(config)
             }
@@ -1957,6 +2244,208 @@ mod tests {
         }
     }
 
+    fn cloudflare_provider(to: Vec<&str>) -> CloudflareProvider {
+        CloudflareProvider {
+            account_id: "acct123".to_string(),
+            api_token: "cf-token".to_string(),
+            from_address: "welcome@infracf.example.com".to_string(),
+            from_name: Some("Temps".to_string()),
+            to_addresses: to.into_iter().map(String::from).collect(),
+            api_base: None,
+        }
+    }
+
+    #[test]
+    fn test_cloudflare_send_endpoint() {
+        let provider = cloudflare_provider(vec!["a@example.com"]);
+        assert_eq!(
+            provider.send_endpoint(),
+            "https://api.cloudflare.com/client/v4/accounts/acct123/email/sending/send"
+        );
+    }
+
+    #[test]
+    fn test_cloudflare_sender_value() {
+        // With a display name → structured { email, name } object (Cloudflare's
+        // documented format; the RFC `Name <addr>` string is NOT used).
+        let with_name = cloudflare_provider(vec!["a@example.com"]);
+        assert_eq!(
+            with_name.sender_value(),
+            serde_json::json!({
+                "email": "welcome@infracf.example.com",
+                "name": "Temps",
+            })
+        );
+
+        // Without a name → bare address string.
+        let mut without_name = cloudflare_provider(vec!["a@example.com"]);
+        without_name.from_name = None;
+        assert_eq!(
+            without_name.sender_value(),
+            serde_json::json!("welcome@infracf.example.com")
+        );
+
+        // Whitespace-only name is treated as absent.
+        let mut blank_name = cloudflare_provider(vec!["a@example.com"]);
+        blank_name.from_name = Some("   ".to_string());
+        assert_eq!(
+            blank_name.sender_value(),
+            serde_json::json!("welcome@infracf.example.com")
+        );
+    }
+
+    #[test]
+    fn test_cloudflare_text_body_includes_metadata() {
+        let notification = Notification::new("Deploy failed", "The build crashed")
+            .with_metadata("project", "temps")
+            .with_metadata("environment", "production");
+        let text = CloudflareProvider::render_text_body(&notification);
+        assert!(text.starts_with("Deploy failed\n\nThe build crashed"));
+        assert!(text.contains("project: temps"));
+        assert!(text.contains("environment: production"));
+    }
+
+    #[tokio::test]
+    async fn test_cloudflare_initialize_validates_required_fields() {
+        let db = Arc::new(MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection());
+
+        let mut ok = cloudflare_provider(vec!["a@example.com"]);
+        assert!(ok.initialize(db.clone()).await.is_ok());
+
+        let mut no_account = cloudflare_provider(vec!["a@example.com"]);
+        no_account.account_id = String::new();
+        assert!(no_account.initialize(db.clone()).await.is_err());
+
+        let mut no_token = cloudflare_provider(vec!["a@example.com"]);
+        no_token.api_token = String::new();
+        assert!(no_token.initialize(db.clone()).await.is_err());
+
+        let mut no_from = cloudflare_provider(vec!["a@example.com"]);
+        no_from.from_address = String::new();
+        assert!(no_from.initialize(db.clone()).await.is_err());
+
+        let mut no_recipients = cloudflare_provider(vec![]);
+        assert!(no_recipients.initialize(db).await.is_err());
+    }
+
+    #[test]
+    fn test_cloudflare_config_serialization_roundtrip() {
+        let provider = cloudflare_provider(vec!["a@example.com", "b@example.com"]);
+        let json = serde_json::to_string(&provider).unwrap();
+        // The api_base test override must never leak into stored config.
+        assert!(!json.contains("api_base"));
+        let parsed: CloudflareProvider = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.account_id, "acct123");
+        assert_eq!(parsed.to_addresses.len(), 2);
+        assert_eq!(parsed.from_name.as_deref(), Some("Temps"));
+        assert_eq!(parsed.api_base, None);
+    }
+
+    // ---- Integration tests against a local mock HTTP server (wiremock) ----
+    // These exercise the real `send` / `health_check` HTTP paths: request
+    // method, path, bearer auth, JSON payload shape and response handling.
+
+    #[tokio::test]
+    async fn test_cloudflare_send_posts_to_each_recipient_with_auth_and_payload() {
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/accounts/acct123/email/sending/send"))
+            .and(header("authorization", "Bearer cf-token"))
+            .and(body_partial_json(serde_json::json!({
+                "from": { "email": "welcome@infracf.example.com", "name": "Temps" },
+                "subject": "Deploy failed",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+            })))
+            .expect(2) // one POST per recipient
+            .mount(&server)
+            .await;
+
+        let mut provider = cloudflare_provider(vec!["a@example.com", "b@example.com"]);
+        provider.api_base = Some(server.uri());
+
+        let notification = Notification::new("Deploy failed", "The build crashed");
+        let result = provider.send(&notification).await;
+
+        assert!(result.is_ok(), "send should succeed: {:?}", result.err());
+        // `expect(2)` is verified on drop of the server.
+    }
+
+    #[tokio::test]
+    async fn test_cloudflare_send_errors_when_all_recipients_fail() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/accounts/acct123/email/sending/send"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "success": false,
+                "errors": [{ "message": "Authentication error" }],
+            })))
+            .mount(&server)
+            .await;
+
+        let mut provider = cloudflare_provider(vec!["a@example.com"]);
+        provider.api_base = Some(server.uri());
+
+        let notification = Notification::new("Alert", "Something broke");
+        let err = provider.send(&notification).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("403") && msg.contains("a@example.com"),
+            "error should carry status and recipient: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cloudflare_health_check_true_on_success() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/user/tokens/verify"))
+            .and(header("authorization", "Bearer cf-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "result": { "id": "tok123", "status": "active" },
+            })))
+            .mount(&server)
+            .await;
+
+        let mut provider = cloudflare_provider(vec!["a@example.com"]);
+        provider.api_base = Some(server.uri());
+
+        assert!(provider.health_check().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_cloudflare_health_check_false_on_bad_credentials() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/user/tokens/verify"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let mut provider = cloudflare_provider(vec!["a@example.com"]);
+        provider.api_base = Some(server.uri());
+
+        assert!(!provider.health_check().await.unwrap());
+    }
+
     #[test]
     fn test_notification_priority_ordering() {
         // For a first send (no prior attempts), Critical should have the shortest
@@ -2469,5 +2958,238 @@ mod tests {
         assert!(html.contains("<table"));
         assert!(!html.contains("display: flex"));
         assert!(!html.contains("display: grid"));
+    }
+
+    // ── Escape helper unit tests ──────────────────────────────────────
+
+    #[test]
+    fn test_html_escape_encodes_all_special_chars() {
+        assert_eq!(html_escape("<"), "&lt;");
+        assert_eq!(html_escape(">"), "&gt;");
+        assert_eq!(html_escape("&"), "&amp;");
+        assert_eq!(html_escape("\""), "&quot;");
+        assert_eq!(html_escape("'"), "&#x27;");
+        assert_eq!(
+            html_escape("<script>alert('xss')</script>"),
+            "&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;"
+        );
+    }
+
+    #[test]
+    fn test_html_escape_passes_safe_chars_through() {
+        assert_eq!(html_escape("hello world 123"), "hello world 123");
+        assert_eq!(html_escape(""), "");
+        // Newlines, tabs, and spaces are not HTML-special — must not be altered.
+        assert_eq!(html_escape("line1\nline2\ttab"), "line1\nline2\ttab");
+    }
+
+    #[test]
+    fn test_slack_escape_encodes_mrkdwn_special_chars() {
+        assert_eq!(slack_escape("<"), "&lt;");
+        assert_eq!(slack_escape(">"), "&gt;");
+        assert_eq!(slack_escape("&"), "&amp;");
+        // Full injection sequences must be neutralised.
+        assert_eq!(slack_escape("<!channel>"), "&lt;!channel&gt;");
+        assert_eq!(
+            slack_escape("<https://evil.example|Click here>"),
+            "&lt;https://evil.example|Click here&gt;"
+        );
+        assert_eq!(slack_escape("&amp;"), "&amp;amp;");
+        // mrkdwn formatting characters must not let user text forge emphasis or
+        // code blocks (e.g. a bolded fake severity, or a `DROP TABLE` code block).
+        assert_eq!(slack_escape("*bold*"), "\\*bold\\*");
+        assert_eq!(slack_escape("_italic_"), "\\_italic\\_");
+        assert_eq!(slack_escape("`code`"), "\\`code\\`");
+        assert_eq!(slack_escape("~strike~"), "\\~strike\\~");
+    }
+
+    #[test]
+    fn test_slack_escape_passes_safe_chars_through() {
+        assert_eq!(slack_escape("hello world 123"), "hello world 123");
+        assert_eq!(slack_escape(""), "");
+    }
+
+    // ── Regression tests: HTML injection via title/metadata ───────────
+
+    #[test]
+    fn test_email_title_injection_does_not_break_html_structure() {
+        // Simulates an OTel series_label value injected into the alarm title by
+        // Phase 3 (per-series dynamic alerting). The value contains a closing tag
+        // that would break the <h1> and inject a phishing anchor.
+        let notification = Notification {
+            id: "sec-test".to_string(),
+            title: r#"Metric threshold breached [endpoint=</h1><a href="https://evil.example">Click to resolve</a>]"#.to_string(),
+            message: "Normal message".to_string(),
+            notification_type: NotificationType::Alert,
+            priority: NotificationPriority::Critical,
+            severity: None,
+            timestamp: Utc::now(),
+            metadata: std::collections::HashMap::new(),
+            bypass_throttling: false,
+        };
+
+        let html = EmailProvider::render_notification_email(&notification);
+
+        // The injected anchor tag must not appear verbatim in the rendered output.
+        assert!(
+            !html.contains(r#"<a href="https://evil.example">"#),
+            "rendered HTML must not contain injected anchor tag"
+        );
+        // The title content must still appear, but escaped.
+        assert!(
+            html.contains("&lt;/h1&gt;"),
+            "closing h1 in title must be HTML-escaped"
+        );
+        assert!(
+            html.contains("&lt;a href=&quot;https://evil.example&quot;&gt;"),
+            "injected anchor in title must be fully HTML-escaped"
+        );
+    }
+
+    #[test]
+    fn test_email_metadata_value_injection_does_not_break_html_structure() {
+        // Simulates an OTel attribute value (series_key) injected into the
+        // DETAILS table. The value closes the current <td> and injects a script.
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "series_label".to_string(),
+            r#"endpoint=</td><script>alert(1)</script>"#.to_string(),
+        );
+
+        let notification = Notification {
+            id: "sec-test-2".to_string(),
+            title: "Metric threshold breached".to_string(),
+            message: "Normal message".to_string(),
+            notification_type: NotificationType::Alert,
+            priority: NotificationPriority::High,
+            severity: None,
+            timestamp: Utc::now(),
+            metadata,
+            bypass_throttling: false,
+        };
+
+        let html = EmailProvider::render_notification_email(&notification);
+
+        assert!(
+            !html.contains("<script>"),
+            "rendered HTML must not contain injected script tag"
+        );
+        assert!(
+            html.contains("&lt;/td&gt;"),
+            "injected closing td in metadata value must be HTML-escaped"
+        );
+    }
+
+    // ── Regression test: HTML injection via message body (ADR-026 Phase 3) ──
+    //
+    // Attack path: OTel per-series label (e.g., `env=</td><a href="...">`) is
+    // embedded into `alarm.title` by the metric-alert evaluator.  When the alarm
+    // resolves, `alarm_service::send_resolved_notification` formats the message as
+    //   format!("Alarm '{}' has been resolved.\nOriginal severity: {}", alarm.title, …)
+    // and sends it through `render_notification_email`.  The old `contains("</")` heuristic
+    // would have passed the entire message through unescaped, injecting arbitrary HTML.
+    #[test]
+    fn test_email_message_injection_via_resolved_alarm_label_is_escaped() {
+        // Mirrors exactly what alarm_service::send_resolved_notification produces when
+        // alarm.title embeds an attacker-controlled OTel series_label.
+        let injected_title =
+            r#"Metric threshold breached [env=</td><a href="https://evil.example">click</a>]"#;
+        let message = format!(
+            "Alarm '{}' has been resolved.\nOriginal severity: critical",
+            injected_title
+        );
+
+        let notification = Notification {
+            id: "sec-test-msg".to_string(),
+            title: "Resolved: Metric threshold breached".to_string(),
+            message,
+            notification_type: NotificationType::Info,
+            priority: NotificationPriority::Normal,
+            severity: None,
+            timestamp: Utc::now(),
+            metadata: std::collections::HashMap::new(),
+            bypass_throttling: false,
+        };
+
+        let html = EmailProvider::render_notification_email(&notification);
+
+        // The injected anchor must not appear verbatim.
+        assert!(
+            !html.contains(r#"<a href="https://evil.example">"#),
+            "rendered HTML must not contain unescaped injected anchor from message"
+        );
+        // The closing </td> from the injection must not appear verbatim.
+        assert!(
+            !html.contains("</td><a"),
+            "rendered HTML must not contain unescaped </td> injection from message"
+        );
+        // The angle-bracket content must be entity-encoded instead.
+        assert!(
+            html.contains("&lt;/td&gt;"),
+            "injected </td> in message must be HTML-escaped to &lt;/td&gt;"
+        );
+        assert!(
+            html.contains("&lt;a href=&quot;https://evil.example&quot;&gt;"),
+            "injected anchor in message must be fully HTML-escaped"
+        );
+        // Newlines must still become <br> so multi-line messages render correctly.
+        assert!(
+            html.contains("<br>"),
+            "newline in message must be converted to <br>"
+        );
+    }
+
+    #[test]
+    fn test_safe_title_renders_identically_without_escaping() {
+        // A title with no HTML-special characters must produce the exact same
+        // visible text after escaping (byte-for-byte in the rendered document).
+        let title = "Metric alert fired for deployment my-app in environment production";
+        let notification = Notification {
+            id: "safe-test".to_string(),
+            title: title.to_string(),
+            message: "Normal message".to_string(),
+            notification_type: NotificationType::Alert,
+            priority: NotificationPriority::High,
+            severity: None,
+            timestamp: Utc::now(),
+            metadata: std::collections::HashMap::new(),
+            bypass_throttling: false,
+        };
+
+        let html = EmailProvider::render_notification_email(&notification);
+
+        // The title must appear verbatim — no extra escaping of safe characters.
+        assert!(
+            html.contains(title),
+            "safe title must appear unchanged in rendered HTML"
+        );
+    }
+
+    #[test]
+    fn test_slack_channel_mention_injection_is_neutralised() {
+        // The Slack mrkdwn `<!channel>` sequence would trigger an @channel
+        // notification flood if passed through unescaped.
+        let title = "Metric alert [env=<!channel>]";
+        let message = "Value exceeded threshold. See <https://evil.example|dashboard>.";
+
+        let escaped_title = slack_escape(title);
+        let escaped_message = slack_escape(message);
+
+        assert!(
+            !escaped_title.contains("<!channel>"),
+            "<!channel> must be neutralised in Slack title"
+        );
+        assert!(
+            escaped_title.contains("&lt;!channel&gt;"),
+            "escaped title must contain the HTML-entity form"
+        );
+        assert!(
+            !escaped_message.contains("<https://evil.example|dashboard>"),
+            "mrkdwn link must be neutralised in Slack message"
+        );
+        assert!(
+            escaped_message.contains("&lt;https://evil.example|dashboard&gt;"),
+            "escaped message must contain the HTML-entity form"
+        );
     }
 }

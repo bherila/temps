@@ -24,7 +24,7 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{deny_deployment_token, permission_guard, project_scope_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_proxy::CachedPeerTable;
@@ -74,6 +74,7 @@ pub async fn get_events_count(
     Query(query): Query<EventsCountQuery>,
 ) -> Result<Json<Vec<EventCount>>, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, project_id);
 
     let spec = EventsCountSpec::new(
         TimeRange {
@@ -126,6 +127,7 @@ pub async fn get_session_events(
     Query(query): Query<SessionEventsQuery>,
 ) -> Result<Json<AnalyticsSessionEventsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, query.project_id);
 
     let spec = SessionEventsSpec {
         session_id: session_id.clone(),
@@ -175,6 +177,7 @@ pub async fn has_analytics_events(
     Path(project_id): Path<i32>,
 ) -> Result<Json<HasEventsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, project_id);
 
     let spec = HasEventsSpec {
         scope: AnalyticsScope::project(project_id),
@@ -223,6 +226,7 @@ pub async fn get_event_type_breakdown(
     Query(query): Query<EventTypeBreakdownQuery>,
 ) -> Result<Json<Vec<EventTypeBreakdown>>, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, project_id);
 
     let spec = EventTypeBreakdownSpec {
         range: TimeRange {
@@ -278,6 +282,7 @@ pub async fn get_events_timeline(
     Query(query): Query<EventTimelineQuery>,
 ) -> Result<Json<Vec<EventTimeline>>, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, project_id);
 
     let spec = EventsTimelineSpec {
         range: TimeRange {
@@ -330,6 +335,7 @@ pub async fn get_active_visitors(
     Query(query): Query<ActiveVisitorsQuery>,
 ) -> Result<Json<ActiveVisitorsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, project_id);
 
     let spec = ActiveVisitorsSpec {
         scope: AnalyticsScope::project(project_id)
@@ -383,6 +389,7 @@ pub async fn get_hourly_visits(
     Query(query): Query<HourlyVisitsQuery>,
 ) -> Result<Json<Vec<EventTimeline>>, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, project_id);
 
     let spec = HourlyVisitsSpec {
         range: TimeRange {
@@ -446,6 +453,7 @@ pub async fn get_property_breakdown(
     Query(query): Query<PropertyBreakdownQuery>,
 ) -> Result<Json<PropertyBreakdownResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, project_id);
 
     let aggregation_level = query.aggregation_level.as_str();
 
@@ -520,6 +528,7 @@ pub async fn get_property_timeline(
     Query(query): Query<PropertyTimelineQuery>,
 ) -> Result<Json<PropertyTimelineResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, project_id);
 
     let aggregation_level = query.aggregation_level.as_str();
 
@@ -581,6 +590,7 @@ pub async fn get_unique_counts(
     Query(query): Query<UniqueCountsQuery>,
 ) -> Result<Json<UniqueCountsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, project_id);
 
     let spec = UniqueCountsSpec {
         range: TimeRange {
@@ -825,6 +835,7 @@ pub async fn record_console_event(
     use tracing::{info, warn};
 
     permission_guard!(auth, AnalyticsWrite);
+    project_scope_guard!(auth, project_id);
 
     info!(
         "Recording console event: {} for project {} path: {}",
@@ -949,6 +960,7 @@ pub async fn get_aggregated_buckets(
     Query(query): Query<crate::types::AggregatedBucketsQuery>,
 ) -> Result<Json<crate::types::AggregatedBucketsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    project_scope_guard!(auth, project_id);
 
     let spec = AggregatedBucketsSpec {
         range: TimeRange {
@@ -1005,6 +1017,11 @@ pub async fn get_dashboard_projects_analytics(
     Query(query): Query<crate::types::DashboardProjectsAnalyticsQuery>,
 ) -> Result<Json<crate::types::DashboardProjectsAnalyticsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
+    // This batch endpoint accepts an arbitrary list of project_ids, so there is
+    // no single project to scope a deployment token against. A project-bound
+    // machine credential has no business querying cross-project dashboards;
+    // require a real user / API-key session.
+    deny_deployment_token!(auth);
 
     let project_ids: Vec<i32> = query
         .project_ids
@@ -1330,6 +1347,104 @@ mod tests {
         .insert(db)
         .await
         .expect("Failed to insert test project")
+    }
+
+    /// Build an app whose auth middleware injects a deployment token bound to
+    /// `token_project_id` with FullAccess — the worst case for cross-tenant IDOR.
+    fn setup_deployment_token_app(state: Arc<AppState>, token_project_id: i32) -> axum::Router {
+        let auth_middleware = middleware::from_fn(
+            move |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                let auth_context = temps_auth::AuthContext::new_deployment_token(
+                    token_project_id,
+                    None,
+                    None,
+                    1,
+                    "test-deployment-token".to_string(),
+                    vec![temps_entities::deployment_tokens::DeploymentTokenPermission::FullAccess],
+                );
+                req.extensions_mut().insert(auth_context);
+                next.run(req).await
+            },
+        );
+
+        configure_routes().layer(auth_middleware).with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_full_access_deployment_token_cannot_read_other_project_analytics() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+
+        // Token is bound to a DIFFERENT project than the one in the path.
+        let other_project_id = project.id + 1;
+        let app = setup_deployment_token_app(state.clone(), other_project_id);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/projects/{}/has-events", project.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Even with FullAccess, the token must be denied cross-project access.
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a FullAccess deployment token bound to project {} must not read project {}",
+            other_project_id,
+            project.id
+        );
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn test_deployment_token_can_read_its_own_project_analytics() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+
+        // Token bound to the SAME project as the path — should be allowed.
+        let app = setup_deployment_token_app(state.clone(), project.id);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/projects/{}/has-events", project.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a deployment token bound to project {} must be able to read its own analytics",
+            project.id
+        );
+
+        test_db.cleanup().await;
     }
 
     #[tokio::test]

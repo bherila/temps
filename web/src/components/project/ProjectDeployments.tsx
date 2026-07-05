@@ -2,6 +2,7 @@ import { EnvironmentResponse, ProjectResponse } from '@/api/client'
 import {
   cancelDeploymentMutation,
   deployFromImageMutation,
+  deployFromStaticMutation,
   getEnvironmentsOptions,
   getProjectDeploymentsOptions,
   promoteDeploymentMutation,
@@ -39,8 +40,9 @@ import { useState, useCallback, useEffect, useRef } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { ArrowUpRight, ChevronLeft, ChevronRight, Loader2, PlusIcon, RefreshCw } from 'lucide-react'
+import { ArrowUpRight, ChevronLeft, ChevronRight, Loader2, PlusIcon, RefreshCw, Upload } from 'lucide-react'
 import { EmptyPlaceholder } from '@/components/ui/empty-placeholder'
 
 const ITEMS_PER_PAGE = 10
@@ -52,6 +54,15 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   )
   const [promoteDeploymentId, setPromoteDeploymentId] = useState<number | null>(null)
   const [promoteTargetEnv, setPromoteTargetEnv] = useState<string>('')
+  // Static-files deploy: upload a bundle, then deploy it to an environment.
+  const [staticDialogOpen, setStaticDialogOpen] = useState(false)
+  const [staticEnv, setStaticEnv] = useState<string>('')
+  const [staticFile, setStaticFile] = useState<File | null>(null)
+  const [staticUploading, setStaticUploading] = useState(false)
+  // Docker-image deploy: deploy a specific (possibly new) image ref.
+  const [imageDialogOpen, setImageDialogOpen] = useState(false)
+  const [imageEnv, setImageEnv] = useState<string>('')
+  const [imageRefInput, setImageRefInput] = useState<string>('')
   const [searchParams, setSearchParams] = useSearchParams()
   const refreshIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const initialDeploymentCountRef = useRef<number | null>(null)
@@ -351,6 +362,76 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     )
   }
 
+  const deployFromStaticMut = useMutation({
+    ...deployFromStaticMutation(),
+    meta: { errorTitle: 'Failed to deploy static files' },
+  })
+
+  const deployImageMut = useMutation({
+    ...deployFromImageMutation(),
+    meta: { errorTitle: 'Failed to deploy image' },
+  })
+
+  // Deploy a specific image ref (may differ from the last one) to an environment.
+  const handleDeployImage = async () => {
+    const ref = imageRefInput.trim()
+    if (!ref || !imageEnv) return
+    try {
+      await deployImageMut.mutateAsync({
+        path: { project_id: project.id, environment_id: parseInt(imageEnv) },
+        body: { image_ref: ref },
+      })
+      toast.success('Image deployment started')
+      setImageDialogOpen(false)
+      setImageEnv('')
+      refetch()
+    } catch (e) {
+      toast.error(
+        (e as { detail?: string })?.detail || 'Failed to deploy image'
+      )
+    }
+  }
+
+  // Upload the chosen bundle (multipart — file bodies don't go cleanly through
+  // the generated SDK, so this uses a raw fetch), then deploy it to the selected
+  // environment. Both steps require DeploymentsCreate.
+  const handleDeployStatic = async () => {
+    if (!staticFile || !staticEnv) return
+    setStaticUploading(true)
+    try {
+      const fd = new FormData()
+      fd.append('file', staticFile)
+      const uploadRes = await fetch(
+        `/api/projects/${project.id}/static-bundles`,
+        { method: 'POST', credentials: 'include', body: fd }
+      )
+      if (!uploadRes.ok) {
+        const d = (await uploadRes.json().catch(() => null)) as {
+          detail?: string
+        } | null
+        throw new Error(d?.detail || 'Upload failed')
+      }
+      const bundle = (await uploadRes.json()) as { id: number }
+      await deployFromStaticMut.mutateAsync({
+        path: { project_id: project.id, environment_id: parseInt(staticEnv) },
+        body: { static_bundle_id: bundle.id },
+      })
+      toast.success('Static deployment started')
+      setStaticDialogOpen(false)
+      setStaticFile(null)
+      setStaticEnv('')
+      refetch()
+    } catch (e) {
+      toast.error(
+        (e as { message?: string; detail?: string })?.message ||
+          (e as { detail?: string })?.detail ||
+          'Failed to deploy static files'
+      )
+    } finally {
+      setStaticUploading(false)
+    }
+  }
+
   // Get environments that are different from the deployment's environment
   const getPromoteTargetEnvironments = (deploymentId: number) => {
     const deployment = deploymentsData?.deployments.find(
@@ -361,6 +442,167 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       (env) => env.id !== deployment.environment_id
     )
   }
+
+  // Shared image-deploy dialog — lets a docker_image project deploy a specific
+  // (possibly new) image ref, instead of only re-pulling the last one.
+  const imageDeployDialog = (
+    <Dialog
+      open={imageDialogOpen}
+      onOpenChange={(open) => {
+        if (!open && !deployImageMut.isPending) {
+          setImageDialogOpen(false)
+          setImageEnv('')
+        }
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <Upload className="h-5 w-5" />
+            Deploy image
+          </DialogTitle>
+          <DialogDescription>
+            Pull a prebuilt Docker image from a registry and deploy it to an
+            environment.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4 py-4">
+          <div className="space-y-2">
+            <Label htmlFor="image-ref">Image reference</Label>
+            <Input
+              id="image-ref"
+              placeholder="ghcr.io/org/app:v1.2.3"
+              value={imageRefInput}
+              disabled={deployImageMut.isPending}
+              onChange={(e) => setImageRefInput(e.target.value)}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label>Environment</Label>
+            <Select value={imageEnv} onValueChange={setImageEnv}>
+              <SelectTrigger>
+                <SelectValue placeholder="Select environment..." />
+              </SelectTrigger>
+              <SelectContent>
+                {(
+                  environmentsQuery.data as EnvironmentResponse[] | undefined
+                )?.map((env) => (
+                  <SelectItem key={env.id} value={String(env.id)}>
+                    {env.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button
+            variant="outline"
+            disabled={deployImageMut.isPending}
+            onClick={() => {
+              setImageDialogOpen(false)
+              setImageEnv('')
+            }}
+          >
+            Cancel
+          </Button>
+          <Button
+            onClick={handleDeployImage}
+            disabled={
+              !imageRefInput.trim() || !imageEnv || deployImageMut.isPending
+            }
+          >
+            {deployImageMut.isPending && (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            )}
+            {deployImageMut.isPending ? 'Deploying...' : 'Deploy image'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+
+  // Shared static-deploy dialog — rendered from both the populated list and the
+  // empty state (a brand-new static project has no deployments yet).
+  const staticDeployDialog = (
+    <Dialog
+      open={staticDialogOpen}
+      onOpenChange={(open) => {
+        if (!open && !staticUploading) {
+          setStaticDialogOpen(false)
+          setStaticFile(null)
+          setStaticEnv('')
+        }
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <Upload className="h-5 w-5" />
+            Deploy static files
+          </DialogTitle>
+          <DialogDescription>
+            Upload a .zip or .tar.gz of your built static site and deploy it to an
+            environment.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4 py-4">
+          <div className="space-y-2">
+            <Label htmlFor="static-bundle">Bundle</Label>
+            <Input
+              id="static-bundle"
+              type="file"
+              accept=".zip,.tar.gz,.tgz"
+              disabled={staticUploading}
+              onChange={(e) => setStaticFile(e.target.files?.[0] ?? null)}
+            />
+            {staticFile && (
+              <p className="text-xs text-muted-foreground">
+                {staticFile.name} ({(staticFile.size / 1024 / 1024).toFixed(1)} MB)
+              </p>
+            )}
+          </div>
+          <div className="space-y-2">
+            <Label>Environment</Label>
+            <Select value={staticEnv} onValueChange={setStaticEnv}>
+              <SelectTrigger>
+                <SelectValue placeholder="Select environment..." />
+              </SelectTrigger>
+              <SelectContent>
+                {(
+                  environmentsQuery.data as EnvironmentResponse[] | undefined
+                )?.map((env) => (
+                  <SelectItem key={env.id} value={String(env.id)}>
+                    {env.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button
+            variant="outline"
+            disabled={staticUploading}
+            onClick={() => {
+              setStaticDialogOpen(false)
+              setStaticFile(null)
+              setStaticEnv('')
+            }}
+          >
+            Cancel
+          </Button>
+          <Button
+            onClick={handleDeployStatic}
+            disabled={!staticFile || !staticEnv || staticUploading}
+          >
+            {staticUploading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+            {staticUploading ? 'Deploying...' : 'Upload & deploy'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
 
   if (error) {
     return (
@@ -411,16 +653,35 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           title="No deployments"
           description="Get started by creating your first deployment"
           action={
-            <Button onClick={handleOpenNewDeployment}>
-              <PlusIcon className="h-4 w-4 mr-2" />
-              New Deployment
-              <KeyboardShortcut
-                shortcut="N"
-                onTrigger={handleOpenNewDeployment}
-              />
-            </Button>
+            project.source_type === 'static_files' ? (
+              <Button onClick={() => setStaticDialogOpen(true)}>
+                <Upload className="h-4 w-4 mr-2" />
+                Deploy static files
+              </Button>
+            ) : project.source_type === 'docker_image' ? (
+              <Button
+                onClick={() => {
+                  setImageRefInput(imageRef ?? '')
+                  setImageDialogOpen(true)
+                }}
+              >
+                <PlusIcon className="h-4 w-4 mr-2" />
+                New Deployment
+              </Button>
+            ) : (
+              <Button onClick={handleOpenNewDeployment}>
+                <PlusIcon className="h-4 w-4 mr-2" />
+                New Deployment
+                <KeyboardShortcut
+                  shortcut="N"
+                  onTrigger={handleOpenNewDeployment}
+                />
+              </Button>
+            )
           }
         />
+        {staticDeployDialog}
+        {imageDeployDialog}
         <RedeploymentModal
           project={project}
           isOpen={isRedeployModalOpen}
@@ -481,11 +742,32 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             {isFetching ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
           </Button>
         </div>
-        <Button onClick={handleOpenNewDeployment} className="w-full sm:w-auto">
-          <PlusIcon className="h-4 w-4 mr-2" />
-          New Deployment
-          <KeyboardShortcut shortcut="N" onTrigger={handleOpenNewDeployment} />
-        </Button>
+        {project.source_type === 'static_files' ? (
+          <Button
+            onClick={() => setStaticDialogOpen(true)}
+            className="w-full sm:w-auto"
+          >
+            <Upload className="h-4 w-4 mr-2" />
+            Deploy static files
+          </Button>
+        ) : project.source_type === 'docker_image' ? (
+          <Button
+            onClick={() => {
+              setImageRefInput(imageRef ?? '')
+              setImageDialogOpen(true)
+            }}
+            className="w-full sm:w-auto"
+          >
+            <PlusIcon className="h-4 w-4 mr-2" />
+            New Deployment
+          </Button>
+        ) : (
+          <Button onClick={handleOpenNewDeployment} className="w-full sm:w-auto">
+            <PlusIcon className="h-4 w-4 mr-2" />
+            New Deployment
+            <KeyboardShortcut shortcut="N" onTrigger={handleOpenNewDeployment} />
+          </Button>
+        )}
       </div>
 
       <Card>
@@ -647,6 +929,10 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Manual deploy dialogs */}
+      {staticDeployDialog}
+      {imageDeployDialog}
     </>
   )
 }

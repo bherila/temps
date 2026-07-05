@@ -45,6 +45,10 @@ commit_preprocessors = [
 ]
 # regex for parsing and grouping commits
 commit_parsers = [
+  # Drop all merge commits (e.g. "Merge pull request #N", "Merge origin/main into
+  # <branch>", or "chore: merge …") — pure noise. Match the merge_commit flag so
+  # casing and type-prefixes don't matter.
+  { field = "merge_commit", pattern = "true", skip = true },
   { message = "^feat", group = "Added" },
   { message = "^add", group = "Added" },
   { message = "^fix", group = "Fixed" },
@@ -55,6 +59,9 @@ commit_parsers = [
   { message = "^style", group = "Styling" },
   { message = "^test", group = "Testing" },
   { message = "^chore\\(release\\): prepare for", skip = true },
+  # Release version-bump commits ("chore: bump version to vX") — release mechanics, not changes.
+  # Parsers match the full commit message, so anchor on the whole "…bump version to v…" text.
+  { message = "(?i)bump version to v", skip = true },
   { message = "^chore\\(deps\\)", skip = true },
   { message = "^chore\\(pr\\)", skip = true },
   { message = "^chore\\(pull\\)", skip = true },
@@ -73,8 +80,8 @@ protect_breaking_commits = false
 filter_commits = false
 # regex for matching git tags
 tag_pattern = "v[0-9].*"
-# regex for skipping tags
-skip_tags = "v0.1.0-beta.1"
+# regex for skipping tags (bogus/test tags that should not appear as releases)
+skip_tags = "v0.1.0-beta.1|0.1.0-test"
 # regex for ignoring tags
 ignore_tags = ""
 # sort the tags topologically

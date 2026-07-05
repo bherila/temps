@@ -14,10 +14,13 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::anomaly::detector::{AnomalyDetector, AnomalyDetectorConfig};
 use crate::handlers;
+use crate::handlers::dashboard_handler;
 use crate::handlers::ingest_handler;
+use crate::handlers::metric_alert_handler;
 use crate::handlers::query_handler;
 use crate::ingest::auth::OtelAuthService;
 use crate::ingest::rate_limit::RateLimiter;
+use crate::services::cross_project::{prune_stale_hints, CrossProjectTraceService, TraceHintMsg};
 use crate::services::health_service::HealthComputeService;
 use crate::services::OtelService;
 use crate::storage::clickhouse::{ClickHouseOtelConfig, ClickHouseOtelStorage};
@@ -151,6 +154,8 @@ impl OtelConfig {
         ingest_handler::ingest_logs_by_path,
         query_handler::query_metrics,
         query_handler::list_metric_names,
+        query_handler::list_metric_label_keys,
+        query_handler::list_metric_label_values,
         query_handler::query_traces,
         query_handler::query_trace_summaries,
         query_handler::get_trace,
@@ -161,11 +166,26 @@ impl OtelConfig {
         query_handler::get_pipeline_stats,
         query_handler::query_genai_traces,
         query_handler::get_genai_trace,
+        query_handler::get_cross_project_trace_siblings,
+        query_handler::get_unified_trace,
+        dashboard_handler::list_dashboards,
+        dashboard_handler::create_dashboard,
+        dashboard_handler::get_dashboard,
+        dashboard_handler::update_dashboard,
+        dashboard_handler::delete_dashboard,
+        metric_alert_handler::list_alerts,
+        metric_alert_handler::create_alert,
+        metric_alert_handler::get_alert,
+        metric_alert_handler::update_alert,
+        metric_alert_handler::delete_alert,
+        metric_alert_handler::preview_alert,
     ),
     components(
         schemas(
-            query_handler::MetricsResponse,
-            query_handler::MetricNamesResponse,
+            query_handler::OtelMetricsResponse,
+            query_handler::OtelMetricNamesResponse,
+            query_handler::OtelMetricLabelKeysResponse,
+            query_handler::OtelMetricLabelValuesResponse,
             query_handler::TracesResponse,
             query_handler::TraceSummariesResponse,
             crate::types::TraceSummary,
@@ -175,6 +195,9 @@ impl OtelConfig {
             query_handler::QuotaResponse,
             query_handler::PipelineStatsResponse,
             crate::types::MetricBucket,
+            crate::types::HistogramSummary,
+            crate::types::MetricAggregation,
+            crate::types::AggregationTemporality,
             crate::types::SpanRecord,
             crate::types::SpanEvent,
             crate::types::SpanKind,
@@ -195,6 +218,40 @@ impl OtelConfig {
             crate::types::GenAiTraceSummary,
             crate::types::GenAiSpanDetail,
             crate::types::GenAiEvent,
+            query_handler::CrossProjectSiblingRef,
+            query_handler::CrossProjectTraceResponse,
+            crate::services::cross_project::UnifiedTrace,
+            crate::services::cross_project::AnnotatedSpan,
+            crate::services::cross_project::ProjectRef,
+            crate::services::cross_project::SiblingRef,
+            crate::services::cross_project::TraceProjectRef,
+            dashboard_handler::CreateDashboardRequest,
+            dashboard_handler::UpdateDashboardRequest,
+            dashboard_handler::OtelDashboardResponse,
+            dashboard_handler::OtelDashboardsResponse,
+            crate::services::dashboard_service::DashboardLayout,
+            crate::services::dashboard_service::DashboardSection,
+            crate::services::dashboard_service::DashboardTile,
+            metric_alert_handler::CreateMetricAlertRequest,
+            metric_alert_handler::UpdateMetricAlertRequest,
+            metric_alert_handler::OtelMetricAlertRuleResponse,
+            metric_alert_handler::OtelMetricAlertsResponse,
+            crate::services::metric_alert_evaluator::SeriesStateEntry,
+            metric_alert_handler::AnomalyPreviewRequest,
+            metric_alert_handler::AnomalyPreviewResponse,
+            metric_alert_handler::AnomalyPreviewPointResponse,
+            crate::detectors::DetectionConfig,
+            crate::detectors::StaticParams,
+            crate::detectors::AnomalyParams,
+            crate::detectors::ForecastParams,
+            crate::detectors::OutlierParams,
+            crate::detectors::AutoWatchParams,
+            crate::detectors::Comparator,
+            crate::detectors::Direction,
+            crate::detectors::Seasonality,
+            crate::detectors::AnomalyAlgorithm,
+            crate::detectors::ForecastAlgorithm,
+            crate::detectors::OutlierAlgorithm,
         )
     ),
     info(
@@ -362,6 +419,12 @@ impl TempsPlugin for OtelPlugin {
                 rate_limiter,
             ));
             context.register_service(otel_service.clone());
+            // Also expose the same service behind the storage-agnostic read
+            // contract so read-only consumers (e.g. the AI debugging chat in
+            // `temps-ai-chat`) can query traces via `temps_core::TraceReader`
+            // WITHOUT depending on this heavy crate. Absent → those consumers
+            // simply offer no trace tools.
+            context.register_service(otel_service.clone() as Arc<dyn temps_core::TraceReader>);
 
             // Build a MetricsStore pointing at the same TimescaleDB connection.
             // This forwards OTLP-pushed metrics into `service_metrics` alongside
@@ -378,11 +441,83 @@ impl TempsPlugin for OtelPlugin {
             let (metrics_write_tx, mut metrics_write_rx) =
                 tokio::sync::mpsc::channel::<Vec<temps_metrics::MetricPoint>>(512);
 
+            // ── ADR-027 Phase 0: Cross-project trace hint pipeline ───────────
+            //
+            // A bounded mpsc channel (capacity 1,000) decouples span ingest
+            // latency from the Postgres hint write.  When the channel is full,
+            // `do_ingest_traces` drops the hint (non-blocking try_send) and
+            // warns.  The background consumer below drains the channel and
+            // calls `record_hint`, which issues a single multi-row
+            // `INSERT … ON CONFLICT DO NOTHING`.
+            let (trace_hint_tx, mut trace_hint_rx) =
+                tokio::sync::mpsc::channel::<TraceHintMsg>(1000);
+
+            let cross_project_service =
+                Arc::new(CrossProjectTraceService::new(db.clone(), storage.clone()));
+            context.register_service(cross_project_service.clone());
+
+            // Metric dashboards + alert rules: Postgres-backed config/metadata
+            // services plus the global audit logger for write operations.
+            let dashboard_service =
+                Arc::new(crate::services::MetricDashboardService::new(db.clone()));
+            let metric_alert_service =
+                Arc::new(crate::services::MetricAlertService::new(db.clone()));
+            let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+
+            // 5. Metric alert evaluator
+            //
+            // Builds its own AlarmService instance (separate from console.rs's)
+            // wired to the same NotificationService + JobQueue, then spawns the
+            // background evaluator. The two AlarmService instances keep
+            // independent in-memory cooldown maps, but fire_alarm's actual
+            // cooldown check queries the DB `alarms` table by type+deployment+
+            // container, so duplicate suppression is still correct. OTEL rules
+            // always set deployment_id=None, so collisions with the monitoring
+            // evaluator are unlikely.
+            let metric_alert_evaluator = {
+                let notification_service =
+                    context.require_service::<dyn temps_core::notifications::NotificationService>();
+                let job_queue = context.require_service::<dyn temps_core::JobQueue>();
+                let alarm_service = Arc::new(temps_monitoring::AlarmService::new(
+                    db.clone(),
+                    notification_service.clone(),
+                    job_queue.clone(),
+                ));
+                // Dynamic per-series alarms bypass the per-rule cooldown: the
+                // evaluator's per-series state machine already guarantees
+                // exactly-once firing per series until it resolves (ADR-026).
+                let alarm_service_dynamic = Arc::new(
+                    temps_monitoring::AlarmService::new(
+                        db.clone(),
+                        notification_service,
+                        job_queue,
+                    )
+                    .with_cooldown(chrono::Duration::zero()),
+                );
+                // ADR-022: optional general AI foundation, registered by the AI
+                // gateway plugin when present. Absent -> deterministic Tier-1 text.
+                let ai = context.get_service::<dyn temps_ai::AiService>();
+                Arc::new(crate::services::MetricAlertEvaluator::new(
+                    metric_alert_service.clone(),
+                    otel_service.clone(),
+                    alarm_service,
+                    alarm_service_dynamic,
+                    db.clone(),
+                    ai,
+                ))
+            };
+
             // Create app state for handlers
             let app_state = OtelAppState {
                 otel_service: otel_service.clone(),
                 metrics_store: Some(metrics_store.clone()),
                 metrics_write_tx: Some(metrics_write_tx),
+                dashboard_service: dashboard_service.clone(),
+                metric_alert_service: metric_alert_service.clone(),
+                metric_alert_evaluator: metric_alert_evaluator.clone(),
+                audit_service: audit_service.clone(),
+                trace_hint_tx: Some(trace_hint_tx),
+                cross_project_service: cross_project_service.clone(),
             };
             context.register_service(Arc::new(app_state.clone()));
 
@@ -434,6 +569,58 @@ impl TempsPlugin for OtelPlugin {
                 });
             }
 
+            // 1c. ADR-027 Phase 0: cross-project trace hint writer consumer.
+            //
+            // Drains `trace_hint_rx` and calls `CrossProjectTraceService::record_hint`
+            // for each message, issuing a single multi-row INSERT ON CONFLICT DO NOTHING.
+            // Errors are warned and the loop continues — hint loss is tolerable.
+            {
+                let hint_svc = cross_project_service.clone();
+                tokio::spawn(async move {
+                    info!("Cross-project trace hint writer consumer started");
+                    while let Some(msg) = trace_hint_rx.recv().await {
+                        if let Err(e) = hint_svc.record_hint(msg.trace_ids, msg.project_id).await {
+                            tracing::warn!(
+                                project_id = msg.project_id,
+                                error = %e,
+                                "Cross-project trace hint write failed (non-fatal); \
+                                 subsequent ingests will re-populate via ON CONFLICT DO NOTHING"
+                            );
+                        }
+                    }
+                    info!("Cross-project trace hint writer consumer stopped (channel closed)");
+                });
+            }
+
+            // 1d. ADR-027 Phase 0: daily prune of cross_project_trace_refs rows
+            //     older than 90 days (matching the OTel span TTL on both backends).
+            //
+            // Deliberately uses a periodic tokio::spawn loop rather than a
+            // Job enum variant to keep the scheduler dependency minimal.
+            // First run is after a 24-hour delay so it doesn't compete with
+            // startup DB activity.
+            {
+                let prune_db = db.clone();
+                tokio::spawn(async move {
+                    let interval = Duration::from_secs(24 * 60 * 60); // 24 hours
+                    loop {
+                        tokio::time::sleep(interval).await;
+                        match prune_stale_hints(&prune_db).await {
+                            Ok(deleted) => info!(
+                                deleted,
+                                "Cross-project trace hint prune completed \
+                                 (rows older than 90 days removed)"
+                            ),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "Cross-project trace hint prune failed (non-fatal); \
+                                 will retry in 24 hours"
+                            ),
+                        }
+                    }
+                });
+            }
+
             // 2. Health compute service
             if config.enable_health_compute {
                 let health_service = Arc::new(HealthComputeService::new(storage.clone()));
@@ -454,6 +641,14 @@ impl TempsPlugin for OtelPlugin {
                 tokio::spawn(async move {
                     info!("Starting OTel anomaly detector");
                     detector.start(vec![]).await;
+                });
+            }
+
+            // Spawn the metric alert evaluator run loop (evaluator already created above).
+            {
+                let evaluator = metric_alert_evaluator;
+                tokio::spawn(async move {
+                    evaluator.run().await;
                 });
             }
 

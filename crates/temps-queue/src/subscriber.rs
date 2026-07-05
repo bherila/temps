@@ -26,6 +26,7 @@ mod tests {
             project_id: 123,
             manual_trigger: false,
             rollback_from_deployment_id: None,
+            target_environment_id: None,
         };
         queue.send(Job::GitPushEvent(git_push_job)).await.unwrap();
 
@@ -81,6 +82,7 @@ mod tests {
             project_id: 999,
             manual_trigger: false,
             rollback_from_deployment_id: None,
+            target_environment_id: None,
         };
         queue.send(Job::GitPushEvent(git_push_job)).await.unwrap();
 
@@ -122,6 +124,7 @@ mod tests {
             project_id: 42,
             manual_trigger: false,
             rollback_from_deployment_id: None,
+            target_environment_id: None,
         };
         queue.send(Job::GitPushEvent(git_push_job)).await.unwrap();
 

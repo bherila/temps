@@ -1,6 +1,7 @@
 import { ContainerDetailResponse } from '@/api/client'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Button } from '@/components/ui/button'
+import { formatMicrocores } from '@/lib/cpu-format'
 import {
   maskCredentialsInValue,
   shouldMaskValue,
@@ -19,10 +20,9 @@ export function ContainerConfiguration({
   const envVars = normalizeEnvVars(container.environment_variables)
   const hasPorts = !!(container.container_port || container.host_port)
   // Configured limits (from project/env deployment_config). cpu_limit and
-  // cpu_request are in millicores, memory in MB — matches the form values
-  // used in project settings.
-  const cpuLimitMilli = container.resource_limits?.cpu_limit
-  const cpuRequestMilli = container.resource_limits?.cpu_request
+  // cpu_request are in MICROcores (1_000_000 = 1 core); memory in MB.
+  const cpuLimitMicro = container.resource_limits?.cpu_limit
+  const cpuRequestMicro = container.resource_limits?.cpu_request
   const memoryLimitMb = container.resource_limits?.memory_limit
   const memoryRequestMb = container.resource_limits?.memory_request
   // Actual CPU limit observed from Docker — useful for spotting drift between
@@ -31,9 +31,9 @@ export function ContainerConfiguration({
     container as { cpu_limit_cores?: number | null }
   ).cpu_limit_cores
   const hasResourceLimits =
-    cpuLimitMilli != null ||
+    cpuLimitMicro != null ||
     memoryLimitMb != null ||
-    cpuRequestMilli != null ||
+    cpuRequestMicro != null ||
     memoryRequestMb != null ||
     cpuLimitObservedCores != null
   const startedAt = (container as { started_at?: string | null }).started_at
@@ -83,18 +83,18 @@ export function ContainerConfiguration({
           description="CPU and memory caps applied to this container at deploy time."
         >
           <FieldGrid>
-            {cpuRequestMilli != null && (
+            {cpuRequestMicro != null && (
               <Field
                 label="CPU request"
                 mono
-                value={formatCoresFromMilli(cpuRequestMilli)}
+                value={formatMicrocores(cpuRequestMicro)}
               />
             )}
-            {cpuLimitMilli != null && (
+            {cpuLimitMicro != null && (
               <Field
                 label="CPU limit"
                 mono
-                value={formatCoresFromMilli(cpuLimitMilli)}
+                value={formatMicrocores(cpuLimitMicro)}
               />
             )}
             {memoryRequestMb != null && (
@@ -396,10 +396,6 @@ function formatCores(cores: number): string {
     return `${rounded} ${rounded === 1 ? 'core' : 'cores'}`
   }
   return `${Math.round(cores * 1000)}m`
-}
-
-function formatCoresFromMilli(milli: number): string {
-  return formatCores(milli / 1000)
 }
 
 function formatMemoryMb(mb: number): string {

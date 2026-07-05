@@ -1967,7 +1967,9 @@ impl WorkflowPlanner {
 ///
 /// Each entry follows the bundler's own public-prefix rule — that's the only
 /// prefix the bundler will inline into the browser bundle.
-fn public_sentry_dsn_var(preset: temps_entities::preset::Preset) -> Option<&'static str> {
+pub(crate) fn public_sentry_dsn_var(
+    preset: temps_entities::preset::Preset,
+) -> Option<&'static str> {
     use temps_entities::preset::Preset;
     match preset {
         // Next.js: `NEXT_PUBLIC_*` is inlined into the client bundle.

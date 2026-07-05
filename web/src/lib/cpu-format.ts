@@ -51,6 +51,21 @@ export function formatCpuUsage(
   return `${value} cores`
 }
 
+// Render a stored CPU *config* value (microcores, where 1_000_000 = 1 core)
+// as human-decimal cores. The DB stores 500000 for half a core; showing the
+// raw number (or worse, "500000m") reads as 500 cores. Examples:
+//   formatMicrocores(500000)   -> "0.5 cores"
+//   formatMicrocores(1000000)  -> "1 core"
+//   formatMicrocores(2000000)  -> "2 cores"
+//   formatMicrocores(250000)   -> "0.25 cores"
+export function formatMicrocores(micro: number | null | undefined): string {
+  if (micro == null || !Number.isFinite(micro)) return '—'
+  const cores = micro / 1_000_000
+  // Up to 3 decimals, trailing zeros stripped ("0.500" -> "0.5", "1.000" -> "1").
+  const value = parseFloat(cores.toFixed(3)).toString()
+  return `${value} ${cores === 1 ? 'core' : 'cores'}`
+}
+
 // Percent of the configured CPU cap (or null if no cap). Used to drive
 // progress bars that should fill at the cap, not at 100% of all host cores.
 export function cpuPercentOfLimit(

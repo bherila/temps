@@ -23,6 +23,7 @@ import {
 } from '@/components/ui/select'
 import { useCallback, useMemo, useState } from 'react'
 import { EmptyState } from '@/components/ui/empty-state'
+import { CodeBlock } from '@/components/ui/code-block'
 import { useNavigate } from 'react-router-dom'
 import {
   Dialog,
@@ -48,8 +49,10 @@ function InstructionsContent() {
           </code>{' '}
           file in your repository root with your cron jobs configuration:
         </p>
-        <pre className="text-xs bg-muted p-4 rounded-md overflow-x-auto">
-          {`cron:
+        <CodeBlock
+          language="yaml"
+          disableWrapToggle
+          code={`cron:
   - path: "/api/ping"
     schedule: "*/5 * * * *"    # Every 5 minutes
 
@@ -58,7 +61,7 @@ function InstructionsContent() {
 
   - path: "/api/weekly-report"
     schedule: "0 0 * * 0"      # Weekly on Sunday`}
-        </pre>
+        />
       </div>
 
       <div className="space-y-2">
@@ -223,21 +226,28 @@ export function CronJobsSettings({ project }: CronJobsSettingsProps) {
           ))}
         </div>
       ) : !crons?.length ? (
-        <EmptyState
-          icon={Clock}
-          title="No Cron Jobs"
-          description={
-            <div className="space-y-2">
-              <p>Get started by adding your first cron job</p>
-              <Button
-                variant="default"
-                onClick={() => setShowInstructions(true)}
-              >
-                View setup instructions
-              </Button>
+        <Card>
+          <CardHeader>
+            <div className="flex items-start gap-3">
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted">
+                <Clock className="h-5 w-5 text-muted-foreground" />
+              </div>
+              <div>
+                <CardTitle className="text-base">No cron jobs yet</CardTitle>
+                <CardDescription className="mt-1">
+                  Get started by committing a{' '}
+                  <code className="text-xs bg-muted px-1 py-0.5 rounded">
+                    .temps.yaml
+                  </code>{' '}
+                  file to your repository. Here&apos;s how:
+                </CardDescription>
+              </div>
             </div>
-          }
-        />
+          </CardHeader>
+          <CardContent>
+            <InstructionsContent />
+          </CardContent>
+        </Card>
       ) : (
         <div className="space-y-4">
           {crons.map((cron) => (

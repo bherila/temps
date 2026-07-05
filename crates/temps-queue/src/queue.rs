@@ -586,6 +586,7 @@ mod tests {
             project_id: 123,
             manual_trigger: false,
             rollback_from_deployment_id: None,
+            target_environment_id: None,
         };
 
         // Publish job
@@ -742,6 +743,7 @@ mod tests {
             project_id: 123,
             manual_trigger: false,
             rollback_from_deployment_id: None,
+            target_environment_id: None,
         });
 
         let cert_job = Job::ProvisionCertificate(ProvisionCertificateJob {

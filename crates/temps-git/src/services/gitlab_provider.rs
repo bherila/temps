@@ -1,6 +1,6 @@
 use super::git_provider::{
     AuthMethod, Branch, Commit, FileContent, GitProviderError, GitProviderService, GitProviderTag,
-    GitProviderType, PullRequest, Repository, RepositoryPage, User, WebhookConfig,
+    GitProviderType, PullRequest, RepoDirEntry, Repository, RepositoryPage, User, WebhookConfig,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -910,6 +910,106 @@ impl GitProviderService for GitLabProvider {
             content: file.content,
             encoding: file.encoding,
         })
+    }
+
+    async fn list_directory(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        reference: Option<&str>,
+    ) -> Result<Vec<RepoDirEntry>, GitProviderError> {
+        let client = self.get_client();
+        let headers = self.get_headers(access_token);
+
+        // GitLab project identifier is the URL-encoded `owner/repo` path.
+        let project_path = format!("{}/{}", owner, repo);
+        let encoded_project = urlencoding::encode(&project_path);
+
+        // Collect up to 300 entries across at most three pages of 100 each.
+        // The GitLab repository tree API is non-recursive by default; each
+        // response page covers one level of the tree.
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: u32 = 3;
+
+        let mut all_entries: Vec<RepoDirEntry> = Vec::new();
+        let mut page: u32 = 1;
+
+        loop {
+            // Build the query string manually so we only add params that are
+            // meaningful. `path` is omitted (empty string maps to root) and
+            // `ref` is omitted when the caller didn't specify one.
+            let mut query_parts: Vec<String> = vec![format!("per_page={}", PER_PAGE)];
+            query_parts.push(format!("page={}", page));
+
+            // GitLab treats an empty path as "root" — only add the param when
+            // there's an actual path to request.
+            if !path.is_empty() {
+                query_parts.push(format!("path={}", urlencoding::encode(path)));
+            }
+
+            if let Some(ref_name) = reference {
+                if !ref_name.is_empty() {
+                    query_parts.push(format!("ref={}", urlencoding::encode(ref_name)));
+                }
+            }
+
+            let url = format!(
+                "{}/api/v4/projects/{}/repository/tree?{}",
+                self.base_url,
+                encoded_project,
+                query_parts.join("&")
+            );
+
+            let response = self
+                .send_with_retry(|| client.get(&url).headers(headers.clone()))
+                .await?;
+
+            if !response.status().is_success() {
+                return Err(GitProviderError::ApiError(format!(
+                    "Failed to list directory '{path}' in {owner}/{repo} (page {page}): {}",
+                    response.status()
+                )));
+            }
+
+            #[derive(Deserialize)]
+            struct GitLabTreeItem {
+                name: String,
+                path: String,
+                #[serde(rename = "type")]
+                item_type: String,
+            }
+
+            let items: Vec<GitLabTreeItem> = response.json().await.map_err(|e| {
+                GitProviderError::ApiError(format!(
+                    "Failed to parse directory listing for '{path}' in {owner}/{repo}: {e}"
+                ))
+            })?;
+
+            let count = items.len();
+            all_entries.extend(items.into_iter().map(|item| {
+                let is_dir = item.item_type == "tree";
+                RepoDirEntry {
+                    name: item.name,
+                    path: item.path,
+                    is_dir,
+                    // GitLab repository tree API does not return file sizes.
+                    size: None,
+                }
+            }));
+
+            // Stop if the page was short (last page) or we've hit the cap.
+            if count < PER_PAGE || page >= MAX_PAGES {
+                break;
+            }
+            page += 1;
+        }
+
+        // Sort: directories first, then alphabetically by name within each group.
+        all_entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+
+        Ok(all_entries)
     }
 
     async fn create_webhook(
@@ -1930,5 +2030,86 @@ mod archive_redirect_tests {
     fn rejects_trailing_dot_fqdn() {
         // `gitlab.com.` ends with `com.`, not `.gitlab.com` → rejected.
         assert!(check(None, "https://gitlab.com./foo").is_err());
+    }
+}
+
+#[cfg(test)]
+mod list_directory_tests {
+    use super::*;
+
+    /// Simulate the mapping + sort logic applied in `list_directory` without
+    /// making any HTTP calls.
+    fn map_and_sort(items: Vec<(&str, &str, &str)>) -> Vec<RepoDirEntry> {
+        // (name, path, type)
+        let mut entries: Vec<RepoDirEntry> = items
+            .into_iter()
+            .map(|(name, path, item_type)| {
+                let is_dir = item_type == "tree";
+                RepoDirEntry {
+                    name: name.to_string(),
+                    path: path.to_string(),
+                    is_dir,
+                    // GitLab tree API does not return size.
+                    size: None,
+                }
+            })
+            .collect();
+
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+        entries
+    }
+
+    #[test]
+    fn dirs_sorted_before_files() {
+        let entries = map_and_sort(vec![
+            ("main.rs", "src/main.rs", "blob"),
+            ("lib", "lib", "tree"),
+            ("README.md", "README.md", "blob"),
+            ("src", "src", "tree"),
+        ]);
+
+        assert!(entries[0].is_dir);
+        assert!(entries[1].is_dir);
+        assert_eq!(entries[0].name, "lib");
+        assert_eq!(entries[1].name, "src");
+        assert!(!entries[2].is_dir);
+        assert!(!entries[3].is_dir);
+        assert_eq!(entries[2].name, "README.md");
+        assert_eq!(entries[3].name, "main.rs");
+    }
+
+    #[test]
+    fn size_is_always_none_for_gitlab() {
+        let entries = map_and_sort(vec![
+            ("Cargo.toml", "Cargo.toml", "blob"),
+            ("src", "src", "tree"),
+        ]);
+
+        for entry in &entries {
+            assert_eq!(
+                entry.size, None,
+                "GitLab tree API does not surface file sizes"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_directory_returns_empty_vec() {
+        let entries = map_and_sort(vec![]);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn blob_entry_is_not_a_dir() {
+        let entries = map_and_sort(vec![("Makefile", "Makefile", "blob")]);
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].is_dir);
+    }
+
+    #[test]
+    fn tree_entry_is_a_dir() {
+        let entries = map_and_sort(vec![("tests", "tests", "tree")]);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].is_dir);
     }
 }

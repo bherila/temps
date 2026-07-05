@@ -166,27 +166,34 @@ impl AuthContext {
     }
 
     pub fn has_permission(&self, permission: &Permission) -> bool {
-        // For deployment tokens, check if the deployment token permission matches
+        // Deployment tokens are project-scoped machine credentials, not
+        // control-plane principals. They may satisfy only the small set of
+        // standard permissions that are explicitly mapped to deployment-token
+        // permissions below; even deployment-token FullAccess must not become
+        // blanket access to unrelated admin APIs such as UsersWrite or
+        // SettingsWrite. Endpoints intended specifically for deployment tokens
+        // should use has_deployment_permission instead.
         if self.is_deployment_token() {
-            if let Some(ref dt_permissions) = self.deployment_token_permissions {
-                // FullAccess grants all permissions
-                if dt_permissions.contains(&DeploymentTokenPermission::FullAccess) {
-                    return true;
-                }
+            let Some(ref dt_permissions) = self.deployment_token_permissions else {
+                return false;
+            };
 
-                // Map standard Permission to DeploymentTokenPermission
-                let dt_permission = match permission {
-                    Permission::AnalyticsRead => Some(DeploymentTokenPermission::AnalyticsRead),
-                    Permission::AnalyticsWrite => Some(DeploymentTokenPermission::VisitorsEnrich),
-                    // Add other mappings as needed
-                    _ => None,
-                };
+            let required_dt_perm = match permission {
+                Permission::AnalyticsRead => DeploymentTokenPermission::AnalyticsRead,
+                Permission::AnalyticsWrite => DeploymentTokenPermission::VisitorsEnrich,
+                // Deployed apps inject their deployment token as TEMPS_API_TOKEN
+                // and use it to call POST /emails (guarded by EmailsSend). This
+                // is documented, project-scoped machine access, so map it to the
+                // matching deployment-token permission.
+                Permission::EmailsSend => DeploymentTokenPermission::EmailsSend,
+                // No implicit bridge from deployment-token permissions to
+                // general control-plane permissions.
+                _ => return false,
+            };
 
-                if let Some(required_dt_perm) = dt_permission {
-                    return dt_permissions.contains(&required_dt_perm);
-                }
-            }
-            return false;
+            return dt_permissions
+                .iter()
+                .any(|dt_permission| dt_permission.grants(&required_dt_perm));
         }
 
         // Check custom permissions first
@@ -302,10 +309,9 @@ impl AuthContext {
     /// Whether this auth context is permitted to act on `project_id`.
     ///
     /// A deployment token is bound to exactly one project at issuance. It must
-    /// only ever touch that project — even when it carries `FullAccess` (which
-    /// makes `has_permission` return `true` for everything). This is the tenant
-    /// boundary that `permission_guard!` alone does NOT enforce: the guard
-    /// proves the caller holds a permission, not that the resource is theirs.
+    /// only ever touch that project. This is the tenant boundary that
+    /// `permission_guard!` alone does NOT enforce: the guard proves the caller
+    /// holds an explicitly mapped permission, not that the resource is theirs.
     ///
     /// For user/API-key/CLI auth this returns `true` (project-level ACLs for
     /// human principals are an Enterprise/RBAC concern handled elsewhere); the
@@ -351,16 +357,51 @@ mod tests {
 
     #[test]
     fn deployment_token_rejected_for_other_project_even_with_full_access() {
-        // FullAccess makes has_permission() return true for everything, so the
-        // ONLY thing stopping cross-tenant access is this scope check.
         let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::FullAccess]);
         assert!(
             !ctx.is_scoped_to_project(8),
             "a project-7 token must not be scoped to project 8"
         );
-        // Sanity: FullAccess really does grant the permission, proving the
-        // scope check is the load-bearing boundary.
-        assert!(ctx.has_permission(&Permission::EnvironmentsRead));
+    }
+
+    #[test]
+    fn deployment_token_full_access_does_not_grant_control_plane_permissions() {
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::FullAccess]);
+
+        assert!(!ctx.has_permission(&Permission::UsersWrite));
+        assert!(!ctx.has_permission(&Permission::SettingsWrite));
+        assert!(!ctx.has_permission(&Permission::DeploymentTokensCreate));
+    }
+
+    #[test]
+    fn deployment_token_full_access_only_grants_explicitly_mapped_standard_permissions() {
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::FullAccess]);
+
+        assert!(ctx.has_permission(&Permission::AnalyticsRead));
+        assert!(ctx.has_permission(&Permission::AnalyticsWrite));
+    }
+
+    #[test]
+    fn deployment_token_full_access_grants_emails_send() {
+        // Deployed apps use their injected deployment token to call POST /emails;
+        // FullAccess must keep satisfying EmailsSend.
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::FullAccess]);
+        assert!(ctx.has_permission(&Permission::EmailsSend));
+    }
+
+    #[test]
+    fn deployment_token_emails_send_permission_grants_emails_send() {
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::EmailsSend]);
+        assert!(ctx.has_permission(&Permission::EmailsSend));
+        // ...but a narrow emails:send token must not gain analytics access.
+        assert!(!ctx.has_permission(&Permission::AnalyticsRead));
+        assert!(!ctx.has_permission(&Permission::AnalyticsWrite));
+    }
+
+    #[test]
+    fn deployment_token_without_emails_send_is_denied_emails_send() {
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::AnalyticsRead]);
+        assert!(!ctx.has_permission(&Permission::EmailsSend));
     }
 
     #[test]

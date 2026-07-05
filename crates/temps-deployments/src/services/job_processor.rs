@@ -503,6 +503,47 @@ impl JobProcessorService {
     }
 }
 
+/// Resolve which environment(s) a `GitPushEvent` should deploy to.
+///
+/// When the job carries an explicit `target_environment_id` (a manual trigger
+/// that named a specific environment — e.g. the AI's `trigger_project_pipeline`
+/// with `environment_id`, or the "Deploy to this environment" action), deploy to
+/// exactly that environment and SKIP branch → environment matching. This is what
+/// makes "redeploy to production" actually target production instead of falling
+/// through to whichever environment happens to track (or not track) the branch.
+///
+/// Otherwise fall back to [`find_environments_for_branch`] — the webhook-push
+/// path that infers the target(s) from the branch.
+async fn resolve_target_environments(
+    db: Arc<DbConnection>,
+    project: &temps_entities::projects::Model,
+    job: &temps_core::GitPushEventJob,
+) -> Result<Vec<temps_entities::environments::Model>, String> {
+    use temps_entities::environments;
+
+    if let Some(target_id) = job.target_environment_id {
+        let env = environments::Entity::find_by_id(target_id)
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .filter(environments::Column::DeletedAt.is_null())
+            .one(db.as_ref())
+            .await
+            .map_err(|e| format!("Database error finding target environment {target_id}: {e}"))?
+            .ok_or_else(|| {
+                format!(
+                    "Target environment {} not found or does not belong to project {}",
+                    target_id, project.id
+                )
+            })?;
+        info!(
+            "Manual trigger targets environment {} ({}) directly — bypassing branch matching",
+            env.id, env.name
+        );
+        return Ok(vec![env]);
+    }
+
+    find_environments_for_branch(db, project, job.branch.as_deref()).await
+}
+
 /// Find all environments to deploy to for a given branch push.
 /// Returns every non-preview, non-protected environment tracking this branch
 /// so each can independently apply its own `automatic_deploy` policy.
@@ -889,20 +930,22 @@ async fn process_git_push_event(
         }
     };
 
-    // Find all environments matching this branch. Multiple environments can
-    // track the same branch; each is deployed independently according to its
-    // own automatic_deploy policy (env-wins semantics).
-    let environments =
-        match find_environments_for_branch(db.clone(), &project, job.branch.as_deref()).await {
-            Ok(envs) => envs,
-            Err(e) => {
-                error!(
-                    "Failed to find environments for project {}: {}",
-                    project.id, e
-                );
-                return;
-            }
-        };
+    // Resolve the deploy target(s). A manual trigger that names an explicit
+    // environment (`target_environment_id`) deploys to exactly that environment,
+    // bypassing branch → environment matching. Otherwise (webhook push, or a
+    // manual trigger with no explicit target) find every environment tracking
+    // this branch; each is deployed independently per its own automatic_deploy
+    // policy (env-wins semantics).
+    let environments = match resolve_target_environments(db.clone(), &project, &job).await {
+        Ok(envs) => envs,
+        Err(e) => {
+            error!(
+                "Failed to resolve target environments for project {}: {}",
+                project.id, e
+            );
+            return;
+        }
+    };
 
     if environments.is_empty() {
         info!(
@@ -1472,6 +1515,7 @@ mod tests {
             project_id: 0,
             manual_trigger: false,
             rollback_from_deployment_id: None,
+            target_environment_id: None,
         };
 
         // Try to find the project (should return None)
@@ -1846,6 +1890,98 @@ mod tests {
         assert_eq!(found_env.id, production_env.id);
         assert_eq!(found_env.name, "Production");
         assert_eq!(found_env.branch, Some("main".to_string()));
+
+        Ok(())
+    }
+
+    /// A manual trigger that names an explicit `target_environment_id` deploys to
+    /// exactly that environment, bypassing branch matching. This reproduces the
+    /// temps-sre-demo bug: neither environment had a branch configured, so a
+    /// branch-based resolve would miss "production" entirely and fall through to
+    /// the env named "preview" — but an explicit target must still hit production.
+    #[tokio::test]
+    async fn test_resolve_target_environments_honors_explicit_target(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Target Test".to_string()),
+            slug: Set("target-test".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            is_public_repo: Set(false),
+            main_branch: Set("main".to_string()),
+            // Preview envs disabled — the legacy "named preview" fallback path.
+            enable_preview_environments: Set(false),
+            ..Default::default()
+        };
+        let project = project.insert(db.as_ref()).await?;
+
+        // Production: NO branch configured (like the real temps-sre-demo).
+        let production = temps_entities::environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            host: Set("prod.example.com".to_string()),
+            branch: Set(None),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("prod.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let production = production.insert(db.as_ref()).await?;
+
+        // An env literally named "preview" — what the branch fallback would pick.
+        let preview = temps_entities::environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("preview".to_string()),
+            slug: Set("preview".to_string()),
+            host: Set("preview.example.com".to_string()),
+            branch: Set(None),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("preview.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let preview = preview.insert(db.as_ref()).await?;
+
+        let base_job = |target: Option<i32>| temps_core::GitPushEventJob {
+            owner: "test-owner".to_string(),
+            repo: "test-repo".to_string(),
+            branch: Some("main".to_string()),
+            tag: None,
+            commit: "abc123".to_string(),
+            project_id: project.id,
+            manual_trigger: true,
+            rollback_from_deployment_id: None,
+            target_environment_id: target,
+        };
+
+        // Explicit target → exactly production, despite no branch match.
+        let job = base_job(Some(production.id));
+        let envs = resolve_target_environments(db.clone(), &project, &job).await?;
+        assert_eq!(envs.len(), 1, "explicit target yields exactly one env");
+        assert_eq!(
+            envs[0].id, production.id,
+            "explicit target_environment_id must win over branch matching"
+        );
+
+        // No explicit target → branch fallback picks the env named "preview"
+        // (the pre-fix behaviour), proving the target is what redirects it.
+        let job = base_job(None);
+        let envs = resolve_target_environments(db.clone(), &project, &job).await?;
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].id, preview.id,
+            "without a target, the branch fallback lands on the named-preview env"
+        );
 
         Ok(())
     }

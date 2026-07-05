@@ -59,7 +59,7 @@ pub struct EnvVarEnvironment {
     pub name: String,
 }
 
-// Constants for CPU allocation (in millicores, where 1000 = 1 CPU core).
+// Constants for CPU allocation (in microcores, where 1_000_000 = 1 CPU core).
 // Only *requests* (scheduling minimums) are defaulted; CPU/memory *limits* are
 // intentionally left unset so new projects/environments run uncapped by default.
 pub const DEFAULT_CPU_REQUEST: i32 = 500_000; // 0.5 cores
@@ -365,6 +365,142 @@ impl ProjectService {
             project_found_db
         };
 
+        // Auto-install Bitbucket Cloud webhook if applicable (best-effort, non-fatal).
+        let project_found_db = if let Some(conn_id) = project_found_db.git_provider_connection_id {
+            let repo_owner = project_found_db.repo_owner.clone();
+            let repo_name = project_found_db.repo_name.clone();
+            if !repo_owner.is_empty() && !repo_name.is_empty() {
+                match self
+                    .install_bitbucket_webhook_for_connection(
+                        project_found_db.id,
+                        conn_id,
+                        &repo_owner,
+                        &repo_name,
+                    )
+                    .await
+                {
+                    Ok((hook_uuid, encrypted_token)) => {
+                        let mut active = projects::ActiveModel::from(project_found_db.clone());
+                        active.bitbucket_webhook_hook_id = Set(Some(hook_uuid));
+                        active.bitbucket_webhook_token = Set(Some(encrypted_token));
+                        active.updated_at = Set(chrono::Utc::now());
+                        match active.update(self.db.as_ref()).await {
+                            Ok(updated) => updated,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to persist Bitbucket webhook fields on new project {}: {}",
+                                    project_found_db.id,
+                                    e
+                                );
+                                project_found_db
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to install Bitbucket webhook for new project {}: {}",
+                            project_found_db.id,
+                            e
+                        );
+                        project_found_db
+                    }
+                }
+            } else {
+                project_found_db
+            }
+        } else {
+            project_found_db
+        };
+
+        // Auto-install Gitea webhook if applicable (best-effort, non-fatal).
+        // BLOCKER 1 fix: gitea_webhook_signing_token was never written.
+        let project_found_db = if let Some(conn_id) = project_found_db.git_provider_connection_id {
+            let repo_owner = project_found_db.repo_owner.clone();
+            let repo_name = project_found_db.repo_name.clone();
+            if !repo_owner.is_empty() && !repo_name.is_empty() {
+                match self
+                    .install_gitea_webhook_for_connection(
+                        project_found_db.id,
+                        conn_id,
+                        &repo_owner,
+                        &repo_name,
+                    )
+                    .await
+                {
+                    Ok(encrypted_token) => {
+                        let mut active = projects::ActiveModel::from(project_found_db.clone());
+                        active.gitea_webhook_signing_token = Set(Some(encrypted_token));
+                        active.updated_at = Set(chrono::Utc::now());
+                        match active.update(self.db.as_ref()).await {
+                            Ok(updated) => updated,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to persist Gitea webhook token on new project {}: {}",
+                                    project_found_db.id,
+                                    e
+                                );
+                                project_found_db
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to install Gitea webhook for new project {}: {}",
+                            project_found_db.id,
+                            e
+                        );
+                        project_found_db
+                    }
+                }
+            } else {
+                project_found_db
+            }
+        } else {
+            project_found_db
+        };
+
+        // Auto-install Generic webhook token if applicable (best-effort, non-fatal).
+        // BLOCKER 2 fix: generic_webhook_token was never written.
+        // Generic has no remote API — generate the token and store it; operators
+        // configure the webhook URL manually.
+        let project_found_db = if let Some(conn_id) = project_found_db.git_provider_connection_id {
+            match self
+                .install_generic_webhook_token(project_found_db.id, conn_id)
+                .await
+            {
+                Ok(Some(encrypted_token)) => {
+                    let mut active = projects::ActiveModel::from(project_found_db.clone());
+                    active.generic_webhook_token = Set(Some(encrypted_token));
+                    active.updated_at = Set(chrono::Utc::now());
+                    match active.update(self.db.as_ref()).await {
+                        Ok(updated) => updated,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to persist Generic webhook token on new project {}: {}",
+                                project_found_db.id,
+                                e
+                            );
+                            project_found_db
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // Not a Generic connection — nothing to do.
+                    project_found_db
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to install Generic webhook token for new project {}: {}",
+                        project_found_db.id,
+                        e
+                    );
+                    project_found_db
+                }
+            }
+        } else {
+            project_found_db
+        };
+
         Ok(Self::map_db_project_to_project(project_found_db))
     }
 
@@ -441,7 +577,15 @@ impl ProjectService {
 
     pub async fn get_projects(&self) -> Result<Vec<Project>, ProjectError> {
         let results = projects::Entity::find()
-            .order_by_desc(projects::Column::LastDeployment)
+            // Most-recently-deployed first; never-deployed projects (NULL
+            // last_deployment) sort last, not first — a NULL under DESC would
+            // otherwise be treated as "deployed infinitely recently".
+            .order_by_with_nulls(
+                projects::Column::LastDeployment,
+                sea_orm::Order::Desc,
+                sea_orm::sea_query::NullOrdering::Last,
+            )
+            .order_by_desc(projects::Column::CreatedAt)
             .all(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::Other(e.to_string()))?;
@@ -589,6 +733,65 @@ impl ProjectService {
         Ok(project_found)
     }
 
+    /// Change a project's source type to a Git-less type (docker_image /
+    /// static_files / manual). Switching TO Git is rejected here because that
+    /// needs repo + provider-connection config — it goes through
+    /// [`Self::update_git_settings`] instead (which sets `source_type = Git`).
+    pub async fn set_source_type(
+        &self,
+        project_id: i32,
+        source_type: temps_entities::source_type::SourceType,
+    ) -> Result<Project, ProjectError> {
+        use temps_entities::source_type::SourceType;
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ProjectError::NotFound(format!(
+                "project {} not found",
+                project_id
+            )))?;
+
+        // Switching to Git is a direct flip only when a repository is already
+        // configured (repo owner + name). A project can carry git info without
+        // being Git-typed — that's a one-click switch. Otherwise the user must
+        // set a repository up first (via Git settings).
+        if matches!(source_type, SourceType::Git) {
+            let has_repo = !project.repo_owner.trim().is_empty()
+                && !project.repo_name.trim().is_empty()
+                && project.repo_owner != "unknown"
+                && project.repo_name != "unknown";
+            if !has_repo {
+                return Err(ProjectError::InvalidInput(
+                    "To switch to a Git source, configure a repository in Git settings \
+                     (a provider connection, repository, and branch are required)."
+                        .to_string(),
+                ));
+            }
+        }
+
+        let mut active_project: projects::ActiveModel = project.into();
+        active_project.source_type = Set(source_type);
+        active_project.updated_at = Set(chrono::Utc::now());
+        let updated = active_project.update(self.db.as_ref()).await?;
+        let updated = Self::map_db_project_to_project(updated);
+
+        // Deploy routing / behavior keys off source_type — notify consumers.
+        if let Err(e) = self
+            .queue_service
+            .send(Job::ProjectUpdated(ProjectUpdatedJob {
+                project_id: updated.id,
+                project_name: updated.name.clone(),
+            }))
+            .await
+        {
+            warn!(
+                "Failed to emit ProjectUpdated after source-type change for {}: {}",
+                updated.id, e
+            );
+        }
+        Ok(updated)
+    }
+
     pub async fn delete_project(
         &self,
         project_id: i32,
@@ -668,6 +871,10 @@ impl ProjectService {
         preview_envs_idle_timeout_seconds: Option<i32>,
         preview_envs_wake_timeout_seconds: Option<i32>,
         preset_config: Option<serde_json::Value>,
+        ai_alert_summaries_enabled: Option<bool>,
+        ai_debug_chat_enabled: Option<bool>,
+        ai_write_actions_enabled: Option<bool>,
+        cross_project_trace_sharing: Option<bool>,
     ) -> Result<Project, ProjectError> {
         // Validate preview env on-demand timeouts before touching the DB.
         // Mirrors DeploymentConfig::validate so the project-level defaults are
@@ -794,6 +1001,47 @@ impl ProjectService {
 
             let mut active_project: projects::ActiveModel = project.into();
             active_project.attack_mode = Set(attack_mode_value);
+            active_project.update(self.db.as_ref()).await?;
+        }
+
+        // Update AI feature toggles if provided (ADR-021 / ADR-023). Both are
+        // tri-state opt-ins (Some(true) = on), stored as nullable columns.
+        // ai_write_actions_enabled is a non-null bool column (default false).
+        if ai_alert_summaries_enabled.is_some()
+            || ai_debug_chat_enabled.is_some()
+            || ai_write_actions_enabled.is_some()
+        {
+            let project = projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(ProjectError::NotFound(format!(
+                    "Project {} not found",
+                    project_id
+                )))?;
+            let mut active_project: projects::ActiveModel = project.into();
+            if let Some(v) = ai_alert_summaries_enabled {
+                active_project.ai_alert_summaries_enabled = Set(Some(v));
+            }
+            if let Some(v) = ai_debug_chat_enabled {
+                active_project.ai_debug_chat_enabled = Set(Some(v));
+            }
+            if let Some(v) = ai_write_actions_enabled {
+                active_project.ai_write_actions_enabled = Set(v);
+            }
+            active_project.update(self.db.as_ref()).await?;
+        }
+
+        // Update cross_project_trace_sharing if provided (ADR-027 Phase 3 opt-out).
+        if let Some(sharing) = cross_project_trace_sharing {
+            let project = projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(ProjectError::NotFound(format!(
+                    "Project {} not found",
+                    project_id
+                )))?;
+            let mut active_project: projects::ActiveModel = project.into();
+            active_project.cross_project_trace_sharing = Set(sharing);
             active_project.update(self.db.as_ref()).await?;
         }
 
@@ -994,6 +1242,11 @@ impl ProjectService {
         let old_repo_owner = project.repo_owner.clone();
         let old_repo_name = project.repo_name.clone();
         let old_gitlab_webhook_id = project.gitlab_webhook_id;
+        let old_bitbucket_hook_id = project.bitbucket_webhook_hook_id.clone();
+        // Gitea: no separate hook_id column — we clear gitea_webhook_signing_token
+        // on repo change / disconnect. The orphaned remote hook on Gitea is
+        // acceptable for v1 (no stored ID to call DELETE with).
+        // Generic: no remote API at all — just regenerate the token.
 
         // Verify git provider connection if provided
         if let Some(connection_id) = git_provider_connection_id {
@@ -1042,6 +1295,10 @@ impl ProjectService {
         active_project.repo_owner = Set(repo_owner.clone());
         active_project.repo_name = Set(repo_name.clone());
         active_project.directory = Set(directory);
+        // Configuring a Git repository makes this a Git-source project — this is
+        // how a docker_image / static_files project is converted to Git (the
+        // reverse conversion goes through `set_source_type`).
+        active_project.source_type = Set(temps_entities::source_type::SourceType::Git);
 
         if let Some(preset_value) = preset {
             // Parse preset string to enum
@@ -1172,6 +1429,140 @@ impl ProjectService {
             // Explicit disconnect: clear webhook state.
             active_project.gitlab_webhook_id = Set(None);
             active_project.gitlab_webhook_signing_token = Set(None);
+        }
+
+        // ── Bitbucket Cloud webhook lifecycle ────────────────────────────────
+        //
+        // Mirrors the GitLab block above: delete the old hook when the repo
+        // changes and install a new one on the new repo (best-effort, non-fatal).
+
+        if repo_changed {
+            // Step 1: Remove old webhook if the old connection was Bitbucket.
+            if let (Some(old_hook_uuid), Some(old_conn_id)) =
+                (old_bitbucket_hook_id.as_deref(), old_connection_id)
+            {
+                if let Err(e) = self
+                    .delete_bitbucket_webhook_for_connection(
+                        old_conn_id,
+                        &old_repo_owner,
+                        &old_repo_name,
+                        old_hook_uuid,
+                    )
+                    .await
+                {
+                    warn!(
+                        "Failed to remove old Bitbucket webhook {} for project {}: {}",
+                        old_hook_uuid, project_id, e
+                    );
+                }
+                // Clear stale hook fields unconditionally.
+                active_project.bitbucket_webhook_hook_id = Set(None);
+                active_project.bitbucket_webhook_token = Set(None);
+            }
+
+            // Step 2: Install a new webhook if the new connection is Bitbucket.
+            if let Some(conn_id) = new_connection_id {
+                match self
+                    .install_bitbucket_webhook_for_connection(
+                        project_id,
+                        conn_id,
+                        &repo_owner,
+                        &repo_name,
+                    )
+                    .await
+                {
+                    Ok((hook_uuid, encrypted_token)) => {
+                        active_project.bitbucket_webhook_hook_id = Set(Some(hook_uuid));
+                        active_project.bitbucket_webhook_token = Set(Some(encrypted_token));
+                    }
+                    Err(e) => {
+                        // Non-fatal: project connects without the webhook.
+                        warn!(
+                            "Failed to install Bitbucket webhook for project {}: {}",
+                            project_id, e
+                        );
+                        active_project.bitbucket_webhook_hook_id = Set(None);
+                        active_project.bitbucket_webhook_token = Set(None);
+                    }
+                }
+            }
+        } else if git_provider_connection_id == Some(0) {
+            // Explicit disconnect: clear Bitbucket webhook state.
+            active_project.bitbucket_webhook_hook_id = Set(None);
+            active_project.bitbucket_webhook_token = Set(None);
+        }
+
+        // ── Gitea webhook lifecycle ──────────────────────────────────────────
+        //
+        // BLOCKER 1 fix: gitea_webhook_signing_token is now written here.
+        // There is no stored hook_id for remote deletion in v1 — on repo
+        // change we clear the token (orphaning the remote hook) and re-install.
+        // On explicit disconnect we clear the token.
+
+        if repo_changed {
+            // Clear the old Gitea signing token unconditionally.
+            active_project.gitea_webhook_signing_token = Set(None);
+
+            // Install a new webhook if the new connection is Gitea.
+            if let Some(conn_id) = new_connection_id {
+                match self
+                    .install_gitea_webhook_for_connection(
+                        project_id,
+                        conn_id,
+                        &repo_owner,
+                        &repo_name,
+                    )
+                    .await
+                {
+                    Ok(encrypted_token) => {
+                        active_project.gitea_webhook_signing_token = Set(Some(encrypted_token));
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to install Gitea webhook for project {}: {}",
+                            project_id, e
+                        );
+                        active_project.gitea_webhook_signing_token = Set(None);
+                    }
+                }
+            }
+        } else if git_provider_connection_id == Some(0) {
+            // Explicit disconnect: clear Gitea webhook state.
+            active_project.gitea_webhook_signing_token = Set(None);
+        }
+
+        // ── Generic webhook token lifecycle ─────────────────────────────────
+        //
+        // BLOCKER 2 fix: generic_webhook_token is now written here.
+        // Generic has no remote API to deregister; we simply regenerate.
+
+        if repo_changed {
+            // Clear the old token.
+            active_project.generic_webhook_token = Set(None);
+
+            if let Some(conn_id) = new_connection_id {
+                match self
+                    .install_generic_webhook_token(project_id, conn_id)
+                    .await
+                {
+                    Ok(Some(encrypted_token)) => {
+                        active_project.generic_webhook_token = Set(Some(encrypted_token));
+                    }
+                    Ok(None) => {
+                        // Not a Generic connection — nothing to do.
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to install Generic webhook token for project {}: {}",
+                            project_id, e
+                        );
+                        active_project.generic_webhook_token = Set(None);
+                    }
+                }
+            }
+        } else if git_provider_connection_id == Some(0) {
+            // Explicit disconnect: clear Generic webhook state.
+            active_project.generic_webhook_token = Set(None);
         }
 
         let updated_project = active_project.update(self.db.as_ref()).await?;
@@ -1385,6 +1776,408 @@ impl ProjectService {
         Ok(hook_id as i32)
     }
 
+    // ── Bitbucket Cloud webhook lifecycle ────────────────────────────────────
+    //
+    // Mirrors the GitLab pattern.  The delivery URL embeds a secret token in
+    // the path (`…/bitbucket/events/{token}`); there is no HMAC body signing.
+    // The token is generated once per project, stored encrypted, and persisted
+    // together with the Bitbucket hook UUID so we can `DELETE` it on disconnect.
+    //
+    // Failures are always non-fatal: the project connects without the webhook
+    // and the operator can re-try via the Temps UI or re-connect the repo.
+
+    /// Resolve whether `connection_id` points to a Bitbucket provider.
+    ///
+    /// Returns `(access_token, auth_method_str)` for Bitbucket connections;
+    /// `Err(String)` for all others (caller silently skips).
+    async fn resolve_bitbucket_connection(
+        &self,
+        connection_id: i32,
+    ) -> Result<(String, String), String> {
+        use temps_entities::{git_provider_connections, git_providers};
+
+        let connection = git_provider_connections::Entity::find_by_id(connection_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| format!("DB error fetching connection {connection_id}: {e}"))?
+            .ok_or_else(|| format!("Connection {connection_id} not found"))?;
+
+        let provider = git_providers::Entity::find_by_id(connection.provider_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| format!("DB error fetching provider {}: {e}", connection.provider_id))?
+            .ok_or_else(|| format!("Provider {} not found", connection.provider_id))?;
+
+        if provider.provider_type != "bitbucket" {
+            return Err(format!(
+                "Provider {} is not a Bitbucket provider (type: {})",
+                provider.id, provider.provider_type
+            ));
+        }
+
+        let auth_method = provider.auth_method.clone();
+
+        let access_token = self
+            .git_provider_manager
+            .get_connection_token(connection_id)
+            .await
+            .map_err(|e| {
+                format!("Failed to get access token for Bitbucket connection {connection_id}: {e}")
+            })?;
+
+        Ok((access_token, auth_method))
+    }
+
+    /// Install a Bitbucket Cloud webhook for `project_id` / `connection_id`.
+    ///
+    /// Steps:
+    /// 1. Generate a fresh `bitbucket_webhook_token` via `OsRng`.
+    /// 2. Build the delivery URL: `{external_url}/api/webhook/git/bitbucket/events/{token}`.
+    /// 3. Call `POST /2.0/repositories/{workspace}/{slug}/hooks`.
+    /// 4. Return `(hook_uuid, encrypted_token)` to the caller for persistence.
+    async fn install_bitbucket_webhook_for_connection(
+        &self,
+        project_id: i32,
+        connection_id: i32,
+        owner: &str,
+        repo: &str,
+    ) -> Result<(String, String), String> {
+        use temps_git::services::bitbucket_provider::generate_bitbucket_webhook_token;
+        use temps_git::services::git_provider::WebhookConfig;
+
+        let (access_token, _auth_method_str) =
+            match self.resolve_bitbucket_connection(connection_id).await {
+                Ok(pair) => pair,
+                Err(e) => return Err(e),
+            };
+
+        let external_url = self
+            .config_service
+            .get_settings()
+            .await
+            .ok()
+            .and_then(|s| s.external_url)
+            .unwrap_or_else(|| "http://localhost:8080".to_string());
+
+        // Generate a fresh secret-in-path delivery token.
+        let delivery_token = generate_bitbucket_webhook_token();
+
+        let webhook_url = format!(
+            "{}/api/webhook/git/bitbucket/events/{}",
+            external_url.trim_end_matches('/'),
+            delivery_token
+        );
+
+        // Resolve the connection to get provider_id, then get provider service.
+        let connection = {
+            use temps_entities::git_provider_connections;
+            git_provider_connections::Entity::find_by_id(connection_id)
+                .one(self.db.as_ref())
+                .await
+                .map_err(|e| format!("DB error fetching connection {connection_id}: {e}"))?
+                .ok_or_else(|| format!("Connection {connection_id} not found"))?
+        };
+
+        let provider_service = self
+            .git_provider_manager
+            .get_provider_service(connection.provider_id)
+            .await
+            .map_err(|e| {
+                format!(
+                    "Failed to get provider service for Bitbucket connection {connection_id}: {e}"
+                )
+            })?;
+
+        let hook_uuid = provider_service
+            .create_webhook(
+                &access_token,
+                owner,
+                repo,
+                WebhookConfig {
+                    url: webhook_url,
+                    secret: None, // Bitbucket uses secret-in-path; no HMAC secret
+                    events: vec![
+                        "repo:push".to_string(),
+                        "pullrequest:created".to_string(),
+                        "pullrequest:updated".to_string(),
+                        "pullrequest:fulfilled".to_string(),
+                        "pullrequest:rejected".to_string(),
+                    ],
+                },
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "Failed to register Bitbucket webhook for project {project_id} ({owner}/{repo}): {e}"
+                )
+            })?;
+
+        // Encrypt the delivery token before storing.
+        let encrypted_token = self
+            .encryption_service
+            .encrypt_string(&delivery_token)
+            .map_err(|e| format!("Failed to encrypt Bitbucket webhook token: {e}"))?;
+
+        info!(
+            "Registered Bitbucket webhook {} for project {} ({}/{})",
+            hook_uuid, project_id, owner, repo
+        );
+
+        Ok((hook_uuid, encrypted_token))
+    }
+
+    /// Delete a previously auto-registered Bitbucket webhook.  Best-effort;
+    /// 404 is treated as success (already gone).
+    async fn delete_bitbucket_webhook_for_connection(
+        &self,
+        connection_id: i32,
+        owner: &str,
+        repo: &str,
+        hook_uuid: &str,
+    ) -> Result<(), String> {
+        let (access_token, _) = match self.resolve_bitbucket_connection(connection_id).await {
+            Ok(pair) => pair,
+            // Not a Bitbucket connection — nothing to do.
+            Err(_) => return Ok(()),
+        };
+
+        let connection = {
+            use temps_entities::git_provider_connections;
+            git_provider_connections::Entity::find_by_id(connection_id)
+                .one(self.db.as_ref())
+                .await
+                .map_err(|e| format!("DB error: {e}"))?
+                .ok_or_else(|| format!("Connection {connection_id} not found"))?
+        };
+
+        let provider_service = self
+            .git_provider_manager
+            .get_provider_service(connection.provider_id)
+            .await
+            .map_err(|e| {
+                format!(
+                    "Failed to get provider service for Bitbucket connection {connection_id}: {e}"
+                )
+            })?;
+
+        provider_service
+            .delete_webhook(&access_token, owner, repo, hook_uuid)
+            .await
+            .map_err(|e| format!("Bitbucket delete webhook error for {owner}/{repo}: {e}"))
+    }
+
+    // ── Gitea webhook install / resolve ─────────────────────────────────────────
+    //
+    // BLOCKER 1 fix: Gitea webhooks use HMAC-SHA256 (unlike Bitbucket's
+    // secret-in-path).  We generate a signing token with OsRng, register it
+    // with Gitea's API via `create_webhook` (passing the secret in the config),
+    // then store it encrypted in `projects.gitea_webhook_signing_token`.
+    //
+    // Failures are always non-fatal — same policy as Bitbucket/GitLab.
+
+    /// Resolve whether `connection_id` points to a Gitea provider.
+    ///
+    /// Returns `(access_token, base_url)` for Gitea connections;
+    /// `Err(String)` for all others (caller silently skips).
+    async fn resolve_gitea_connection(
+        &self,
+        connection_id: i32,
+    ) -> Result<(String, String), String> {
+        use temps_entities::{git_provider_connections, git_providers};
+
+        let connection = git_provider_connections::Entity::find_by_id(connection_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| format!("DB error fetching connection {connection_id}: {e}"))?
+            .ok_or_else(|| format!("Connection {connection_id} not found"))?;
+
+        let provider = git_providers::Entity::find_by_id(connection.provider_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| format!("DB error fetching provider {}: {e}", connection.provider_id))?
+            .ok_or_else(|| format!("Provider {} not found", connection.provider_id))?;
+
+        if provider.provider_type != "gitea" {
+            return Err(format!(
+                "Provider {} is not a Gitea provider (type: {})",
+                provider.id, provider.provider_type
+            ));
+        }
+
+        let base_url = provider
+            .base_url
+            .ok_or_else(|| format!("Gitea provider {} has no base_url configured", provider.id))?;
+
+        let access_token = self
+            .git_provider_manager
+            .get_connection_token(connection_id)
+            .await
+            .map_err(|e| {
+                format!("Failed to get access token for Gitea connection {connection_id}: {e}")
+            })?;
+
+        Ok((access_token, base_url))
+    }
+
+    /// Install a Gitea webhook for `project_id` / `connection_id`.
+    ///
+    /// Steps:
+    /// 1. Resolve the connection to confirm it's a Gitea provider.
+    /// 2. Generate a fresh 32-byte hex signing token via `generate_gitea_signing_token`.
+    /// 3. Build the delivery URL: `{external_url}/api/webhook/git/gitea/events`.
+    /// 4. Call `create_webhook` with the HMAC secret (Gitea HMAC signing).
+    /// 5. Encrypt the token and return it for storage.
+    ///
+    /// Returns `Ok(encrypted_token)` on success; `Err(String)` on any failure
+    /// (non-fatal — caller logs and continues).
+    async fn install_gitea_webhook_for_connection(
+        &self,
+        project_id: i32,
+        connection_id: i32,
+        owner: &str,
+        repo: &str,
+    ) -> Result<String, String> {
+        use temps_git::services::git_provider::WebhookConfig;
+        use temps_git::services::gitea_provider::generate_gitea_signing_token;
+
+        let (access_token, _base_url) = match self.resolve_gitea_connection(connection_id).await {
+            Ok(pair) => pair,
+            Err(e) => return Err(e),
+        };
+
+        let external_url = self
+            .config_service
+            .get_settings()
+            .await
+            .ok()
+            .and_then(|s| s.external_url)
+            .unwrap_or_else(|| "http://localhost:8080".to_string());
+
+        // Generate a fresh HMAC secret (used as the Gitea webhook secret).
+        let signing_token = generate_gitea_signing_token();
+
+        let webhook_url = format!(
+            "{}/api/webhook/git/gitea/events",
+            external_url.trim_end_matches('/')
+        );
+
+        // Resolve the connection to get provider_id, then get provider service.
+        let connection = {
+            use temps_entities::git_provider_connections;
+            git_provider_connections::Entity::find_by_id(connection_id)
+                .one(self.db.as_ref())
+                .await
+                .map_err(|e| format!("DB error fetching connection {connection_id}: {e}"))?
+                .ok_or_else(|| format!("Connection {connection_id} not found"))?
+        };
+
+        let provider_service = self
+            .git_provider_manager
+            .get_provider_service(connection.provider_id)
+            .await
+            .map_err(|e| {
+                format!("Failed to get provider service for Gitea connection {connection_id}: {e}")
+            })?;
+
+        // Gitea webhooks are HMAC-SHA256; pass the secret in WebhookConfig.secret.
+        provider_service
+            .create_webhook(
+                &access_token,
+                owner,
+                repo,
+                WebhookConfig {
+                    url: webhook_url,
+                    secret: Some(signing_token.clone()), // HMAC secret
+                    events: vec!["push".to_string()],
+                },
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "Failed to register Gitea webhook for project {project_id} ({owner}/{repo}): {e}"
+                )
+            })?;
+
+        // Encrypt the signing token before storing.
+        let encrypted_token = self
+            .encryption_service
+            .encrypt_string(&signing_token)
+            .map_err(|e| format!("Failed to encrypt Gitea webhook signing token: {e}"))?;
+
+        info!(
+            "Registered Gitea webhook for project {} ({}/{})",
+            project_id, owner, repo
+        );
+
+        Ok(encrypted_token)
+    }
+
+    // ── Generic webhook token install ────────────────────────────────────────────
+    //
+    // BLOCKER 2 fix: the Generic provider has no REST API to auto-register a
+    // hook.  We generate a token and store it encrypted.  The webhook URL
+    // (`{external_url}/api/webhook/git/generic/events/{token}`) is surfaced to
+    // the operator for manual configuration.
+    //
+    // Returns `Ok(Some(encrypted_token))` for Generic connections,
+    // `Ok(None)` for non-Generic connections, `Err` on failure.
+
+    /// Generate and store a generic webhook delivery token for `project_id`.
+    ///
+    /// Returns `Ok(Some(encrypted_token))` when `connection_id` is a Generic
+    /// provider; `Ok(None)` when it's any other provider type (caller skips).
+    async fn install_generic_webhook_token(
+        &self,
+        project_id: i32,
+        connection_id: i32,
+    ) -> Result<Option<String>, String> {
+        use temps_entities::{git_provider_connections, git_providers};
+        use temps_git::services::generic_provider::generate_generic_webhook_token;
+
+        let connection = git_provider_connections::Entity::find_by_id(connection_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| format!("DB error fetching connection {connection_id}: {e}"))?
+            .ok_or_else(|| format!("Connection {connection_id} not found"))?;
+
+        let provider = git_providers::Entity::find_by_id(connection.provider_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| format!("DB error fetching provider {}: {e}", connection.provider_id))?
+            .ok_or_else(|| format!("Provider {} not found", connection.provider_id))?;
+
+        if provider.provider_type != "generic" {
+            // Not a Generic connection — nothing to do.
+            return Ok(None);
+        }
+
+        let token = generate_generic_webhook_token();
+
+        let encrypted_token = self
+            .encryption_service
+            .encrypt_string(&token)
+            .map_err(|e| format!("Failed to encrypt Generic webhook token: {e}"))?;
+
+        let external_url = self
+            .config_service
+            .get_settings()
+            .await
+            .ok()
+            .and_then(|s| s.external_url)
+            .unwrap_or_else(|| "http://localhost:8080".to_string());
+
+        info!(
+            "Generated Generic webhook token for project {} (conn {}). \
+             Configure your git host to POST to: {}/api/webhook/git/generic/events/{}",
+            project_id,
+            connection_id,
+            external_url.trim_end_matches('/'),
+            token // plaintext token is only logged here; stored value is encrypted
+        );
+
+        Ok(Some(encrypted_token))
+    }
+
     pub async fn get_projects_paginated(
         &self,
         page: i64,
@@ -1403,9 +2196,16 @@ impl ProjectService {
             .map_err(|e| ProjectError::DatabaseConnectionError(e.to_string()))?
             as i64;
 
-        // Get paginated projects
+        // Get paginated projects. Never-deployed projects (NULL last_deployment)
+        // sort last rather than first (a NULL under DESC would otherwise appear
+        // as the most-recently-deployed project).
         let projects = projects::Entity::find()
-            .order_by_desc(projects::Column::LastDeployment)
+            .order_by_with_nulls(
+                projects::Column::LastDeployment,
+                sea_orm::Order::Desc,
+                sea_orm::sea_query::NullOrdering::Last,
+            )
+            .order_by_desc(projects::Column::CreatedAt)
             .offset(offset)
             .limit(per_page as u64)
             .all(self.db.as_ref())
@@ -1700,12 +2500,16 @@ impl ProjectService {
             is_on_demand: false, // Deprecated field, default to false
             deployment_config: deployment_config.clone(),
             attack_mode: db_project.attack_mode,
+            ai_alert_summaries_enabled: db_project.ai_alert_summaries_enabled,
+            ai_debug_chat_enabled: db_project.ai_debug_chat_enabled,
+            ai_write_actions_enabled: db_project.ai_write_actions_enabled,
             enable_preview_environments: db_project.enable_preview_environments,
             preview_envs_on_demand: db_project.preview_envs_on_demand,
             preview_envs_idle_timeout_seconds: db_project.preview_envs_idle_timeout_seconds,
             preview_envs_wake_timeout_seconds: db_project.preview_envs_wake_timeout_seconds,
             source_type: db_project.source_type,
             gitlab_webhook_id: db_project.gitlab_webhook_id,
+            cross_project_trace_sharing: db_project.cross_project_trace_sharing,
         }
     }
 
@@ -1823,6 +2627,9 @@ impl ProjectService {
             // not a git webhook — bypass automatic_deploy.
             manual_trigger: true,
             rollback_from_deployment_id: None,
+            // Infer the target from the branch at creation time (the default
+            // environment tracks main_branch).
+            target_environment_id: None,
         };
 
         self.queue_service
@@ -1995,6 +2802,11 @@ impl ProjectService {
             // "Deploy" button and the CLI — both are user-initiated.
             manual_trigger: true,
             rollback_from_deployment_id: None,
+            // The caller explicitly chose this environment — deploy there
+            // directly rather than re-inferring the target from the branch
+            // (which would fall through to a preview/named-preview env when the
+            // environment doesn't have the branch configured).
+            target_environment_id: Some(environment_id),
         };
 
         // Send the job to the queue
@@ -2232,6 +3044,10 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
+                None, // cross_project_trace_sharing
             )
             .await;
 

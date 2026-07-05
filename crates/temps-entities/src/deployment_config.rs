@@ -244,11 +244,15 @@ impl RateLimitConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, FromJsonQueryResult)]
 #[serde(rename_all = "camelCase")]
 pub struct DeploymentConfig {
-    /// CPU request in millicores (e.g., 100 = 0.1 CPU, 1000 = 1 CPU)
+    /// CPU request in microcores, where 1_000_000 = 1 full CPU core
+    /// (e.g., 100_000 = 0.1 CPU, 500_000 = 0.5 CPU, 2_000_000 = 2 CPUs).
+    /// NOT millicores — the deployer formats this as `{n}u` and converts
+    /// `n / 1_000_000` cores into Docker nano_cpus.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_request: Option<i32>,
 
-    /// CPU limit in millicores (e.g., 2000 = 2 CPUs)
+    /// CPU limit in microcores, where 1_000_000 = 1 full CPU core
+    /// (e.g., 2_000_000 = 2 CPUs). NOT millicores. `None` = uncapped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_limit: Option<i32>,
 

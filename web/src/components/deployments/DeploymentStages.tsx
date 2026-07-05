@@ -2,6 +2,7 @@ import {
   DeploymentJobResponse,
   DeploymentResponse,
   ProjectResponse,
+  updateProjectSettings,
 } from '@/api/client'
 import { getDeploymentJobsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
@@ -19,16 +20,21 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery } from '@tanstack/react-query'
 import AnsiToHtml from 'ansi-to-html'
 import {
+  AlertTriangle,
   Check,
   CheckCircle2,
   ChevronDownIcon,
   ChevronUpIcon,
   Copy,
+  Info,
   Loader2,
   Settings,
+  Sparkles,
   XCircle,
 } from 'lucide-react'
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
+import { toast } from 'sonner'
+import { useAiAssistant } from '../ai/AiAssistantContext'
 import { ElapsedTime } from '../global/ElapsedTime'
 
 interface DeploymentStagesProps {
@@ -181,13 +187,10 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
   const [copied, setCopied] = useState(false)
 
   useEffect(() => {
-    if (logs.length > 0) {
-      const viewport = scrollAreaRef.current?.querySelector(
-        '[data-radix-scroll-area-viewport]'
-      )
-      if (viewport) {
-        viewport.scrollTop = viewport.scrollHeight
-      }
+    if (logs.length > 0 && scrollAreaRef.current) {
+      // Native scroll container (not Radix) so mobile gets two-axis touch
+      // scrolling; keep pinned to the latest line.
+      scrollAreaRef.current.scrollTop = scrollAreaRef.current.scrollHeight
     }
   }, [logs])
 
@@ -202,23 +205,6 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
       }),
     []
   )
-
-  // Get color class for log level
-  const getLevelColor = (level: string) => {
-    switch (level.toLowerCase()) {
-      case 'error':
-        return 'text-red-500 dark:text-red-400'
-      case 'warning':
-      case 'warn':
-        return 'text-yellow-600 dark:text-yellow-500'
-      case 'success':
-        return 'text-green-600 dark:text-green-500'
-      case 'info':
-        return 'text-blue-500 dark:text-blue-400'
-      default:
-        return 'text-muted-foreground'
-    }
-  }
 
   // Get icon for log level
   const getLevelIcon = (level: string) => {
@@ -355,7 +341,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
             onClick={() => toggleFilter('info')}
             className="gap-2"
           >
-            <span className="text-blue-500">ℹ️</span>
+            <Info className="text-blue-500" />
             Info
             {logCounts.info > 0 && (
               <span className="ml-1 px-1.5 py-0.5 text-xs rounded-full bg-blue-500/20">
@@ -369,7 +355,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
             onClick={() => toggleFilter('success')}
             className="gap-2"
           >
-            <span className="text-green-500">✅</span>
+            <CheckCircle2 className="text-green-500" />
             Success
             {logCounts.success > 0 && (
               <span className="ml-1 px-1.5 py-0.5 text-xs rounded-full bg-green-500/20">
@@ -383,7 +369,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
             onClick={() => toggleFilter('warning')}
             className="gap-2"
           >
-            <span className="text-yellow-500">⚠️</span>
+            <AlertTriangle className="text-yellow-500" />
             Warning
             {logCounts.warning > 0 && (
               <span className="ml-1 px-1.5 py-0.5 text-xs rounded-full bg-yellow-500/20">
@@ -397,7 +383,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
             onClick={() => toggleFilter('error')}
             className="gap-2"
           >
-            <span className="text-red-500">❌</span>
+            <XCircle className="text-red-500" />
             Error
             {logCounts.error > 0 && (
               <span className="ml-1 px-1.5 py-0.5 text-xs rounded-full bg-red-500/20">
@@ -435,11 +421,18 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
           )}
         </Button>
 
-        <ScrollArea
+        {/* Native scroll container (not Radix ScrollArea) — Radix only wires
+            up a vertical scrollbar and its display:table viewport blocks
+            horizontal touch scrolling on mobile, so long log lines got
+            clipped with no way to reach them. A plain overflow-auto div gives
+            reliable two-axis touch scrolling. */}
+        <div
           ref={scrollAreaRef}
-          className={`h-96 border rounded-md bg-background overflow-auto ${connectionStatus === 'connecting' ? 'opacity-50' : 'opacity-100'}`}
+          className={`h-96 overflow-auto border rounded-md bg-background overscroll-contain ${connectionStatus === 'connecting' ? 'opacity-50' : 'opacity-100'}`}
         >
-          <div className="text-xs font-mono p-4">
+          {/* w-max + min-w-full lets rows grow to the longest line so it can be
+              scrolled to horizontally, while never shrinking below the viewport. */}
+          <div className="text-xs font-mono p-4 w-max min-w-full">
             {logs.length === 0 ? (
               <div className="text-muted-foreground">
                 Connecting to log stream...
@@ -463,19 +456,19 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
                     {getLevelIcon(log.level)}
                   </span>
                   <span
-                    className="whitespace-pre-wrap break-words flex-1 min-w-0"
+                    className="whitespace-pre flex-1"
                     dangerouslySetInnerHTML={{
                       __html: ansiConverter.toHtml(log.message),
                     }}
                   />
-                  <span className="text-muted-foreground/40 text-[10px] whitespace-nowrap">
+                  <span className="text-muted-foreground/40 text-[10px] whitespace-nowrap shrink-0">
                     {formatTimestamp(log.timestamp)}
                   </span>
                 </div>
               ))
             )}
           </div>
-        </ScrollArea>
+        </div>
       </div>
     </div>
   )
@@ -569,6 +562,55 @@ export function DeploymentStages({
   const [configModalStage, setConfigModalStage] =
     useState<DeploymentJobResponse | null>(null)
 
+  // AI debugging chat (ADR-023), opened from a failed stage into the persistent
+  // app-level dock. The chat is scoped to the whole deployment.
+  const { open: openAiAssistant } = useAiAssistant()
+  // Read-only AI chat is safe, so we don't hide the "Debug with AI" affordance
+  // when it's off — we enable it inline (one click) and then open the chat,
+  // rather than sending the user to Settings. Local state so the button reflects
+  // enablement without refetching the project prop.
+  const [chatEnabled, setChatEnabled] = useState(
+    project.ai_debug_chat_enabled === true ||
+      project.ai_write_actions_enabled === true
+  )
+  const [enablingChat, setEnablingChat] = useState(false)
+
+  const debugWithAi = async () => {
+    if (!chatEnabled) {
+      setEnablingChat(true)
+      try {
+        const { error } = await updateProjectSettings({
+          path: { project_id: project.id },
+          body: { ai_debug_chat_enabled: true },
+        })
+        if (error) throw error
+        setChatEnabled(true)
+        toast.success('AI chat enabled')
+      } catch {
+        toast.error(
+          "Couldn't enable AI chat — you may need project admin permission."
+        )
+        setEnablingChat(false)
+        return
+      }
+      setEnablingChat(false)
+    }
+    openAiAssistant({
+      projectId: project.id,
+      context: {
+        contextType: 'deployment',
+        contextId: deployment.id,
+        title: `Debug deployment #${deployment.id}`,
+        description:
+          "AI reads this deployment's failed stages and build logs to explain what went wrong. Ask follow-up questions to dig deeper.",
+        startPrompt:
+          'Diagnose this deployment failure and suggest concrete fixes.',
+        projectSlug: project.slug,
+        projectName: project.name,
+      },
+    })
+  }
+
   // Compute which stages should be expanded based on their status and manual overrides
   const expandedStageIds = useMemo(() => {
     if (!stagesQuery.data) return new Set<number>()
@@ -629,40 +671,18 @@ export function DeploymentStages({
     )
   }
 
-  const expandAll = () => {
-    setManualOverrides(new Map())
-    if (stagesQuery.data) {
-      const allExpanded = new Map<number, boolean>()
-      stagesQuery.data.jobs.forEach((stage) => {
-        allExpanded.set(stage.id, true)
-      })
-      setManualOverrides(allExpanded)
-    }
-  }
-
-  const collapseAll = () => {
-    setManualOverrides(new Map())
-    if (stagesQuery.data) {
-      const allCollapsed = new Map<number, boolean>()
-      stagesQuery.data.jobs.forEach((stage) => {
-        allCollapsed.set(stage.id, false)
-      })
-      setManualOverrides(allCollapsed)
-    }
-  }
-
   const getStatusIcon = (status: string) => {
     switch (status) {
       case 'success':
-        return <CheckCircle2 className="h-5 w-5 text-green-500" />
+        return <CheckCircle2 className="h-4 w-4 text-green-500" />
       case 'failure':
-        return <XCircle className="h-5 w-5 text-red-500" />
+        return <XCircle className="h-4 w-4 text-red-500" />
       case 'running':
-        return <Loader2 className="h-5 w-5 text-orange-500 animate-spin" />
+        return <Loader2 className="h-4 w-4 text-orange-500 animate-spin" />
       case 'pending':
-        return <Loader2 className="h-5 w-5 text-muted-foreground" />
+        return <Loader2 className="h-4 w-4 text-muted-foreground" />
       case 'cancelled':
-        return <XCircle className="h-5 w-5 text-muted-foreground" />
+        return <XCircle className="h-4 w-4 text-muted-foreground" />
       default:
         return null
     }
@@ -707,21 +727,21 @@ export function DeploymentStages({
   return (
     <div className="space-y-4">
       {/* Stages */}
-      <div className="space-y-4 px-2 sm:px-0">
+      <div className="space-y-2">
         {stagesQuery.data?.jobs.map((stage) => (
           <div
             key={stage.id}
             className="border rounded-lg overflow-hidden bg-card"
           >
-            {/* Fat Header */}
-            <div className="flex items-center justify-between px-6 py-4 bg-muted/30 hover:bg-muted/50 transition-colors">
+            {/* Header */}
+            <div className="flex items-center justify-between px-4 py-2.5 bg-muted/30 hover:bg-muted/50 transition-colors">
               <div
-                className="flex items-center gap-3 flex-1 cursor-pointer"
+                className="flex min-w-0 items-center gap-2.5 flex-1 cursor-pointer"
                 onClick={() => toggleStage(stage.id)}
               >
                 {getStatusIcon(stage.status)}
-                <div className="flex items-center gap-3">
-                  <h3 className="font-medium text-base">
+                <div className="flex min-w-0 items-center gap-3">
+                  <h3 className="font-medium text-sm">
                     {stage.name}
                     {stage.description && (
                       <span className="ml-2 font-normal text-sm text-muted-foreground">
@@ -732,7 +752,31 @@ export function DeploymentStages({
                   {getStatusBadge(stage.status)}
                 </div>
               </div>
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2 sm:gap-3">
+                {stage.status === 'failure' && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={enablingChat}
+                    className="h-8 gap-1.5 border-primary/30 text-primary hover:bg-primary/10 hover:text-primary"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      void debugWithAi()
+                    }}
+                    title={
+                      chatEnabled
+                        ? 'Debug this failure with AI'
+                        : 'Enable AI chat and debug this failure'
+                    }
+                  >
+                    {enablingChat ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Sparkles className="h-4 w-4" />
+                    )}
+                    <span className="hidden sm:inline">Debug with AI</span>
+                  </Button>
+                )}
                 <ElapsedTime
                   startedAt={stage.started_at!}
                   endedAt={stage.finished_at!}
@@ -754,9 +798,9 @@ export function DeploymentStages({
                   className="cursor-pointer"
                 >
                   {expandedStageIds.has(stage.id) ? (
-                    <ChevronUpIcon className="h-5 w-5 text-muted-foreground" />
+                    <ChevronUpIcon className="h-4 w-4 text-muted-foreground" />
                   ) : (
-                    <ChevronDownIcon className="h-5 w-5 text-muted-foreground" />
+                    <ChevronDownIcon className="h-4 w-4 text-muted-foreground" />
                   )}
                 </button>
               </div>

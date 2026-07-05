@@ -1,9 +1,13 @@
 pub mod acme_accounts;
 pub mod acme_orders;
+pub mod ai_conversations;
 pub mod ai_gateway_config;
+pub mod ai_messages;
+pub mod ai_pending_actions;
 pub mod ai_provider_keys;
 pub mod ai_usage_logs;
 pub mod alarms;
+pub mod cross_project_trace_refs;
 // Agent entities (renamed from autopilot)
 pub mod agent_run_logs;
 pub mod agent_runs;
@@ -58,6 +62,7 @@ pub mod ip_access_control;
 pub mod ip_geolocations;
 pub mod network_config;
 pub mod node_dns_state;
+pub mod node_enrollment_tokens;
 pub mod node_route_state;
 pub mod nodes;
 pub mod notification_preferences;
@@ -121,6 +126,12 @@ pub mod status_monitors;
 
 // Metrics alert rules
 pub mod monitoring_alert_rules;
+
+// Metric dashboards (saved per-project dashboard layouts)
+pub mod metric_dashboards;
+
+// Metric alert rules (first-class metric-centric alerting)
+pub mod metric_alert_rules;
 
 // Webhook entities
 pub mod webhook_deliveries;

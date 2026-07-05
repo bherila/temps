@@ -29,6 +29,17 @@ pub struct GitPushEventJob {
     /// (no field) deserializing as non-rollback.
     #[serde(default)]
     pub rollback_from_deployment_id: Option<i32>,
+    /// Explicit deploy target for a *manual* trigger — set when the user (or the
+    /// AI, via `trigger_project_pipeline`) picked a specific environment. When
+    /// present, the consumer deploys to exactly this environment and SKIPS the
+    /// branch → environment matching (which is meant for webhook pushes where the
+    /// target is inferred). `None` = infer the target from the branch, the
+    /// webhook/default behaviour.
+    ///
+    /// `#[serde(default)]` so older queued jobs (no field) keep inferring by
+    /// branch.
+    #[serde(default)]
+    pub target_environment_id: Option<i32>,
 }
 
 /// Request to deploy a prebuilt Docker image to a project (no build step).

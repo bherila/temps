@@ -146,12 +146,15 @@ pub async fn create_service(
     // so it can resolve `*.temps.local` natively (ADR-011). Falls back to
     // Docker's default DNS when the overlay isn't bootstrapped yet
     // (single-host setups). Read from the agent's shared slot — published
-    // by `network_sync` once the bridge gateway is up.
+    // by `network_sync` once the bridge gateway is up. `dns_with_fallback`
+    // appends public resolvers so a crashed/unreachable Hickory resolver
+    // never takes down DNS for every managed-service container on the node.
     let dns_servers: Option<Vec<String>> = state
         .overlay_bridge_address
         .read()
         .ok()
-        .and_then(|slot| slot.as_ref().map(|ip| vec![ip.to_string()]));
+        .and_then(|slot| slot.as_ref().map(|ip| vec![ip.to_string()]))
+        .map(temps_deployer::docker::dns_with_fallback);
     if let Some(ref dns) = dns_servers {
         tracing::debug!(
             container = %container_name,

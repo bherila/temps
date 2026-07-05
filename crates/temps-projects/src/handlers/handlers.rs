@@ -20,8 +20,8 @@ use temps_core::RequestMetadata;
 use tracing::{debug, error, info};
 
 use super::types::{
-    CreateProjectRequest, PaginatedProjectList, PaginationParams, ProjectResponse,
-    ProjectStatisticsResponse, ReinstallWebhookResponse, TriggerPipelinePayload,
+    ChangeProjectSourceRequest, CreateProjectRequest, PaginatedProjectList, PaginationParams,
+    ProjectResponse, ProjectStatisticsResponse, ReinstallWebhookResponse, TriggerPipelinePayload,
     TriggerPipelineResponse, UpdateAutomaticDeployRequest, UpdateDeploymentConfigRequest,
     UpdateGitSettingsRequest, UpdateProjectSettingsRequest,
 };
@@ -38,6 +38,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/projects/{id}", get(get_project))
         .route("/projects/by-slug/{slug}", get(get_project_by_slug))
         .route("/projects/{id}", put(update_project))
+        .route("/projects/{id}/source", patch(change_project_source))
         .route("/projects/{id}", delete(delete_project))
         .route("/projects", post(create_project))
         .route("/projects", get(get_projects))
@@ -89,6 +90,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         create_project,
         get_project,
         update_project,
+        change_project_source,
         delete_project,
         get_projects,
         get_project_by_slug,
@@ -109,6 +111,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     components(
         schemas(
             CreateProjectRequest,
+            ChangeProjectSourceRequest,
             ProjectResponse,
             PaginatedProjectList,
             PaginationParams,
@@ -434,6 +437,67 @@ pub async fn update_project(
     Ok(Json(ProjectResponse::map_from_project(updated_project)).into_response())
 }
 
+/// Change a project's source type to a Git-less type (docker_image /
+/// static_files / manual). Switching TO Git is done via the Git settings
+/// endpoint (`POST /projects/{id}/git`), which also supplies the repository and
+/// provider connection.
+#[utoipa::path(
+    patch,
+    path = "/projects/{id}/source",
+    tag = "Projects",
+    params(("id" = i32, Path, description = "Project ID")),
+    request_body = ChangeProjectSourceRequest,
+    responses(
+        (status = 200, description = "Source type changed", body = ProjectResponse),
+        (status = 400, description = "Invalid source type change (e.g. switching to Git here)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Project not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn change_project_source(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(req): Json<super::types::ChangeProjectSourceRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, id);
+
+    let updated = state
+        .project_service
+        .set_source_type(id, req.source_type)
+        .await?;
+
+    let audit_event = ProjectUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent,
+        },
+        project_id: updated.id,
+        project_name: updated.name.clone(),
+        project_slug: updated.slug.clone(),
+        updated_fields: ProjectUpdatedFields {
+            name: Some(updated.name.clone()),
+            repo_name: None,
+            repo_owner: None,
+            directory: None,
+            main_branch: None,
+            preset: None,
+            automatic_deploy: None,
+        },
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
+        error!("Failed to create audit log: {:?}", e);
+    }
+
+    Ok(Json(ProjectResponse::map_from_project(updated)).into_response())
+}
+
 #[utoipa::path(
     delete,
     path = "/projects/{id}",
@@ -538,6 +602,10 @@ pub async fn update_project_settings(
             settings.preview_envs_idle_timeout_seconds,
             settings.preview_envs_wake_timeout_seconds,
             settings.preset_config.clone(),
+            settings.ai_alert_summaries_enabled,
+            settings.ai_debug_chat_enabled,
+            settings.ai_write_actions_enabled,
+            settings.cross_project_trace_sharing,
         )
         .await
         .map_err(Problem::from)?;

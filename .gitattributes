@@ -1,0 +1,8 @@
+# CHANGELOG.md is generated from Conventional Commits by git-cliff (see cliff.toml
+# and CONTRIBUTING.md). It is NOT hand-edited in PRs, so it should never conflict.
+#
+# - merge=union: belt-and-suspenders — if two branches ever do touch it, keep both
+#   sides instead of raising a conflict (git's built-in union driver, honored by
+#   GitHub's server-side merge).
+# - linguist-generated: collapse it in PR diffs and exclude it from language stats.
+CHANGELOG.md merge=union linguist-generated

@@ -11,6 +11,9 @@ pub use job_processor::*;
 pub mod workflow_planner;
 pub use workflow_planner::*;
 
+pub mod env_resolver;
+pub use env_resolver::*;
+
 pub mod workflow_execution_service;
 pub use workflow_execution_service::*;
 
@@ -40,6 +43,9 @@ pub use node_service::*;
 
 pub mod node_scheduler;
 pub use node_scheduler::*;
+
+pub mod remote_log_source;
+pub use remote_log_source::*;
 
 pub mod sensitive_envelope;
 pub use sensitive_envelope::*;

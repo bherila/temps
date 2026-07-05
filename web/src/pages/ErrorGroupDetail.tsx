@@ -19,17 +19,31 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { TimeAgo } from '@/components/utils/TimeAgo'
+import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
 import { extractSentryEvent } from '@/lib/sentry-utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import { AlertTriangle, ArrowLeft, Check, EyeOff, RotateCcw } from 'lucide-react'
+import {
+  AlertTriangle,
+  ArrowLeft,
+  Check,
+  EyeOff,
+  MoreVertical,
+  RotateCcw,
+} from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 
@@ -94,6 +108,18 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
     }
   }, [setBreadcrumbs, errorGroup, projectSlug])
 
+  // Tell the assistant which error the user is looking at.
+  const assistantContext = errorGroup
+    ? [
+        'The user is viewing an error group (error tracking) in the Temps console.',
+        `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
+        `Error group #${errorGroupId}: "${errorGroup.title}" (type: ${errorGroup.error_type ?? 'unknown'}).`,
+        `Seen ${errorGroup.total_count} time(s); first ${errorGroup.first_seen}, last ${errorGroup.last_seen}.`,
+        'Fetch details via the temps CLI: `error-tracking get_error_group --group_id` and `list_error_events --group_id`.',
+      ].join('\n')
+    : null
+  useAssistantPageContext(assistantContext, 'this error')
+
   const getSeverityColor = (level: string) => {
     switch (level?.toLowerCase()) {
       case 'error':
@@ -152,78 +178,120 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   return (
     <div className="p-4 sm:p-6">
       {/* Error Title Bar with Back Button */}
-      <div className="mb-6">
-        <div className="flex items-start gap-3 mb-2">
+      <div className="mb-6 space-y-3">
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             variant="ghost"
-            size="sm"
+            size="icon"
             onClick={() => navigate(`/projects/${project.slug}/errors`)}
-            className="mt-1"
+            className="-ml-2 shrink-0"
+            aria-label="Back to error tracking"
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
-          <div className="flex-1">
-            <div className="flex flex-wrap items-center gap-3 mb-2">
-              <Badge
-                className={cn(
-                  getSeverityColor(errorGroup.error_type || 'error')
-                )}
+          <Badge
+            className={cn(getSeverityColor(errorGroup.error_type || 'error'))}
+          >
+            {errorGroup.error_type || 'error'}
+          </Badge>
+          {(errorGroup as any).status && (errorGroup as any).status !== 'unresolved' && (
+            <Badge
+              variant={(errorGroup as any).status === 'resolved' ? 'default' : 'secondary'}
+              className="text-xs"
+            >
+              {(errorGroup as any).status}
+            </Badge>
+          )}
+        </div>
+
+        <h1 className="text-lg sm:text-xl md:text-2xl font-semibold break-words">
+          {errorGroup.title}
+        </h1>
+
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex flex-col gap-1 text-sm text-muted-foreground sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-2 sm:gap-y-1">
+            <span>{errorGroup.total_count || 0} occurrences</span>
+            <span className="hidden sm:inline">•</span>
+            <span>
+              First seen <TimeAgo date={errorGroup.first_seen} />
+            </span>
+            <span className="hidden sm:inline">•</span>
+            <span>
+              Last seen <TimeAgo date={errorGroup.last_seen} />
+            </span>
+          </div>
+
+          {/* Desktop: full action buttons */}
+          <div className="hidden gap-2 sm:flex sm:flex-wrap">
+            {(errorGroup as any).status !== 'resolved' && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => updateStatus('resolved')}
+                disabled={statusMutation.isPending}
               >
-                {errorGroup.error_type || 'error'}
-              </Badge>
-              <h1 className="text-xl sm:text-2xl font-semibold flex-1 min-w-0 break-words">{errorGroup.title}</h1>
-              <div className="flex flex-wrap gap-2 flex-shrink-0">
+                <Check className="h-4 w-4 mr-1.5" />
+                Resolve
+              </Button>
+            )}
+            {(errorGroup as any).status !== 'ignored' && (errorGroup as any).status !== 'resolved' && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => updateStatus('ignored')}
+                disabled={statusMutation.isPending}
+              >
+                <EyeOff className="h-4 w-4 mr-1.5" />
+                Ignore
+              </Button>
+            )}
+            {((errorGroup as any).status === 'resolved' || (errorGroup as any).status === 'ignored') && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => updateStatus('unresolved')}
+                disabled={statusMutation.isPending}
+              >
+                <RotateCcw className="h-4 w-4 mr-1.5" />
+                Unresolve
+              </Button>
+            )}
+          </div>
+
+          {/* Mobile: actions collapsed behind a kebab menu */}
+          <div className="sm:hidden">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  disabled={statusMutation.isPending}
+                  aria-label="Error actions"
+                >
+                  <MoreVertical className="h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
                 {(errorGroup as any).status !== 'resolved' && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => updateStatus('resolved')}
-                    disabled={statusMutation.isPending}
-                  >
-                    <Check className="h-4 w-4 mr-1.5" />
+                  <DropdownMenuItem onClick={() => updateStatus('resolved')}>
+                    <Check className="mr-2 h-4 w-4" />
                     Resolve
-                  </Button>
+                  </DropdownMenuItem>
                 )}
                 {(errorGroup as any).status !== 'ignored' && (errorGroup as any).status !== 'resolved' && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => updateStatus('ignored')}
-                    disabled={statusMutation.isPending}
-                  >
-                    <EyeOff className="h-4 w-4 mr-1.5" />
+                  <DropdownMenuItem onClick={() => updateStatus('ignored')}>
+                    <EyeOff className="mr-2 h-4 w-4" />
                     Ignore
-                  </Button>
+                  </DropdownMenuItem>
                 )}
                 {((errorGroup as any).status === 'resolved' || (errorGroup as any).status === 'ignored') && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => updateStatus('unresolved')}
-                    disabled={statusMutation.isPending}
-                  >
-                    <RotateCcw className="h-4 w-4 mr-1.5" />
+                  <DropdownMenuItem onClick={() => updateStatus('unresolved')}>
+                    <RotateCcw className="mr-2 h-4 w-4" />
                     Unresolve
-                  </Button>
+                  </DropdownMenuItem>
                 )}
-              </div>
-            </div>
-            <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm text-muted-foreground">
-              {(errorGroup as any).status && (errorGroup as any).status !== 'unresolved' && (
-                <Badge variant={(errorGroup as any).status === 'resolved' ? 'default' : 'secondary'} className="text-xs">
-                  {(errorGroup as any).status}
-                </Badge>
-              )}
-              <span>{errorGroup.total_count || 0} occurrences</span>
-              <span>•</span>
-              <span>
-                First seen <TimeAgo date={errorGroup.first_seen} />
-              </span>
-              <span>•</span>
-              <span>
-                Last seen <TimeAgo date={errorGroup.last_seen} />
-              </span>
-            </div>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
       </div>

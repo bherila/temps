@@ -129,6 +129,16 @@ export function RedeploymentModal({
     }
   }, [isOpen, defaultCommit, defaultTag, defaultType])
 
+  // Auto-select the repo's default branch once it resolves, so the modal opens
+  // with the default branch pre-selected instead of an empty "Select a branch"
+  // state. Only fills an empty selection — never overrides a user's pick or an
+  // environment-derived branch.
+  useEffect(() => {
+    if (!isOpen || mode !== 'new' || deploymentType !== 'branch') return
+    if (selectedBranch || !initialBranch) return
+    setSelectedBranch(initialBranch)
+  }, [isOpen, mode, deploymentType, selectedBranch, initialBranch])
+
   // When environment selection changes, automatically select its branch
   useEffect(() => {
     if (!selectedEnvironment || !environmentsQuery.data) return

@@ -40,6 +40,17 @@ pub struct Model {
     pub git_provider_connection_id: Option<i32>,
     /// Attack mode - when enabled, requires CAPTCHA verification for all visitors
     pub attack_mode: bool,
+    /// ADR-021 Tier 2: opt-in AI summarization of metric alert notifications for
+    /// this project. NULL/false = off (the deterministic Tier-1 text is used);
+    /// true = enrich with the configured AI provider when one is available.
+    pub ai_alert_summaries_enabled: Option<bool>,
+    /// ADR-023: opt-in AI debugging chat (e.g. on deployment failures) for this
+    /// project. NULL/false = off; true = offer the chat when AI is configured.
+    pub ai_debug_chat_enabled: Option<bool>,
+    /// Opt-in for the AI propose-then-confirm write-action feature. When false
+    /// (the default), the AI may only read data; write-action proposals are
+    /// suppressed. Operators enable this per-project via the UI.
+    pub ai_write_actions_enabled: bool,
     /// Enable automatic preview environment creation for each branch
     pub enable_preview_environments: bool,
     /// When true, preview environments auto-created for branches are
@@ -68,6 +79,34 @@ pub struct Model {
     /// Never serialized in API responses.
     #[serde(skip_serializing)]
     pub gitlab_webhook_signing_token: Option<String>,
+    /// Encrypted HMAC-SHA256 signing token for Gitea webhook signature verification.
+    /// Sent as the `secret` field when creating the Gitea repo hook.
+    /// Never serialized in API responses (MUST-FIX 5).
+    #[serde(skip_serializing)]
+    pub gitea_webhook_signing_token: Option<String>,
+    /// Encrypted secret-in-path token for Bitbucket webhook delivery URL.
+    /// Embedded in the webhook callback URL path instead of HMAC (Bitbucket
+    /// Cloud does not provide HMAC body signing).
+    /// Never serialized in API responses (MUST-FIX 5).
+    #[serde(skip_serializing)]
+    pub bitbucket_webhook_token: Option<String>,
+    /// The hook UUID returned by Bitbucket when we auto-registered the webhook
+    /// via `POST /2.0/repositories/{workspace}/{slug}/hooks`. Stored so we can
+    /// `DELETE` it on disconnect. Bitbucket UUIDs include braces: `{uuid-v4}`.
+    /// NULL when no auto-registered hook exists for this project.
+    pub bitbucket_webhook_hook_id: Option<String>,
+    /// Encrypted secret-in-path token for Generic/Manual git provider webhook URL.
+    /// Embedded in the webhook callback URL path.
+    /// Never serialized in API responses (MUST-FIX 5).
+    #[serde(skip_serializing)]
+    pub generic_webhook_token: Option<String>,
+    /// ADR-027 Phase 3: whether this project's traces appear in cross-project
+    /// discovery results. TRUE (the default) is consistent with the OSS
+    /// global-observability model where any OtelRead holder can query any
+    /// project's telemetry. Operators who want private-by-default can set this
+    /// to FALSE; cross-project links to this project will then be suppressed.
+    #[sea_orm(default_value = "true")]
+    pub cross_project_trace_sharing: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -81,79 +81,22 @@ echo -e "${GREEN}Version updated in:${NC}"
 echo "  - Cargo.toml"
 echo "  - crates/temps-cli/Cargo.toml"
 
-# Check if CHANGELOG.md exists
-if [ ! -f "CHANGELOG.md" ]; then
-    echo -e "${YELLOW}CHANGELOG.md not found. Creating template...${NC}"
-    cat > CHANGELOG.md << EOF
-# Changelog
-
-All notable changes to this project will be documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-## [Unreleased]
-
-### Added
-- Initial release
-
-### Changed
--
-
-### Fixed
--
-
-EOF
-    echo -e "${GREEN}Created CHANGELOG.md template${NC}"
-fi
-
-# Check if [Unreleased] section exists
-if ! grep -q "## \[Unreleased\]" CHANGELOG.md; then
-    echo -e "${RED}Error: CHANGELOG.md is missing [Unreleased] section${NC}"
-    echo "Please add an [Unreleased] section with your changes"
+# Regenerate CHANGELOG.md from Conventional Commits with git-cliff.
+# CHANGELOG.md is a generated artifact — it is NOT hand-edited in PRs (see
+# CONTRIBUTING.md). All entries come from commit messages, so releases never
+# hit merge conflicts on this file.
+if ! command -v git-cliff >/dev/null 2>&1; then
+    echo -e "${RED}Error: git-cliff is not installed${NC}"
+    echo "Install it with: cargo install git-cliff   (or: brew install git-cliff)"
     exit 1
 fi
 
-# Check if there are any entries in Unreleased
-if ! grep -A 20 "## \[Unreleased\]" CHANGELOG.md | grep -q "^- "; then
-    echo -e "${YELLOW}Warning: [Unreleased] section appears to be empty${NC}"
-    echo -e "${YELLOW}Please add your changes before continuing${NC}"
-    echo -e "${YELLOW}See .github/CHANGELOG_TEMPLATE.md for examples${NC}"
-    echo ""
-    echo -e "${YELLOW}Continue anyway? (y/N)${NC}"
-    read -r CONTINUE
-    if [ "$CONTINUE" != "y" ] && [ "$CONTINUE" != "Y" ]; then
-        echo "Aborted"
-        exit 1
-    fi
-fi
-
-echo -e "${GREEN}Converting [Unreleased] to [${VERSION}]...${NC}"
-
-# Create backup
-cp CHANGELOG.md CHANGELOG.md.bak
-
-# Replace [Unreleased] with version and date, and add new [Unreleased] section
-TODAY=$(date +%Y-%m-%d)
-sed -i.tmp "s/## \[Unreleased\]/## [${VERSION}] - ${TODAY}/" CHANGELOG.md && rm CHANGELOG.md.tmp
-
-# Add new [Unreleased] section at the top
-sed -i.tmp "/^## \[${VERSION}\]/i\\
-## [Unreleased]\\
-\\
-### Added\\
--\\
-\\
-### Changed\\
--\\
-\\
-### Fixed\\
--\\
-\\
-" CHANGELOG.md && rm CHANGELOG.md.tmp
+echo -e "${GREEN}Regenerating CHANGELOG.md for v${VERSION} with git-cliff...${NC}"
+# --tag assigns the current unreleased commits to the v${VERSION} section.
+git-cliff --tag "v${VERSION}" -o CHANGELOG.md
 
 echo -e "${GREEN}Updated CHANGELOG.md${NC}"
-echo -e "${YELLOW}Review the changes and make any needed edits${NC}"
+echo -e "${YELLOW}Review the generated changelog and make any needed edits${NC}"
 echo -e "${YELLOW}Press Enter when ready to continue...${NC}"
 read -r
 

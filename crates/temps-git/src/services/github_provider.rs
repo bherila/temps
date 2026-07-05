@@ -1,6 +1,7 @@
 use super::git_provider::{
     AuthMethod, Branch, Commit, FileContent, GitProviderError, GitProviderService, GitProviderTag,
-    GitProviderType, PullRequest, Repository, ScopedTokenGrant, ScopedTokenOp, User, WebhookConfig,
+    GitProviderType, PullRequest, RepoDirEntry, Repository, ScopedTokenGrant, ScopedTokenOp, User,
+    WebhookConfig,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -1162,9 +1163,17 @@ impl GitProviderService for GitHubProvider {
         let client = self.get_client();
         let headers = self.get_headers(access_token);
 
+        // Percent-encode the path so model/user-supplied paths can't break out
+        // of the Contents API URL (e.g. injecting `?`/`#`/`..%2f`). Encode each
+        // segment individually so the `/` separators are preserved.
+        let encoded_path = path
+            .split('/')
+            .map(|segment| urlencoding::encode(segment).into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
         let mut url = format!(
             "{}/repos/{}/{}/contents/{}",
-            self.api_url, owner, repo, path
+            self.api_url, owner, repo, encoded_path
         );
         if let Some(ref_name) = branch {
             url.push_str(&format!("?ref={}", ref_name));
@@ -1198,6 +1207,104 @@ impl GitProviderService for GitHubProvider {
             content: file.content,
             encoding: file.encoding,
         })
+    }
+
+    async fn list_directory(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        reference: Option<&str>,
+    ) -> Result<Vec<RepoDirEntry>, GitProviderError> {
+        let client = self.get_client();
+        let headers = self.get_headers(access_token);
+
+        // Percent-encode each path segment individually so `/` separators are
+        // preserved but user-supplied characters can't break the URL.
+        let encoded_path = path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|segment| urlencoding::encode(segment).into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+
+        let mut url = format!(
+            "{}/repos/{}/{}/contents/{}",
+            self.api_url, owner, repo, encoded_path
+        );
+        if let Some(ref_name) = reference {
+            url.push_str(&format!("?ref={}", urlencoding::encode(ref_name)));
+        }
+
+        let response = self
+            .send_with_retry(|| client.get(&url).headers(headers.clone()))
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(GitProviderError::ApiError(format!(
+                "Failed to list directory '{path}' in {owner}/{repo}: {}",
+                response.status()
+            )));
+        }
+
+        // The Contents API returns either a JSON array (directory) or a single
+        // object (file). Detect which one by peeking at the raw value.
+        #[derive(Deserialize)]
+        struct GitHubContentItem {
+            name: String,
+            path: String,
+            #[serde(rename = "type")]
+            item_type: String,
+            size: Option<u64>,
+        }
+
+        let body_bytes = response.bytes().await.map_err(|e| {
+            GitProviderError::ApiError(format!(
+                "Failed to read directory listing response body: {e}"
+            ))
+        })?;
+
+        // Try to decode as an array first; fall back to a single-item wrapper
+        // so callers that accidentally point at a file still get a useful result.
+        let items: Vec<GitHubContentItem> =
+            if let Ok(arr) = serde_json::from_slice::<Vec<GitHubContentItem>>(&body_bytes) {
+                arr
+            } else {
+                match serde_json::from_slice::<GitHubContentItem>(&body_bytes) {
+                    Ok(single) => vec![single],
+                    Err(e) => {
+                        return Err(GitProviderError::ApiError(format!(
+                            "Failed to parse directory listing for '{path}' in {owner}/{repo}: {e}"
+                        )));
+                    }
+                }
+            };
+
+        let mut entries: Vec<RepoDirEntry> = items
+            .into_iter()
+            .map(|item| {
+                let is_dir = item.item_type == "dir";
+                // Only surface size for plain files; dirs and symlinks report 0 or
+                // meaningless values from the API.
+                let size = if item.item_type == "file" {
+                    item.size
+                } else {
+                    None
+                };
+                RepoDirEntry {
+                    name: item.name,
+                    path: item.path,
+                    is_dir,
+                    size,
+                }
+            })
+            .collect();
+
+        // Sort: directories first, then alphabetically by name within each group.
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+
+        Ok(entries)
     }
 
     async fn get_latest_commit(
@@ -2526,5 +2633,91 @@ mod archive_redirect_tests {
         // `codeload.github.com.` ends with `com.`, not `.github.com` → rejected.
         // Locks in url-crate parsing behavior against dependency bumps.
         assert!(check(None, "https://codeload.github.com./foo").is_err());
+    }
+}
+
+#[cfg(test)]
+mod list_directory_tests {
+    use super::*;
+
+    /// Simulate the mapping + sort logic that `list_directory` applies to the
+    /// raw GitHub Contents API items. This exercises the production code path
+    /// without making any HTTP calls.
+    fn map_and_sort(items: Vec<(&str, &str, &str, Option<u64>)>) -> Vec<RepoDirEntry> {
+        // (name, path, type, size)
+        let mut entries: Vec<RepoDirEntry> = items
+            .into_iter()
+            .map(|(name, path, item_type, size)| {
+                let is_dir = item_type == "dir";
+                let size = if item_type == "file" { size } else { None };
+                RepoDirEntry {
+                    name: name.to_string(),
+                    path: path.to_string(),
+                    is_dir,
+                    size,
+                }
+            })
+            .collect();
+
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+        entries
+    }
+
+    #[test]
+    fn dirs_sorted_before_files() {
+        let entries = map_and_sort(vec![
+            ("main.rs", "src/main.rs", "file", Some(1024)),
+            ("lib", "lib", "dir", None),
+            ("README.md", "README.md", "file", Some(512)),
+            ("src", "src", "dir", None),
+        ]);
+
+        // First two must be dirs
+        assert!(entries[0].is_dir, "first entry should be a dir");
+        assert!(entries[1].is_dir, "second entry should be a dir");
+        // Dirs sorted by name: lib < src
+        assert_eq!(entries[0].name, "lib");
+        assert_eq!(entries[1].name, "src");
+        // Files follow, sorted by name: README.md < main.rs
+        assert!(!entries[2].is_dir);
+        assert!(!entries[3].is_dir);
+        assert_eq!(entries[2].name, "README.md");
+        assert_eq!(entries[3].name, "main.rs");
+    }
+
+    #[test]
+    fn file_size_populated_for_files_only() {
+        let entries = map_and_sort(vec![
+            ("Cargo.toml", "Cargo.toml", "file", Some(256)),
+            ("tests", "tests", "dir", None),
+            ("link.rs", "link.rs", "symlink", Some(0)),
+        ]);
+
+        let cargo = entries.iter().find(|e| e.name == "Cargo.toml").unwrap();
+        assert_eq!(cargo.size, Some(256));
+
+        let tests = entries.iter().find(|e| e.name == "tests").unwrap();
+        assert_eq!(tests.size, None, "dirs must not carry size");
+
+        let link = entries.iter().find(|e| e.name == "link.rs").unwrap();
+        assert_eq!(link.size, None, "symlinks must not carry size");
+        assert!(!link.is_dir);
+    }
+
+    #[test]
+    fn empty_directory_returns_empty_vec() {
+        let entries = map_and_sort(vec![]);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn single_file_response_maps_correctly() {
+        // When the API returns a single object (file, not dir), we wrap it in a
+        // vec and produce one entry.
+        let entries = map_and_sort(vec![("Cargo.toml", "Cargo.toml", "file", Some(1024))]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Cargo.toml");
+        assert!(!entries[0].is_dir);
+        assert_eq!(entries[0].size, Some(1024));
     }
 }

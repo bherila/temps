@@ -17,6 +17,7 @@ use crate::error::OtelError;
 use crate::ingest::auth::{IngestAuth, ServiceAuth};
 use crate::ingest::decode;
 use crate::proto;
+use crate::services::cross_project::{is_valid_trace_id, TraceHintMsg};
 use crate::types::{MetricPoint as OtlpMetricPoint, MetricType};
 use crate::OtelAppState;
 use temps_core::problemdetails::{self, Problem};
@@ -62,6 +63,18 @@ impl From<OtelError> for Problem {
                 warn!(error = %error, "OTel ingest project not found");
                 problemdetails::new(StatusCode::NOT_FOUND)
                     .with_title("Project Not Found")
+                    .with_detail(error.to_string())
+            }
+            OtelError::DashboardNotFound { .. } => {
+                warn!(error = %error, "OTel dashboard not found");
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Dashboard Not Found")
+                    .with_detail(error.to_string())
+            }
+            OtelError::MetricAlertNotFound { .. } => {
+                warn!(error = %error, "OTel metric alert rule not found");
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Metric Alert Rule Not Found")
                     .with_detail(error.to_string())
             }
             OtelError::Storage { .. }
@@ -574,7 +587,45 @@ async fn do_ingest_traces(
         );
     }
 
+    // ADR-027 Phase 0: collect distinct trace_ids before moving `spans` into
+    // `ingest_spans`.  We fire the hint AFTER ingest succeeds so that only
+    // durably-stored spans produce discovery rows.
+    // Only well-formed (32-char lowercase hex) trace_ids become discovery rows.
+    // OTLP-decoded ids are always valid, but this guards against ever writing
+    // keys the read path (which validates the same way) could never match.
+    let hint_trace_ids: std::collections::HashSet<String> = spans
+        .iter()
+        .map(|s| s.trace_id.clone())
+        .filter(|tid| is_valid_trace_id(tid))
+        .collect();
+
     let stored = state.otel_service.ingest_spans(spans).await?;
+
+    // Forward cross-project trace hint to the bounded background writer.
+    // `try_send` never blocks the OTLP HTTP response; on Full/Closed we warn
+    // and drop — hint loss is non-fatal (re-populated by the next ingest batch).
+    if let Some(ref tx) = state.trace_hint_tx {
+        use tokio::sync::mpsc::error::TrySendError;
+        let msg = TraceHintMsg {
+            trace_ids: hint_trace_ids,
+            project_id: ctx.project_id,
+        };
+        match tx.try_send(msg) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                warn!(
+                    project_id = ctx.project_id,
+                    "cross_project trace hint channel full; hint dropped (backpressure — non-fatal)"
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                warn!(
+                    project_id = ctx.project_id,
+                    "cross_project trace hint channel closed unexpectedly; hint dropped"
+                );
+            }
+        }
+    }
 
     debug!(
         project_id = ctx.project_id,
@@ -1134,23 +1185,18 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn make_otlp_point(metric_type: MetricType, value: f64) -> OtlpMetricPoint {
-        OtlpMetricPoint {
-            project_id: 1,
-            deployment_id: Some(42),
-            resource: ResourceInfo::default(),
-            metric_name: "test.metric".to_string(),
+        let mut p = OtlpMetricPoint::skeleton(
+            1,
+            Some(42),
+            ResourceInfo::default(),
+            "test.metric".to_string(),
             metric_type,
-            unit: "count".to_string(),
-            timestamp: chrono::Utc::now(),
-            value: Some(value),
-            histogram_count: None,
-            histogram_sum: None,
-            histogram_min: None,
-            histogram_max: None,
-            histogram_bounds: None,
-            histogram_bucket_counts: None,
-            attributes: BTreeMap::new(),
-        }
+            "count".to_string(),
+            chrono::Utc::now(),
+            BTreeMap::new(),
+        );
+        p.value = Some(value);
+        p
     }
 
     /// CORRECTNESS(metrics-correctness-B): OTLP Sum must be stored as Gauge,

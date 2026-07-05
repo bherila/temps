@@ -369,6 +369,24 @@ pub struct FileContent {
     pub encoding: String, // base64, utf-8, etc.
 }
 
+/// A single entry returned by [`GitProviderService::list_directory`].
+///
+/// Represents one file or subdirectory at a given path in a repository tree.
+/// Entries are non-recursive: only the immediate children of the requested
+/// path are returned, not their descendants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoDirEntry {
+    /// The entry's base name (e.g. `"main.rs"`, `"src"`).
+    pub name: String,
+    /// Repo-relative path from the repository root (e.g. `"src/main.rs"`).
+    pub path: String,
+    /// `true` for a directory/tree node; `false` for a file/blob or symlink.
+    pub is_dir: bool,
+    /// File size in bytes when the provider returns it; `None` for directories
+    /// and for providers that do not surface size in the tree listing.
+    pub size: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookConfig {
     pub url: String,
@@ -562,6 +580,22 @@ pub trait GitProviderService: Send + Sync {
         path: &str,
         branch: Option<&str>,
     ) -> Result<FileContent, GitProviderError>;
+
+    /// List the entries (files + subdirectories, one level, non-recursive) at
+    /// `path` in the repository at the given `reference` (branch, tag, or
+    /// commit SHA). An empty `path` lists the repository root.
+    ///
+    /// The returned vec is sorted directories-first, then by name within each
+    /// group. Providers that do not return size information set
+    /// [`RepoDirEntry::size`] to `None`.
+    async fn list_directory(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        reference: Option<&str>,
+    ) -> Result<Vec<RepoDirEntry>, GitProviderError>;
 
     /// Get latest commit for a branch
     async fn get_latest_commit(
@@ -794,16 +828,24 @@ impl GitProviderFactory {
                 Ok(Box::new(GitLabProvider::new(base_url, auth_method)))
             }
             GitProviderType::Bitbucket => {
-                // Future implementation
-                Err(GitProviderError::NotImplemented)
+                use crate::services::bitbucket_provider::BitbucketProvider;
+                Ok(Box::new(BitbucketProvider::new(auth_method)))
             }
             GitProviderType::Gitea => {
-                // Future implementation
-                Err(GitProviderError::NotImplemented)
+                use crate::services::gitea_provider::GiteaProvider;
+                let url = base_url.ok_or_else(|| {
+                    GitProviderError::InvalidConfiguration(
+                        "Gitea provider requires a base_url \
+                         (e.g. https://git.example.com). \
+                         Validate with HTTPS before passing here."
+                            .to_string(),
+                    )
+                })?;
+                Ok(Box::new(GiteaProvider::new(url, auth_method)))
             }
             GitProviderType::Generic => {
-                // Future implementation for generic git servers
-                Err(GitProviderError::NotImplemented)
+                use crate::services::generic_provider::GenericProvider;
+                Ok(Box::new(GenericProvider::new(base_url, auth_method)))
             }
         }
     }

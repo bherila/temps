@@ -122,6 +122,23 @@ mod m20260618_000001_create_on_demand_cert_attempts;
 mod m20260618_000002_add_domains_on_demand_backoff;
 mod m20260619_000001_add_settings_change_trigger;
 mod m20260621_000001_create_telemetry_milestones;
+mod m20260626_000001_create_metric_dashboards;
+mod m20260626_000002_create_metric_alert_rules;
+mod m20260627_000001_add_ai_alert_summaries;
+mod m20260627_000001_node_enrollment_tokens;
+mod m20260627_000002_create_ai_conversations;
+mod m20260628_000001_add_node_to_log_chunks;
+mod m20260628_000001_otel_spans_root_index;
+mod m20260629_000001_otel_metrics_full_fidelity;
+mod m20260629_000002_add_provider_default_model;
+mod m20260630_000001_add_ai_pending_actions_and_write_toggle;
+mod m20260701_000001_add_ai_action_plans;
+mod m20260701_000001_add_provider_webhook_tokens;
+mod m20260701_000002_add_bitbucket_webhook_hook_id;
+mod m20260702_000001_add_label_filters_to_metric_alert_rules;
+mod m20260702_000002_add_dynamic_alerting_to_metric_alert_rules;
+mod m20260702_000003_add_grouped_threshold_and_series_state_to_metric_alert_rules;
+mod m20260703_000001_cross_project_trace_refs;
 
 pub struct Migrator;
 
@@ -247,6 +264,25 @@ impl MigratorTrait for Migrator {
             Box::new(m20260618_000002_add_domains_on_demand_backoff::Migration),
             Box::new(m20260619_000001_add_settings_change_trigger::Migration),
             Box::new(m20260621_000001_create_telemetry_milestones::Migration),
+            Box::new(m20260626_000001_create_metric_dashboards::Migration),
+            Box::new(m20260626_000002_create_metric_alert_rules::Migration),
+            Box::new(m20260627_000001_add_ai_alert_summaries::Migration),
+            Box::new(m20260627_000001_node_enrollment_tokens::Migration),
+            Box::new(m20260627_000002_create_ai_conversations::Migration),
+            Box::new(m20260628_000001_add_node_to_log_chunks::Migration),
+            Box::new(m20260628_000001_otel_spans_root_index::Migration),
+            Box::new(m20260629_000001_otel_metrics_full_fidelity::Migration),
+            Box::new(m20260629_000002_add_provider_default_model::Migration),
+            Box::new(m20260630_000001_add_ai_pending_actions_and_write_toggle::Migration),
+            Box::new(m20260701_000001_add_ai_action_plans::Migration),
+            Box::new(m20260701_000001_add_provider_webhook_tokens::Migration),
+            Box::new(m20260701_000002_add_bitbucket_webhook_hook_id::Migration),
+            Box::new(m20260702_000001_add_label_filters_to_metric_alert_rules::Migration),
+            Box::new(m20260702_000002_add_dynamic_alerting_to_metric_alert_rules::Migration),
+            Box::new(
+                m20260702_000003_add_grouped_threshold_and_series_state_to_metric_alert_rules::Migration,
+            ),
+            Box::new(m20260703_000001_cross_project_trace_refs::Migration),
         ]
     }
 }

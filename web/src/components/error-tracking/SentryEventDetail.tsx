@@ -151,15 +151,15 @@ export function SentryEventDetail({
                 {/* Exception Details - Information Dense */}
                 <Card>
                   <CardHeader>
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <CardTitle>
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <CardTitle className="text-lg sm:text-xl">
                           {exceptions.length > 1
                             ? `Exception ${exceptionIndex + 1} of ${exceptions.length}`
                             : 'Exception Details'}
                         </CardTitle>
                         {exception.type && (
-                          <CardDescription className="font-mono">
+                          <CardDescription className="font-mono truncate">
                             {exception.type}
                           </CardDescription>
                         )}
@@ -167,6 +167,7 @@ export function SentryEventDetail({
                       <Button
                         variant="ghost"
                         size="sm"
+                        className="shrink-0"
                         onClick={() =>
                           copyToClipboard(
                             `${exception.type || 'Error'}: ${exception.value}`,

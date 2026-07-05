@@ -1026,12 +1026,20 @@ mod tests {
             git_provider_connection_id: if has_git { Some(1) } else { None },
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
+            gitea_webhook_signing_token: None,
+            bitbucket_webhook_token: None,
+            bitbucket_webhook_hook_id: None,
+            generic_webhook_token: None,
             attack_mode: false,
+            ai_alert_summaries_enabled: None,
+            ai_debug_chat_enabled: None,
+            ai_write_actions_enabled: false,
             enable_preview_environments: false,
             preview_envs_on_demand: false,
             preview_envs_idle_timeout_seconds: 300,
             preview_envs_wake_timeout_seconds: 30,
             source_type: temps_entities::source_type::SourceType::Git,
+            cross_project_trace_sharing: true,
         }
     }
 
