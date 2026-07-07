@@ -16383,6 +16383,7 @@ export type AppSettingsResponse = {
      * effective backend and warns when it diverges from the configured store.
      */
     effective_metrics_store: MetricsStoreKind;
+    edge_target?: string | null;
     external_url?: string | null;
     insecure_tls: boolean;
     internal_url?: string | null;
@@ -16391,7 +16392,6 @@ export type AppSettingsResponse = {
     multi_node: MultiNodeSettingsMasked;
     preview_domain: string;
     preview_gateway: PreviewGatewaySettingsMasked;
-    public_hostnames: PublicHostnameSettings;
     rate_limiting: RateLimitSettings;
     /**
      * When enabled, Admin-role accounts without MFA enrolled are rejected
@@ -16408,22 +16408,8 @@ export type AppSettingsResponse = {
 };
 
 /**
- * Operator-configurable templates for generated public hostnames.
- *
- * Templates may use `{base_domain}`, `{environment}`, `{service}`,
- * `{deployment}`, `{project}`, `{app}`, `{branch}`, `{preview_slug}`, and
- * `{short_hash}`. When `strategy = flat`, all generated labels before
- * `{base_domain}` are collapsed into a single DNS label.
- */
-export type PublicHostnameSettings = {
-    deployment_template?: string | null;
-    environment_template?: string | null;
-    service_template?: string | null;
-    strategy?: PublicHostnameStrategy;
-};
-
-/**
  * Public hostname generation mode for Temps-managed preview routes.
+ * Stored per managed domain (`generated_hostname_mode`), not globally.
  */
 export type PublicHostnameStrategy = 'standard' | 'flat';
 
@@ -16503,6 +16489,7 @@ export type AppSettings = {
     disk_space_alert?: DiskSpaceAlertSettings;
     dns_provider?: DnsProviderSettings;
     docker_registry?: DockerRegistrySettings;
+    edge_target?: string | null;
     external_url?: string | null;
     /**
      * Skip TLS certificate verification on outbound HTTP clients built by the
@@ -16531,7 +16518,6 @@ export type AppSettings = {
     on_demand_tls?: OnDemandTlsSettings;
     preview_domain?: string;
     preview_gateway?: PreviewGatewaySettings;
-    public_hostnames?: PublicHostnameSettings;
     rate_limiting?: RateLimitSettings;
     /**
      * When `true`, any user holding the `Admin` role must have MFA enrolled
