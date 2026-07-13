@@ -505,7 +505,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
         let source_map_state = Arc::new(crate::handlers::source_map_handlers::SourceMapAppState {
             source_map_service: source_map_service.clone(),
             audit_service: audit_service.clone(),
-            project_access_checker,
+            project_access_checker: project_access_checker.clone(),
         });
         let source_map_routes = crate::handlers::source_map_handlers::configure_source_map_routes()
             .with_state(source_map_state);
@@ -515,6 +515,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
         let monitor_state = Arc::new(crate::handlers::monitor_handlers::MonitorAppState {
             monitor_service,
             audit_service: audit_service.clone(),
+            project_access_checker,
         });
         let monitor_routes =
             crate::handlers::monitor_handlers::configure_monitor_routes().with_state(monitor_state);
