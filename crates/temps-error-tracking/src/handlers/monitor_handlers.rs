@@ -9,7 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use temps_entities::{monitor_check_ins, monitors};
 use utoipa::{IntoParams, OpenApi, ToSchema};
@@ -34,6 +34,7 @@ pub struct MonitorApiDoc;
 pub struct MonitorAppState {
     pub monitor_service: Arc<MonitorService>,
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 pub fn configure_monitor_routes() -> Router<Arc<MonitorAppState>> {
@@ -177,6 +178,7 @@ pub async fn list_monitors(
 ) -> Result<Json<MonitorListResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (items, total) = state
         .monitor_service
@@ -210,6 +212,7 @@ pub async fn get_monitor(
 ) -> Result<Json<MonitorResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let monitor = state
         .monitor_service
@@ -241,6 +244,7 @@ pub async fn update_monitor(
 ) -> Result<Json<MonitorResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let monitor = state
         .monitor_service
@@ -282,6 +286,7 @@ pub async fn list_monitor_check_ins(
 ) -> Result<Json<MonitorCheckInListResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
     project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (items, total) = state
         .monitor_service
