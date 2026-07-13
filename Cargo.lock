@@ -11412,7 +11412,7 @@ dependencies = [
  "axum-macros",
  "axum-test",
  "chrono",
- "cron 0.15.0",
+ "cron",
  "debugid",
  "flate2",
  "futures",
