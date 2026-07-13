@@ -11286,6 +11286,10 @@ export type ProjectResponse = {
      */
     gitlab_webhook_id?: number | null;
     id: number;
+    /**
+     * Hours to retain built Docker images before nightly cleanup. Null = system default (48 h).
+     */
+    image_retention_hours?: number | null;
     last_deployment?: number | null;
     main_branch: string;
     name: string;
@@ -16152,6 +16156,10 @@ export type UpdateProjectSettingsRequest = {
      * Enable automatic preview environment creation for each branch
      */
     enable_preview_environments?: boolean | null;
+    /**
+     * Hours to retain built Docker images. Omit = unchanged; null = use system default.
+     */
+    image_retention_hours?: number | null;
     git_provider_connection_id?: number | null;
     main_branch?: string | null;
     preset?: string | null;
