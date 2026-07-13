@@ -19,7 +19,7 @@ tracing = { workspace = true }
 
 # ClickHouse metrics store (opt-in via TEMPS_CLICKHOUSE_*; TimescaleDB remains
 # the default). Version/features mirror temps-otel's CH backend.
-clickhouse = { version = "0.13", features = ["uuid", "chrono"] }
+clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
 
 # Scraper: entity access and config
 temps-core = { path = "../temps-core" }
@@ -29,9 +29,10 @@ temps-entities = { path = "../temps-entities" }
 # Postgres collector
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 
-# MongoDB collector
+# MongoDB collector. Use mongodb's own re-exported `mongodb::bson` types
+# rather than a standalone `bson` dependency — a standalone version can drift
+# out of sync with whatever bson version `mongodb` pins internally.
 mongodb = "3.7.0"
-bson = "2.13"
 
 # Redis collector
 redis = { workspace = true }
@@ -44,3 +45,6 @@ reqwest = { workspace = true }
 
 # Node collector (Linux /proc + statvfs)
 libc = "0.2"
+
+[dev-dependencies]
+testcontainers = { workspace = true }

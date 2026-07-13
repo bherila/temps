@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use argon2::password_hash::PasswordHash;
 use argon2::{Argon2, PasswordVerifier};
 use dashmap::DashMap;
+use moka::future::Cache;
 use sea_orm::EntityTrait;
 use temps_core::CookieCrypto;
 use temps_database::DbConnection;
@@ -64,6 +65,27 @@ impl PreviewHost {
     pub fn label(&self) -> &str {
         &self.hex
     }
+}
+
+/// Derives a Pingora connection-pool partition key (`HttpPeer::group_key`)
+/// from a preview target. All preview traffic is forwarded through the same
+/// physical peer (`PREVIEW_GATEWAY_PEER`), so without a distinguishing
+/// `group_key`, every sandbox's requests look like the same logical peer to
+/// Pingora's connection pool: pooling is keyed by `Peer::reuse_hash()`
+/// (`HttpPeer`'s hash includes `group_key`, address, scheme, and SNI — see
+/// pingora-core's `upstreams/peer.rs`), and a pooled keep-alive connection
+/// opened while serving one sandbox can be handed back out to serve a
+/// different sandbox's request on a completely different hostname —
+/// silently splicing one app's bytes into another's response. Folding the
+/// target hex+port into `group_key` makes each sandbox+port combination its
+/// own pool partition, so a connection can never cross between them.
+pub fn preview_peer_group_key(host: &PreviewHost) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    host.hex.hash(&mut hasher);
+    host.port.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Parse a hostname against `ws-<hex>-<port>.<preview_domain>`.
@@ -301,7 +323,7 @@ pub fn verify_argon2(plaintext: &str, hash: &str) -> bool {
 /// Outcome of looking up a sandbox for preview auth. Distinguishes the
 /// three states that drive routing: doesn't exist, exists with no
 /// password (URL-only), exists with a configured password.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PreviewSandboxLookup {
     /// Sandbox exists and is live, with a password configured. The
     /// gateway should require a valid cookie or redirect to login.
@@ -358,6 +380,88 @@ pub async fn lookup_sandbox(
     }
 }
 
+/// TTL for sandbox lookup cache entries (both `Protected` and `NotFound`).
+///
+/// A 30-second window is acceptable because password rotation already
+/// invalidates cookies cryptographically (the cookie payload contains a
+/// SHA-256 fingerprint of the argon2 PHC hash — see `verify_preview_cookie_subject`).
+/// The only effect of a stale cache entry is that a brand-new login attempt
+/// for a sandbox whose password was just changed may verify against the old
+/// hash for up to 30 s; existing cookies are unaffected.
+const SANDBOX_LOOKUP_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Maximum number of sandbox lookup results to cache concurrently.
+const SANDBOX_LOOKUP_CACHE_MAX_CAPACITY: u64 = 10_000;
+
+/// In-memory cache for `lookup_sandbox` results on the proxy hot path.
+///
+/// Every request to a `ws-<hex>-<port>.<preview_domain>` host previously
+/// issued a `SELECT` against the `sandboxes` table. This cache eliminates
+/// that query for the common case of a sandbox the proxy has seen recently.
+///
+/// Both `Protected { password_hash }` and `NotFound` are cached. Caching
+/// `NotFound` is important for sandboxes that no longer exist — without it,
+/// repeated requests keep hitting Postgres even for destroyed sandboxes.
+///
+/// # Password rotation
+///
+/// Password rotation invalidates existing preview cookies immediately and
+/// cryptographically: each cookie payload encodes a SHA-256 fingerprint of
+/// the argon2 PHC hash (see [`verify_preview_cookie_subject`]). A stale
+/// cache entry (holding the old hash) causes at most a 30-second window where
+/// new login POSTs verify against the old hash — all existing cookies are
+/// unaffected because the fingerprint in the cookie no longer matches.
+pub struct SandboxLookupCache {
+    db: Arc<DbConnection>,
+    /// `sandbox_hex → PreviewSandboxLookup`. TTL 30 s, cap 10 k.
+    cache: Cache<String, PreviewSandboxLookup>,
+}
+
+impl SandboxLookupCache {
+    /// Create a new [`SandboxLookupCache`] with the production 30-second TTL.
+    pub fn new(db: Arc<DbConnection>) -> Self {
+        let cache = Cache::builder()
+            .max_capacity(SANDBOX_LOOKUP_CACHE_MAX_CAPACITY)
+            .time_to_live(SANDBOX_LOOKUP_CACHE_TTL)
+            .build();
+        Self { db, cache }
+    }
+
+    /// Internal constructor for tests — accepts an explicit TTL.
+    #[cfg(test)]
+    fn new_with_ttl(db: Arc<DbConnection>, ttl: Duration) -> Self {
+        let cache = Cache::builder()
+            .max_capacity(SANDBOX_LOOKUP_CACHE_MAX_CAPACITY)
+            .time_to_live(ttl)
+            .build();
+        Self { db, cache }
+    }
+
+    /// Look up a sandbox by its hex suffix, using the in-memory cache.
+    ///
+    /// Both hit and miss results are cached so repeated requests for the same
+    /// sandbox — including non-existent ones — never amplify into DB load.
+    pub async fn lookup(&self, hex: &str) -> PreviewSandboxLookup {
+        let key = hex.to_string();
+
+        // Fast path: previous lookup already resolved this hex.
+        if let Some(cached) = self.cache.get(&key).await {
+            debug!(hex, "sandbox-lookup cache hit (skipping DB)");
+            return cached;
+        }
+
+        // Cache miss: query the database.
+        let result = lookup_sandbox(&self.db, hex).await;
+        debug!(
+            hex,
+            found = !matches!(result, PreviewSandboxLookup::NotFound),
+            "sandbox DB lookup; caching result"
+        );
+        self.cache.insert(key, result.clone()).await;
+        result
+    }
+}
+
 /// Run the preview auth check for a parsed preview host (cookie-only).
 ///
 /// Order of operations:
@@ -371,14 +475,14 @@ pub async fn lookup_sandbox(
 /// only the login POST records failures (via [`PreviewAuthLimiter::record_failure`])
 /// so GETs without a cookie don't lock users out after a browser refresh.
 pub async fn check_preview_auth(
-    db: &Arc<DbConnection>,
+    cache: &SandboxLookupCache,
     crypto: &CookieCrypto,
     limiter: &PreviewAuthLimiter,
     host: PreviewHost,
     client_ip: IpAddr,
     cookie_header: Option<&str>,
 ) -> PreviewAuthOutcome {
-    let stored_hash = match lookup_sandbox(db, &host.hex).await {
+    let stored_hash = match cache.lookup(&host.hex).await {
         PreviewSandboxLookup::NotFound => {
             return PreviewAuthOutcome::NotFound { host };
         }
@@ -425,6 +529,47 @@ mod tests {
         assert_ne!(hash_fingerprint(hash_a), hash_fingerprint(hash_b));
         assert_eq!(hash_fingerprint(hash_a), hash_fingerprint(hash_a));
         assert_eq!(hash_fingerprint(hash_a).len(), 16);
+    }
+
+    #[test]
+    fn preview_peer_group_key_differs_for_different_sandboxes() {
+        let a = PreviewHost {
+            hex: "7702c56bfb804b49".into(),
+            port: 3000,
+        };
+        let b = PreviewHost {
+            hex: "c5d8e38f791dbc40".into(),
+            port: 3000,
+        };
+        assert_ne!(preview_peer_group_key(&a), preview_peer_group_key(&b));
+    }
+
+    #[test]
+    fn preview_peer_group_key_differs_for_different_ports_same_sandbox() {
+        // Same sandbox, two different exposed ports (e.g. HMR websocket vs.
+        // the app's own HTTP port) must not share a pooled connection.
+        let http = PreviewHost {
+            hex: "7702c56bfb804b49".into(),
+            port: 3000,
+        };
+        let ws = PreviewHost {
+            hex: "7702c56bfb804b49".into(),
+            port: 3001,
+        };
+        assert_ne!(preview_peer_group_key(&http), preview_peer_group_key(&ws));
+    }
+
+    #[test]
+    fn preview_peer_group_key_stable_for_same_target() {
+        let a = PreviewHost {
+            hex: "7702c56bfb804b49".into(),
+            port: 3000,
+        };
+        let a2 = PreviewHost {
+            hex: "7702c56bfb804b49".into(),
+            port: 3000,
+        };
+        assert_eq!(preview_peer_group_key(&a), preview_peer_group_key(&a2));
     }
 
     #[test]
@@ -535,6 +680,123 @@ mod tests {
             limiter.failures.len() <= MAX_TRACKED_ENTRIES,
             "limiter grew beyond cap: {}",
             limiter.failures.len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SandboxLookupCache tests
+    // -----------------------------------------------------------------------
+
+    use chrono::Utc;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use temps_entities::sandboxes;
+
+    /// Build a minimal sandboxes::Model for use in MockDatabase results.
+    fn sandbox_model(
+        public_id: &str,
+        status: &str,
+        password_hash: Option<&str>,
+    ) -> sandboxes::Model {
+        let now = Utc::now();
+        sandboxes::Model {
+            id: 1,
+            public_id: public_id.to_string(),
+            user_id: 1,
+            name: "test-sandbox".to_string(),
+            status: status.to_string(),
+            image: Some("ubuntu:22.04".to_string()),
+            work_dir: "/workspace".to_string(),
+            timeout_secs: 3600,
+            metadata: None,
+            created_at: now,
+            last_activity_at: now,
+            expires_at: now,
+            preview_password_hash: password_hash.map(|s| s.to_string()),
+            preview_password_hint: None,
+        }
+    }
+
+    /// A protected sandbox is cached after the first lookup; the second call
+    /// returns the cached result without a second DB query.
+    #[tokio::test]
+    async fn sandbox_cache_hit_avoids_second_db_call() {
+        let hash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let model = sandbox_model("sbx_7702c56bfb804b49", "running", Some(hash));
+
+        // Exactly ONE result queued — a second DB call would panic.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![model]])
+            .into_connection();
+
+        let cache = SandboxLookupCache::new(Arc::new(db));
+
+        // First call: cache miss → 1 DB query.
+        let first = cache.lookup("7702c56bfb804b49").await;
+        assert!(
+            matches!(first, PreviewSandboxLookup::Protected { .. }),
+            "expected Protected, got {:?}",
+            first
+        );
+
+        // Second call: cache hit → 0 DB queries (MockDatabase would panic if queried).
+        let second = cache.lookup("7702c56bfb804b49").await;
+        assert!(
+            matches!(second, PreviewSandboxLookup::Protected { .. }),
+            "expected cached Protected, got {:?}",
+            second
+        );
+    }
+
+    /// A missing sandbox resolves to NotFound which is also cached so repeated
+    /// requests for non-existent sandboxes don't amplify into DB load.
+    #[tokio::test]
+    async fn sandbox_cache_caches_not_found() {
+        // ONE empty result — second query would panic.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<sandboxes::Model>::new()])
+            .into_connection();
+
+        let cache = SandboxLookupCache::new(Arc::new(db));
+
+        let first = cache.lookup("deadbeef01234567").await;
+        assert!(
+            matches!(first, PreviewSandboxLookup::NotFound),
+            "expected NotFound, got {:?}",
+            first
+        );
+
+        // Second call served from cache, no DB query.
+        let second = cache.lookup("deadbeef01234567").await;
+        assert!(matches!(second, PreviewSandboxLookup::NotFound));
+    }
+
+    /// After the TTL expires the cache retries the DB.
+    #[tokio::test]
+    async fn sandbox_cache_retries_after_ttl_expiry() {
+        let hash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        // Two results queued: first=NotFound, second=Protected.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                Vec::<sandboxes::Model>::new(), // first call: not found
+                vec![sandbox_model("sbx_aabbccdd11223344", "running", Some(hash))], // second call after TTL
+            ])
+            .into_connection();
+
+        // Very short TTL so we can expire it in the test.
+        let cache = SandboxLookupCache::new_with_ttl(Arc::new(db), Duration::from_millis(1));
+
+        let first = cache.lookup("aabbccdd11223344").await;
+        assert!(matches!(first, PreviewSandboxLookup::NotFound));
+
+        // Wait for TTL to expire.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Second call after expiry — DB queried again.
+        let second = cache.lookup("aabbccdd11223344").await;
+        assert!(
+            matches!(second, PreviewSandboxLookup::Protected { .. }),
+            "expected Protected after TTL expiry, got {:?}",
+            second
         );
     }
 }

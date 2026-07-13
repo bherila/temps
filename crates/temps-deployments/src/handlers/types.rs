@@ -38,6 +38,23 @@ pub struct AppState {
     pub config_service: Arc<temps_config::ConfigService>,
     /// Docker client for container exec/terminal
     pub docker: Arc<bollard::Docker>,
+    /// Optional gate checked before manual-deploy handlers transition a
+    /// deployment to `Running` (e.g. a plugin implementing manual
+    /// approvals). `None` when no such plugin is registered — deploys
+    /// proceed unconditionally, matching today's behaviour. Safe to
+    /// resolve once here (unlike the job processor's `DeploymentGateSlot`):
+    /// `configure_routes` runs only after every plugin's
+    /// `initialize_plugin_services` has completed, so a registered gate is
+    /// guaranteed to already be present by this point. See
+    /// [`temps_core::DeploymentGate`].
+    pub deployment_gate: Option<Arc<dyn temps_core::DeploymentGate>>,
+    /// Optional checker enforcing team-based project access for human sessions.
+    ///
+    /// `None` when no plugin implementing this check is registered — the
+    /// `project_access_guard!` macro is a strict synchronous no-op in that
+    /// case. Resolved once in `configure_routes` via
+    /// `context.get_service::<dyn temps_core::ProjectAccessChecker>()`.
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 use crate::services::types::Deployment;

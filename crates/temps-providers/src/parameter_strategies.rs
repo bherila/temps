@@ -1,3 +1,4 @@
+use crate::externalsvc::{mariadb::MariaDbSizeProfile, ServiceResourceLimits};
 use serde_json::{json, Value as JsonValue};
 use std::collections::HashMap;
 
@@ -34,7 +35,9 @@ fn is_valid_pg_identifier(s: &str) -> bool {
         return false;
     }
     let mut chars = s.chars();
-    let first = chars.next().expect("non-empty checked above");
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !first.is_ascii_alphabetic() && first != '_' {
         return false;
     }
@@ -106,6 +109,144 @@ fn validate_postgres_credentials(params: &HashMap<String, JsonValue>) -> Result<
     Ok(())
 }
 
+fn is_valid_mariadb_identifier(s: &str) -> bool {
+    if s.is_empty() || s.len() > 63 {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().expect("non-empty checked above");
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn validate_mariadb_password(label: &str, s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Ok(());
+    }
+    if s.len() < 8 {
+        return Err(format!("{} must be at least 8 characters", label));
+    }
+    if s.len() > 256 {
+        return Err(format!("{} too long (max 256 characters)", label));
+    }
+    for (i, c) in s.chars().enumerate() {
+        match c {
+            '\'' => {
+                return Err(format!(
+                    "{} contains a single quote at position {}",
+                    label, i
+                ))
+            }
+            '\\' => return Err(format!("{} contains a backslash at position {}", label, i)),
+            '\0' => return Err(format!("{} contains a null byte", label)),
+            '\n' | '\r' => return Err(format!("{} contains a newline", label)),
+            c if c.is_control() => {
+                return Err(format!(
+                    "{} contains control character (U+{:04X}) at position {}",
+                    label, c as u32, i
+                ))
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_mariadb_credentials(params: &HashMap<String, JsonValue>) -> Result<(), String> {
+    if let Some(JsonValue::String(user)) = params.get("username") {
+        if !user.is_empty() && !is_valid_mariadb_identifier(user) {
+            return Err(format!(
+                "invalid 'username' {:?}: must match ^[A-Za-z_][A-Za-z0-9_]{{0,62}}$",
+                user
+            ));
+        }
+    }
+    if let Some(JsonValue::String(db)) = params.get("database") {
+        if !db.is_empty() && !is_valid_mariadb_identifier(db) {
+            return Err(format!(
+                "invalid 'database' {:?}: must match ^[A-Za-z_][A-Za-z0-9_]{{0,62}}$",
+                db
+            ));
+        }
+    }
+    if let Some(JsonValue::String(pw)) = params.get("password") {
+        validate_mariadb_password("password", pw)?;
+    }
+    if let Some(JsonValue::String(pw)) = params.get("root_password") {
+        validate_mariadb_password("root_password", pw)?;
+    }
+    Ok(())
+}
+
+fn mariadb_size_profile_from_params(
+    params: &HashMap<String, JsonValue>,
+) -> Result<MariaDbSizeProfile, String> {
+    match params.get("size_profile") {
+        value if is_empty_value(value) => Ok(MariaDbSizeProfile::Small),
+        Some(JsonValue::String(profile)) => MariaDbSizeProfile::parse(profile).ok_or_else(|| {
+            format!(
+                "invalid 'size_profile' {:?}: expected one of small, standard, dedicated",
+                profile
+            )
+        }),
+        Some(other) => Err(format!(
+            "invalid 'size_profile' {:?}: expected a string",
+            other
+        )),
+        None => Ok(MariaDbSizeProfile::Small),
+    }
+}
+
+fn validate_service_resource_limits(params: &HashMap<String, JsonValue>) -> Result<(), String> {
+    let Some(resources) = params.get("resources") else {
+        return Ok(());
+    };
+    if resources.is_null() {
+        return Ok(());
+    }
+    let limits: ServiceResourceLimits = serde_json::from_value(resources.clone())
+        .map_err(|e| format!("invalid 'resources' block: {}", e))?;
+    limits
+        .validate()
+        .map_err(|e| format!("invalid 'resources' block: {}", e))
+}
+
+/// Reject a set of internal-only fields that must never arrive from the
+/// client on a create request.
+///
+/// Each key in `forbidden` maps to a field that is populated exclusively by
+/// server-side logic:
+///
+/// - `container_name` — set only by `import_from_container()`.  A client
+///   supplying it could redirect every Docker operation to an existing
+///   container — including another tenant's, since Docker names are global
+///   and predictable (`{service}-{slug}`).  This is an IDOR.
+///
+/// - `metrics_ingest_key` / `metrics_ingest_url` — set only by the internal
+///   `store_and_apply_ingest_key` path when metrics are enabled.  A client
+///   supplying both at creation time makes the RustFS container push OTLP
+///   metrics (with a client-controlled bearer token) to a client-controlled
+///   URL from inside the Docker bridge network — SSRF and metrics-stream
+///   poisoning.
+///
+/// `validate_for_update` already blocks these via its updateable-keys
+/// allowlist; this closes the matching gap on create.
+fn reject_internal_only_keys(
+    params: &HashMap<String, JsonValue>,
+    forbidden: &[&str],
+) -> Result<(), String> {
+    for &key in forbidden {
+        if params.contains_key(key) {
+            return Err(format!(
+                "'{key}' cannot be set by the client — it is assigned internally only"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Strategy for validating and managing parameters for a specific service type
 pub trait ParameterStrategy: Send + Sync {
     /// Validate parameters for service creation - ensures all required parameters are present
@@ -142,6 +283,7 @@ pub struct PostgresParameterStrategy;
 
 impl ParameterStrategy for PostgresParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        reject_internal_only_keys(params, &["container_name"])?;
         if !params.contains_key("database") || is_empty_value(params.get("database")) {
             return Err("'database' is required for PostgreSQL".to_string());
         }
@@ -268,11 +410,183 @@ impl ParameterStrategy for PostgresParameterStrategy {
     }
 }
 
+/// MariaDB parameter strategy
+pub struct MariaDbParameterStrategy;
+
+impl ParameterStrategy for MariaDbParameterStrategy {
+    fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        reject_internal_only_keys(params, &["container_name"])?;
+        validate_mariadb_credentials(params)?;
+        mariadb_size_profile_from_params(params)?;
+        validate_service_resource_limits(params)?;
+        Ok(())
+    }
+
+    fn auto_generate_missing(&self, params: &mut HashMap<String, JsonValue>) -> Result<(), String> {
+        if is_empty_value(params.get("host")) {
+            params.insert(
+                "host".to_string(),
+                JsonValue::String("localhost".to_string()),
+            );
+        }
+
+        if is_empty_value(params.get("database")) {
+            params.insert("database".to_string(), JsonValue::String("app".to_string()));
+        }
+
+        if is_empty_value(params.get("username")) {
+            params.insert("username".to_string(), JsonValue::String("app".to_string()));
+        }
+
+        if is_empty_value(params.get("port")) {
+            if let Some(port) = find_available_port(3306) {
+                params.insert("port".to_string(), JsonValue::String(port.to_string()));
+            }
+        }
+
+        if is_empty_value(params.get("docker_image")) {
+            params.insert(
+                "docker_image".to_string(),
+                JsonValue::String("mariadb:lts".to_string()),
+            );
+        }
+
+        let size_profile = mariadb_size_profile_from_params(params)?;
+        if is_empty_value(params.get("size_profile")) {
+            params.insert(
+                "size_profile".to_string(),
+                JsonValue::String(size_profile.as_str().to_string()),
+            );
+        }
+
+        if is_empty_value(params.get("resources")) {
+            let resources = serde_json::to_value(size_profile.default_resource_limits())
+                .map_err(|e| format!("failed to serialize MariaDB default resources: {}", e))?;
+            params.insert("resources".to_string(), resources);
+        }
+
+        if is_empty_value(params.get("password")) {
+            params.insert(
+                "password".to_string(),
+                JsonValue::String(generate_secure_password()),
+            );
+        }
+
+        if is_empty_value(params.get("root_password")) {
+            params.insert(
+                "root_password".to_string(),
+                JsonValue::String(generate_secure_password()),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn validate_for_update(&self, updates: &HashMap<String, JsonValue>) -> Result<(), String> {
+        for key in updates.keys() {
+            if !self.updateable_keys().contains(&key.as_str()) {
+                return Err(format!(
+                    "Cannot update parameter '{}' for MariaDB. Read-only parameters: {}. Updateable parameters: {}",
+                    key,
+                    self.readonly_keys().join(", "),
+                    self.updateable_keys().join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn updateable_keys(&self) -> Vec<&'static str> {
+        vec!["port", "docker_image"]
+    }
+
+    fn readonly_keys(&self) -> Vec<&'static str> {
+        vec![
+            "host",
+            "database",
+            "username",
+            "password",
+            "root_password",
+            "size_profile",
+            "resources",
+        ]
+    }
+
+    fn merge_updates(
+        &self,
+        existing: &mut HashMap<String, JsonValue>,
+        updates: HashMap<String, JsonValue>,
+    ) -> Result<(), String> {
+        self.validate_for_update(&updates)?;
+
+        for (key, value) in updates {
+            existing.insert(key, value);
+        }
+        Ok(())
+    }
+
+    fn get_schema(&self) -> Option<JsonValue> {
+        Some(json!({
+            "type": "object",
+            "title": "MariaDB Parameters",
+            "properties": {
+                "database": {
+                    "type": "string",
+                    "description": "Initial database name (read-only after creation)",
+                    "default": "app"
+                },
+                "username": {
+                    "type": "string",
+                    "description": "Application database user (read-only after creation)",
+                    "default": "app"
+                },
+                "password": {
+                    "type": "string",
+                    "description": "Application user password (read-only after creation, auto-generated if not provided)",
+                    "example": "secure_password"
+                },
+                "root_password": {
+                    "type": "string",
+                    "description": "Root password used by Temps for provisioning (read-only after creation, auto-generated if not provided)",
+                    "example": "secure_root_password"
+                },
+                "host": {
+                    "type": "string",
+                    "description": "Host address (read-only after creation)",
+                    "default": "localhost"
+                },
+                "port": {
+                    "type": "integer",
+                    "description": "Port (updateable)",
+                    "default": 3306
+                },
+                "docker_image": {
+                    "type": "string",
+                    "description": "Docker image (updateable, e.g., mariadb:lts)",
+                    "default": "mariadb:lts"
+                },
+                "size_profile": {
+                    "type": "string",
+                    "description": "Managed MariaDB resource/tuning profile. A MariaDB service is shared; linked projects get separate databases inside it.",
+                    "default": "small",
+                    "enum": ["small", "standard", "dedicated"]
+                }
+            },
+            "readonly": ["host", "database", "username", "password", "root_password", "size_profile", "resources"]
+        }))
+    }
+
+    fn service_name(&self) -> &'static str {
+        "MariaDB"
+    }
+}
+
 /// Redis parameter strategy
 pub struct RedisParameterStrategy;
 
 impl ParameterStrategy for RedisParameterStrategy {
-    fn validate_for_creation(&self, _params: &HashMap<String, JsonValue>) -> Result<(), String> {
+    fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        reject_internal_only_keys(params, &["container_name"])?;
         // Redis doesn't require parameters for creation
         Ok(())
     }
@@ -365,8 +679,17 @@ impl ParameterStrategy for RedisParameterStrategy {
 pub struct S3ParameterStrategy;
 
 impl ParameterStrategy for S3ParameterStrategy {
-    fn validate_for_creation(&self, _params: &HashMap<String, JsonValue>) -> Result<(), String> {
-        // S3/RustFS doesn't require parameters for creation
+    fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        // service_type "s3" validates here but the container is created via
+        // RustfsService, which deserializes params into RustfsInputConfig.
+        // Reject all internal-only fields that RustfsInputConfig exposes so
+        // that neither the direct rustfs/blob path nor this s3 path can be
+        // used to supply a client-controlled OTLP target (SSRF) or bearer
+        // token (metrics-stream poisoning).
+        reject_internal_only_keys(
+            params,
+            &["container_name", "metrics_ingest_key", "metrics_ingest_url"],
+        )?;
         Ok(())
     }
 
@@ -479,6 +802,12 @@ impl ParameterStrategy for S3ParameterStrategy {
             "type": "object",
             "title": "S3 Parameters",
             "properties": {
+                "backend": {
+                    "type": "string",
+                    "description": "Managed S3-compatible backend to provision. RustFS is the default; Garage and MinIO are available backend selectors.",
+                    "enum": ["rustfs", "garage", "minio"],
+                    "default": "rustfs"
+                },
                 "access_key": {
                     "type": "string",
                     "description": "Access key (read-only after creation, auto-generated)",
@@ -515,7 +844,7 @@ impl ParameterStrategy for S3ParameterStrategy {
                     "default": "rustfs/rustfs:1.0.0-alpha.98"
                 }
             },
-            "readonly": ["access_key", "secret_key", "host", "region"]
+            "readonly": ["backend", "access_key", "secret_key", "host", "region"]
         }))
     }
 
@@ -528,7 +857,8 @@ impl ParameterStrategy for S3ParameterStrategy {
 pub struct MinioParameterStrategy;
 
 impl ParameterStrategy for MinioParameterStrategy {
-    fn validate_for_creation(&self, _params: &HashMap<String, JsonValue>) -> Result<(), String> {
+    fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        reject_internal_only_keys(params, &["container_name"])?;
         // MinIO doesn't require parameters for creation
         Ok(())
     }
@@ -642,8 +972,11 @@ impl ParameterStrategy for MinioParameterStrategy {
 pub struct RustfsParameterStrategy;
 
 impl ParameterStrategy for RustfsParameterStrategy {
-    fn validate_for_creation(&self, _params: &HashMap<String, JsonValue>) -> Result<(), String> {
-        // RustFS doesn't require parameters for creation
+    fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        reject_internal_only_keys(
+            params,
+            &["container_name", "metrics_ingest_key", "metrics_ingest_url"],
+        )?;
         Ok(())
     }
 
@@ -806,6 +1139,7 @@ pub struct MongodbParameterStrategy;
 
 impl ParameterStrategy for MongodbParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        reject_internal_only_keys(params, &["container_name"])?;
         if !params.contains_key("database") || is_empty_value(params.get("database")) {
             return Err("'database' is required for MongoDB".to_string());
         }
@@ -940,6 +1274,7 @@ impl ParameterStrategy for MongodbParameterStrategy {
 /// Helper: Get strategy for a service type
 pub fn get_strategy(service_type: &str) -> Option<Box<dyn ParameterStrategy>> {
     match service_type {
+        "mariadb" => Some(Box::new(MariaDbParameterStrategy)),
         "postgres" => Some(Box::new(PostgresParameterStrategy)),
         "redis" => Some(Box::new(RedisParameterStrategy)),
         // S3 now uses RustFS by default
@@ -1079,6 +1414,77 @@ mod tests {
 
         let result = strategy.validate_for_update(&updates);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mariadb_generates_defaults() {
+        let strategy = MariaDbParameterStrategy;
+        let mut params = HashMap::new();
+
+        strategy
+            .validate_for_creation(&params)
+            .expect("empty MariaDB params should use defaults");
+        strategy
+            .auto_generate_missing(&mut params)
+            .expect("defaults should generate");
+
+        assert_eq!(
+            params.get("database"),
+            Some(&JsonValue::String("app".to_string()))
+        );
+        assert_eq!(
+            params.get("username"),
+            Some(&JsonValue::String("app".to_string()))
+        );
+        assert_eq!(
+            params.get("docker_image"),
+            Some(&JsonValue::String("mariadb:lts".to_string()))
+        );
+        assert_eq!(
+            params.get("size_profile"),
+            Some(&JsonValue::String("small".to_string()))
+        );
+        let resources: ServiceResourceLimits = serde_json::from_value(
+            params
+                .get("resources")
+                .expect("MariaDB defaults should include resource limits")
+                .clone(),
+        )
+        .expect("default MariaDB resources should deserialize");
+        assert_eq!(resources.memory_mb, Some(512));
+        assert_eq!(resources.memory_swap_mb, Some(768));
+        assert_eq!(resources.nano_cpus, Some(750_000_000));
+        assert!(params.get("password").and_then(|v| v.as_str()).is_some());
+        assert!(params
+            .get("root_password")
+            .and_then(|v| v.as_str())
+            .is_some());
+    }
+
+    #[test]
+    fn test_mariadb_rejects_readonly_update() {
+        let strategy = MariaDbParameterStrategy;
+        let mut updates = HashMap::new();
+        updates.insert(
+            "root_password".to_string(),
+            JsonValue::String("new-secure-password".to_string()),
+        );
+
+        let result = strategy.validate_for_update(&updates);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_mariadb_rejects_invalid_size_profile() {
+        let strategy = MariaDbParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "size_profile".to_string(),
+            JsonValue::String("oversized".to_string()),
+        );
+
+        let result = strategy.validate_for_creation(&params);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1274,6 +1680,201 @@ mod tests {
 
         let ok = pg_params("postgres", "myapp", Some("strong_password_456!"));
         assert!(strategy.validate_for_creation(&ok).is_ok());
+    }
+
+    // ─── container_name IDOR guard ─────────────────────────────────────
+    //
+    // `container_name` is internal-only (set by `import_from_container()`).
+    // A client including it in a create request could redirect every Docker
+    // operation to an existing container — including a different tenant's,
+    // since Docker names are global and predictable (`{service}-{slug}`).
+    // These tests confirm that every strategy's `validate_for_creation`
+    // rejects the field before anything is persisted.
+
+    #[test]
+    fn postgres_rejects_client_supplied_container_name() {
+        let strategy = PostgresParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "database".to_string(),
+            JsonValue::String("mydb".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            JsonValue::String("user".to_string()),
+        );
+        params.insert(
+            "container_name".to_string(),
+            JsonValue::String("postgres-victim-slug".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error should mention 'container_name', got: {err}"
+        );
+    }
+
+    #[test]
+    fn mariadb_rejects_client_supplied_container_name() {
+        let strategy = MariaDbParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "container_name".to_string(),
+            JsonValue::String("mariadb-victim-slug".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error should mention 'container_name', got: {err}"
+        );
+    }
+
+    #[test]
+    fn redis_rejects_client_supplied_container_name() {
+        let strategy = RedisParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "container_name".to_string(),
+            JsonValue::String("redis-victim-slug".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error should mention 'container_name', got: {err}"
+        );
+    }
+
+    #[test]
+    fn s3_rejects_client_supplied_container_name() {
+        let strategy = S3ParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "container_name".to_string(),
+            JsonValue::String("rustfs-victim-slug".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error should mention 'container_name', got: {err}"
+        );
+    }
+
+    #[test]
+    fn minio_rejects_client_supplied_container_name() {
+        let strategy = MinioParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "container_name".to_string(),
+            JsonValue::String("minio-victim-slug".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error should mention 'container_name', got: {err}"
+        );
+    }
+
+    #[test]
+    fn rustfs_rejects_client_supplied_container_name() {
+        let strategy = RustfsParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "container_name".to_string(),
+            JsonValue::String("rustfs-victim-slug".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error should mention 'container_name', got: {err}"
+        );
+    }
+
+    #[test]
+    fn mongodb_rejects_client_supplied_container_name() {
+        let strategy = MongodbParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "database".to_string(),
+            JsonValue::String("mydb".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            JsonValue::String("user".to_string()),
+        );
+        params.insert(
+            "container_name".to_string(),
+            JsonValue::String("mongodb-victim-slug".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error should mention 'container_name', got: {err}"
+        );
+    }
+
+    // ─── RustFS metrics-field SSRF / metrics-poisoning guard ──────────────
+    //
+    // `metrics_ingest_key` and `metrics_ingest_url` are internal-only fields
+    // on `RustfsInputConfig`. When both are present, `RustfsService::init()`
+    // sets `RUSTFS_OBS_METRIC_ENDPOINT` and
+    // `RUSTFS_OBS_ENDPOINT_METRICS_HEADERS` on the container, making it push
+    // OTLP metrics to a client-controlled URL with a client-controlled bearer
+    // token — SSRF from inside the Docker bridge network, and metrics-stream
+    // poisoning if the attacker holds another tenant's ingest key.
+    //
+    // The routing detail that makes the S3 test load-bearing: a create
+    // request with `service_type: "s3"` is validated by
+    // `S3ParameterStrategy::validate_for_creation` but the container is
+    // actually started via `RustfsService`, which deserializes the stored
+    // params HashMap into `RustfsInputConfig`.  Closing the guard only on
+    // `RustfsParameterStrategy` would leave the s3 path open.
+
+    #[test]
+    fn rustfs_rejects_client_supplied_metrics_ingest_key() {
+        let strategy = RustfsParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "metrics_ingest_key".to_string(),
+            JsonValue::String("si_attacker_controlled_key".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("metrics_ingest_key"),
+            "error should mention 'metrics_ingest_key', got: {err}"
+        );
+    }
+
+    #[test]
+    fn rustfs_rejects_client_supplied_metrics_ingest_url() {
+        let strategy = RustfsParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "metrics_ingest_url".to_string(),
+            JsonValue::String("http://attacker.internal/collect".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("metrics_ingest_url"),
+            "error should mention 'metrics_ingest_url', got: {err}"
+        );
+    }
+
+    /// The routing-bypass test: service_type "s3" goes through
+    /// `S3ParameterStrategy` but the container runs as `RustfsService`, so
+    /// the s3 strategy must also block the RustFS-specific internal fields.
+    #[test]
+    fn s3_rejects_client_supplied_metrics_ingest_key() {
+        let strategy = S3ParameterStrategy;
+        let mut params = HashMap::new();
+        params.insert(
+            "metrics_ingest_key".to_string(),
+            JsonValue::String("si_attacker_controlled_key".to_string()),
+        );
+        let err = strategy.validate_for_creation(&params).unwrap_err();
+        assert!(
+            err.contains("metrics_ingest_key"),
+            "error should mention 'metrics_ingest_key', got: {err}"
+        );
     }
 
     /// Regression: the UI and the parameter schema both promise users that

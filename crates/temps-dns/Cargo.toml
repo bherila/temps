@@ -35,8 +35,9 @@ reqwest = { workspace = true }
 cloudflare = "0.14"
 
 # AWS Signature V4 signing for Route53
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
+sha2_010 = { package = "sha2", version = "0.10.9" }
 hex = "0.4"
 
 # GCP service account authentication
@@ -44,7 +45,7 @@ rsa = "0.9"
 base64 = "0.22"
 
 # XML parsing for Route53
-quick-xml = { version = "0.37", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 
 # URL encoding
 urlencoding = "2.1"
@@ -70,6 +71,7 @@ tokio-test = "0.4"
 testcontainers = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
 wiremock = "0.6"
+serial_test = "3.2"
 mockall = "0.13"
 # ADR-024 integration test: in-process DNS client to query the real
 # control-plane resolver over a UDP socket (mirrors temps-dns-resolver's

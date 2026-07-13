@@ -10,6 +10,20 @@ pub struct LoginAudit {
     pub login_method: String,
 }
 
+/// Recorded when a user completes a successful login while at least one
+/// other session for their account is already active (non-expired). This is
+/// purely observational -- it does NOT block the login (bherila/temps#24) --
+/// but gives an auditor/operator a trail to spot suspicious concurrent
+/// access (e.g. a stolen session token being used from a second location).
+#[derive(Debug, Clone, Serialize)]
+pub struct ConcurrentSessionDetectedAudit {
+    pub context: AuditContext,
+    pub login_method: String,
+    /// Number of other active sessions that already existed for this user
+    /// at the moment this login completed (not counting the new session).
+    pub existing_active_session_count: u64,
+}
+
 // User management audits
 #[derive(Debug, Clone, Serialize)]
 pub struct UserCreatedAudit {
@@ -119,6 +133,29 @@ pub struct EmailVerifiedAudit {
     pub email: String,
 }
 
+// API key creation audit. Custom-permission keys are the highest-impact
+// variant -- capturing role_type and the granted permission strings lets an
+// auditor spot an over-broad grant after the fact without needing to
+// correlate against the key's current (mutable) state.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiKeyCreatedAudit {
+    pub context: AuditContext,
+    pub api_key_id: i32,
+    pub api_key_name: String,
+    pub role_type: String,
+    pub permissions: Option<Vec<String>>,
+}
+
+// API key rotation audit. Rotation invalidates the old secret and mints a new
+// one for the same key record -- an auditor needs the key's id/name to tie
+// this event to the credential's lifecycle without seeing the secret itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiKeyRotatedAudit {
+    pub context: AuditContext,
+    pub api_key_id: i32,
+    pub api_key_name: String,
+}
+
 // OIDC provider configuration audits. SSO provider config is one of
 // the highest-impact settings in the system — it controls who can log
 // in and with what role — so every mutation gets a row. The diff-shape
@@ -198,6 +235,29 @@ impl AuditOperation for LoginAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for ConcurrentSessionDetectedAudit {
+    fn operation_type(&self) -> String {
+        "CONCURRENT_SESSION_DETECTED".to_string()
+    }
+
+    fn user_id(&self) -> i32 {
+        self.context.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
     fn serialize(&self) -> Result<String> {
         serde_json::to_string(self)
             .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
@@ -483,6 +543,52 @@ impl AuditOperation for PasswordChangedAudit {
 impl AuditOperation for EmailVerifiedAudit {
     fn operation_type(&self) -> String {
         "EMAIL_VERIFIED".to_string()
+    }
+
+    fn user_id(&self) -> i32 {
+        self.context.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for ApiKeyCreatedAudit {
+    fn operation_type(&self) -> String {
+        "API_KEY_CREATED".to_string()
+    }
+
+    fn user_id(&self) -> i32 {
+        self.context.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for ApiKeyRotatedAudit {
+    fn operation_type(&self) -> String {
+        "API_KEY_ROTATED".to_string()
     }
 
     fn user_id(&self) -> i32 {

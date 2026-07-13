@@ -14,7 +14,7 @@ reqwest = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3.10"
 tokio = { workspace = true }
-hmac = "0.12.1"
+hmac = "0.13"
 sha2 = { workspace = true }
 hex = { workspace = true }
 base64 = "0.22"
@@ -39,7 +39,7 @@ axum = { workspace = true }
 urlencoding = { workspace = true }
 async-trait = { workspace = true }
 hex = { workspace = true }
-hmac = "0.12.1"
+hmac = "0.13"
 thiserror = { workspace = true }
 futures-util = { workspace = true }
 utoipa = { workspace = true }
@@ -51,7 +51,7 @@ serde_derive = { workspace = true }
 jsonwebtoken = "10.3.0"
 uuid = { workspace = true }
 http-body-util = { workspace = true }
-git2 = "0.20.4"
+git2 = { version = "0.21.0", features = ["https", "ssh"] }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }

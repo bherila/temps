@@ -1,16 +1,42 @@
+//! Proxy request pipeline for the Temps reverse proxy.
+//!
+//! # Hot-path invariant
+//!
+//! No function on the per-request path (`early_request_filter`, `request_filter`,
+//! `upstream_peer`, `upstream_response_filter`, `response_filter`, and every helper
+//! they call) may await a database query directly.
+//!
+//! - **Writes** go through the `ProxyLogBatchHandle` / `TrackingBatchHandle` mpsc
+//!   channels and are flushed by the background batch writer.
+//! - **Reads** go through ArcSwap snapshots (refreshed by background loops) or
+//!   moka TTL caches (populated on first miss, then served in-memory).
+//!
+//! The single intentional exception is the ACME HTTP-01 challenge lookup
+//! (`handle_acme_http_challenge`), which is path-gated to
+//! `/.well-known/acme-challenge/*` — a path that is rare by construction and never
+//! appears on normal traffic. Every other request-path DB call present before this
+//! branch was removed as part of `perf/remove-db-from-request-path` (WS1–WS6).
+
 use crate::handler::preview_wall::{
     build_logout_cookie_sandbox, generate_preview_form_html_labeled, sanitize_next,
     PREVIEW_LOGIN_PATH, PREVIEW_LOGOUT_PATH,
 };
 use crate::on_demand::OnDemandManager;
 use crate::preview_auth::{
-    build_set_cookie_sandbox, check_preview_auth, encode_preview_cookie_subject, lookup_sandbox,
-    parse_preview_host, verify_argon2, PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost,
-    PreviewSandboxLookup, PREVIEW_GATEWAY_PEER,
+    build_set_cookie_sandbox, check_preview_auth, encode_preview_cookie_subject,
+    parse_preview_host, preview_peer_group_key, verify_argon2, PreviewAuthLimiter,
+    PreviewAuthOutcome, PreviewHost, PreviewSandboxLookup, SandboxLookupCache,
+    PREVIEW_GATEWAY_PEER,
 };
+use crate::service::cert_host_cache::CertHostCache;
 use crate::service::challenge_service::ChallengeService;
+use crate::service::cookie_codec::{
+    make_v2_session_payload, parse_session_cookie, parse_visitor_cookie,
+};
 use crate::service::ip_access_control_service::IpAccessControlService;
-use crate::service::proxy_log_batch_writer::ProxyLogBatchHandle;
+use crate::service::proxy_log_batch_writer::{
+    ProxyLogBatchHandle, TrackingBatchHandle, TrackingEvent,
+};
 use crate::service::proxy_log_service::CreateProxyLogRequest;
 use crate::tls_fingerprint;
 use crate::traits::*;
@@ -334,9 +360,7 @@ pub struct ProxyContext {
     pub referrer: Option<String>,
     pub ip_address: Option<String>,
     pub visitor_id: Option<String>,
-    pub visitor_id_i32: Option<i32>,
     pub session_id: Option<String>,
-    pub session_id_i32: Option<i32>,
     pub is_new_session: bool,
     pub request_headers: Option<HashMap<String, String>>,
     pub response_headers: Option<HashMap<String, String>>,
@@ -355,8 +379,21 @@ pub struct ProxyContext {
     pub tls_cipher: Option<String>,
     /// SNI hostname from TLS handshake (for SNI-based routing)
     pub sni_hostname: Option<String>,
-    /// Upstream response body bytes received (tracked by Pingora 0.8.0)
+    /// Upstream response body bytes actually forwarded to the client,
+    /// accumulated per-chunk in `response_body_filter`. Authoritative source
+    /// for response bandwidth — unlike the `Content-Length` header, this is
+    /// always populated even for chunked/streamed responses.
     pub upstream_body_bytes_received: usize,
+    /// Client request body bytes received, accumulated per-chunk in
+    /// `request_body_filter`. Authoritative source for request bandwidth —
+    /// unlike the `Content-Length` header, this is always populated even for
+    /// chunked-encoded request bodies.
+    pub client_body_bytes_received: usize,
+    /// Proxy log entry built in `log_request` (response-header time), held
+    /// here rather than sent immediately because `upstream_body_bytes_received`
+    /// isn't fully accumulated until the response body finishes streaming.
+    /// The `logging` hook patches in the final byte count and sends it.
+    pub pending_proxy_log: Option<CreateProxyLogRequest>,
     /// Whether the client requested a Markdown response via `Accept: text/markdown`
     pub wants_markdown: bool,
     /// Accumulated body bytes for HTML-to-Markdown conversion
@@ -365,40 +402,34 @@ pub struct ProxyContext {
     pub upstream_connect_tries: usize,
     /// Time upstream took to accept the request body (upload diagnostics, Pingora 0.8.0)
     pub upstream_write_pending_time_ms: Option<i32>,
+    /// When `upstream_peer` started resolving/connecting the upstream. Basis
+    /// for the backend-latency metric; `None` for requests the proxy answered
+    /// itself (static files, redirects, walls).
+    pub upstream_start_time: Option<Instant>,
+    /// Backend latency: `upstream_start_time` → first upstream response
+    /// header (connect + request + upstream processing + TTFB).
+    pub upstream_response_time_ms: Option<u64>,
     /// Set when the request matched a workspace preview hostname and passed
     /// auth — `upstream_peer` will route it to the local preview gateway.
     pub preview_route: Option<PreviewHost>,
-}
-
-impl ProxyContext {
-    /// Build a ProjectContext from the individual fields if all are present
-    fn get_project_context(&self) -> Option<ProjectContext> {
-        if let (Some(project), Some(environment), Some(deployment)) =
-            (&self.project, &self.environment, &self.deployment)
-        {
-            Some(ProjectContext {
-                project: project.clone(),
-                environment: environment.clone(),
-                deployment: deployment.clone(),
-            })
-        } else {
-            None
-        }
-    }
 }
 
 /// Main load balancer proxy implementation using traits
 pub struct LoadBalancer {
     upstream_resolver: Arc<dyn UpstreamResolver>,
     proxy_log_handle: ProxyLogBatchHandle,
+    tracking_handle: TrackingBatchHandle,
     project_context_resolver: Arc<dyn ProjectContextResolver>,
-    visitor_manager: Arc<dyn VisitorManager>,
-    session_manager: Arc<dyn SessionManager>,
+    cookie_config: CookieConfig,
     crypto: Arc<temps_core::CookieCrypto>,
     db: Arc<DbConnection>,
     config_service: Arc<temps_config::ConfigService>,
     ip_access_control_service: Arc<IpAccessControlService>,
     challenge_service: Arc<ChallengeService>,
+    /// In-memory snapshot of domains that have a TLS certificate. Used by the
+    /// HTTP→HTTPS redirect check instead of issuing 2 DB queries per request.
+    /// Refreshed every 30 s by `CertHostCache::run_refresh_loop`. See WS3.
+    cert_host_cache: Arc<CertHostCache>,
     disable_https_redirect: bool,
     on_demand_manager: Option<Arc<OnDemandManager>>,
     /// On-demand HTTP-01 TLS cert manager (ADR-018). When set, the port-80
@@ -414,12 +445,33 @@ pub struct LoadBalancer {
     /// `deployment_url_mode` handling (serves HTTP as before).
     route_table: Option<Arc<temps_routes::CachedPeerTable>>,
     file_store: Option<Arc<dyn temps_file_store::FileStore>>,
+    /// In-memory moka cache for `static_asset_cache` DB lookups. Keyed on
+    /// `(project_id, url_path)`; values are `Option<content_hash>` so that
+    /// **negative results (no row found) are cached too** — the miss case is
+    /// the common path for container deployments where most assets are served
+    /// by upstream, not the fallback store. TTL 60 s, max ~50 k entries. See
+    /// `service/static_asset_lookup.rs` and WS4 in IMPLEMENTATION_PLAN.md.
+    static_asset_lookup: Arc<crate::service::static_asset_lookup::StaticAssetLookup>,
     preview_auth_limiter: Arc<PreviewAuthLimiter>,
+    /// In-memory moka cache for sandbox preview lookups. Keyed by sandbox
+    /// hex suffix; values are `PreviewSandboxLookup` (both `Protected` and
+    /// `NotFound` are cached). TTL 30 s. See `preview_auth.rs` and WS6 in
+    /// IMPLEMENTATION_PLAN.md.
+    ///
+    /// Password rotation invalidates preview cookies cryptographically (the
+    /// cookie binds a SHA-256 fingerprint of the argon2 PHC hash), so a
+    /// ≤30 s stale cache window only affects brand-new login attempts
+    /// immediately after a password change — existing cookies are unaffected.
+    sandbox_lookup_cache: Arc<SandboxLookupCache>,
     /// Shared admin-gate snapshot. When set and non-noop, requests for
     /// hosts that aren't in the route table are gated before falling back
     /// to the console — see `request_filter`. When `None`, gate enforcement
     /// is skipped entirely (used by older test harnesses).
     admin_gate: Option<temps_core::admin_gate::AdminGateHandle>,
+    /// Lock-free hot-path request counters (status classes + duration
+    /// histogram). Updated on every completed/failed request; drained by the
+    /// background `ProxyMetricsSampler`, never read on the request path.
+    proxy_metrics: Arc<crate::metrics::ProxyMetrics>,
 }
 
 impl LoadBalancer {
@@ -427,27 +479,32 @@ impl LoadBalancer {
     pub fn new(
         upstream_resolver: Arc<dyn UpstreamResolver>,
         proxy_log_handle: ProxyLogBatchHandle,
+        tracking_handle: TrackingBatchHandle,
         project_context_resolver: Arc<dyn ProjectContextResolver>,
-        visitor_manager: Arc<dyn VisitorManager>,
-        session_manager: Arc<dyn SessionManager>,
         crypto: Arc<temps_core::CookieCrypto>,
         db: Arc<DbConnection>,
         config_service: Arc<temps_config::ConfigService>,
         ip_access_control_service: Arc<IpAccessControlService>,
         challenge_service: Arc<ChallengeService>,
+        cert_host_cache: Arc<CertHostCache>,
         disable_https_redirect: bool,
     ) -> Self {
         Self {
             upstream_resolver,
             proxy_log_handle,
+            tracking_handle,
             project_context_resolver,
-            visitor_manager,
-            session_manager,
+            cookie_config: CookieConfig::default(),
             crypto,
+            static_asset_lookup: Arc::new(
+                crate::service::static_asset_lookup::StaticAssetLookup::new(Arc::clone(&db)),
+            ),
+            sandbox_lookup_cache: Arc::new(SandboxLookupCache::new(Arc::clone(&db))),
             db,
             config_service,
             ip_access_control_service,
             challenge_service,
+            cert_host_cache,
             disable_https_redirect,
             on_demand_manager: None,
             on_demand_cert_manager: None,
@@ -455,7 +512,14 @@ impl LoadBalancer {
             file_store: None,
             preview_auth_limiter: Arc::new(PreviewAuthLimiter::new()),
             admin_gate: None,
+            proxy_metrics: Arc::new(crate::metrics::ProxyMetrics::default()),
         }
+    }
+
+    /// Handle to the hot-path metrics counters, for the background sampler.
+    /// The returned `Arc` shares the counters this instance records into.
+    pub fn proxy_metrics(&self) -> Arc<crate::metrics::ProxyMetrics> {
+        Arc::clone(&self.proxy_metrics)
     }
 
     /// Wire the shared admin-gate handle. When set, `request_filter`
@@ -504,16 +568,6 @@ impl LoadBalancer {
     #[cfg(test)]
     pub fn project_context_resolver(&self) -> &Arc<dyn ProjectContextResolver> {
         &self.project_context_resolver
-    }
-
-    #[cfg(test)]
-    pub fn visitor_manager(&self) -> &Arc<dyn VisitorManager> {
-        &self.visitor_manager
-    }
-
-    #[cfg(test)]
-    pub fn session_manager(&self) -> &Arc<dyn SessionManager> {
-        &self.session_manager
     }
 
     /// Pull the W3C `traceparent` trace_id (the 32-hex-char `<trace-id>` field)
@@ -700,40 +754,40 @@ impl LoadBalancer {
             .replace("{{IDENTIFIER_TYPE}}", identifier_type)
     }
 
-    async fn ensure_visitor_session(&self, ctx: &mut ProxyContext) -> Result<()> {
-        // Only create visitor/session if we don't already have one
+    /// Resolve visitor and session identifiers from cookies — entirely in-process,
+    /// no database round-trips. A [`TrackingEvent`] is enqueued for the background
+    /// batch writer, which upserts visitor/session rows asynchronously.
+    async fn ensure_visitor_session(&self, ctx: &mut ProxyContext) {
+        // Only resolve once per request
         if ctx.visitor_id.is_some() {
-            return Ok(());
+            return;
         }
 
-        // Project context is already resolved in request_filter, use it here
-        let project_context = if let (Some(project), Some(environment), Some(deployment)) =
-            (&ctx.project, &ctx.environment, &ctx.deployment)
-        {
-            Some(ProjectContext {
-                project: project.clone(),
-                environment: environment.clone(),
-                deployment: deployment.clone(),
-            })
-        } else {
-            None
-        };
-
-        // Skip visitor/session creation for crawlers - only track real humans
+        // Skip crawlers — only track real humans
         if let Some(crawler_name) =
             crate::crawler_detector::CrawlerDetector::get_crawler_name(Some(&ctx.user_agent))
         {
             debug!(
-                "Crawler detected: {} ({}), skipping visitor/session creation for project {}",
+                "Crawler detected: {} ({}), skipping visitor/session for project {}",
                 crawler_name,
                 ctx.user_agent,
-                project_context.as_ref().map(|p| p.project.id).unwrap_or(0)
+                ctx.project.as_ref().map(|p| p.id).unwrap_or(0)
             );
-            return Ok(());
+            return;
         }
 
-        // Compute first-visit attribution from referrer and query string
-        // These fields are only stored when creating a NEW visitor
+        // ── Stateless visitor decision (no DB) ──────────────────────────────
+        let visitor_uuid =
+            parse_visitor_cookie(ctx.request_visitor_cookie.as_deref(), &self.crypto);
+
+        // ── Stateless session decision (no DB) ──────────────────────────────
+        let session_decision = parse_session_cookie(
+            ctx.request_session_cookie.as_deref(),
+            &self.crypto,
+            self.cookie_config.session_max_age_minutes,
+        );
+
+        // ── Compute attribution (used only for new visitors) ─────────────────
         let utm = ctx
             .query_string
             .as_deref()
@@ -745,6 +799,7 @@ impl LoadBalancer {
             .and_then(temps_analytics::extract_referrer_hostname);
         let channel =
             temps_analytics::get_channel(&utm, referrer_hostname.as_deref(), Some(&ctx.host));
+
         let attribution = crate::traits::FirstVisitAttribution {
             referrer: ctx.referrer.clone(),
             referrer_hostname: referrer_hostname.clone(),
@@ -754,66 +809,69 @@ impl LoadBalancer {
             utm_campaign: utm.utm_campaign.clone(),
         };
 
-        // Pass the raw encrypted cookie to get_or_create_visitor — it handles
-        // decryption internally.  Previously the cookie was decrypted here and the
-        // plaintext UUID was forwarded, causing get_or_create_visitor to attempt a
-        // second decryption that always failed, creating a new visitor on every
-        // returning page load.
-        let visitor = match self
-            .visitor_manager
-            .get_or_create_visitor(
-                ctx.request_visitor_cookie.as_deref(),
-                project_context.as_ref(),
-                &ctx.user_agent,
-                ctx.ip_address.as_deref(),
-                &attribution,
-            )
-            .await
-        {
-            Ok(visitor) => visitor,
-            Err(e) => {
-                error!("Failed to get/create visitor: {:?}", e);
-                return Err(Error::new_str("Failed to get/create visitor"));
-            }
-        };
+        // ── Enqueue background upsert ─────────────────────────────────────────
+        self.tracking_handle.send(TrackingEvent {
+            visitor_uuid: visitor_uuid.clone(),
+            session_uuid: session_decision.session_uuid.clone(),
+            project_id: ctx.project.as_ref().map(|p| p.id).unwrap_or(0),
+            environment_id: ctx.environment.as_ref().map(|e| e.id).unwrap_or(0),
+            last_seen: chrono::Utc::now(),
+            client_ip: ctx.ip_address.clone(),
+            user_agent: Some(ctx.user_agent.clone()),
+            is_crawler: false,
+            crawler_name: None,
+            is_new_session: session_decision.is_new_session,
+            session_referrer: ctx.referrer.clone(),
+            session_referrer_hostname: referrer_hostname,
+            session_utm_source: utm.utm_source,
+            session_utm_medium: utm.utm_medium,
+            session_utm_campaign: utm.utm_campaign,
+            session_utm_content: utm.utm_content,
+            session_utm_term: utm.utm_term,
+            session_channel: Some(channel.to_string()),
+            attribution,
+        });
 
-        // Create session using the trait - pass encrypted cookie, not decrypted value
-        // Include query string for UTM parameter extraction and host for self-referral detection
-        let session = match self
-            .session_manager
-            .get_or_create_session(
-                ctx.request_session_cookie.as_deref(),
-                &visitor,
-                project_context.as_ref(),
-                ctx.referrer.as_deref(),
-                ctx.query_string.as_deref(),
-                Some(&ctx.host),
-            )
-            .await
-        {
-            Ok(session) => session,
-            Err(e) => {
-                error!("Failed to get/create session: {:?}", e);
-                return Err(Error::new_str("Failed to get/create session"));
-            }
-        };
+        // ── Set context fields ────────────────────────────────────────────────
+        ctx.visitor_id = Some(visitor_uuid.clone());
+        ctx.session_id = Some(session_decision.session_uuid.clone());
+        ctx.is_new_session = session_decision.is_new_session;
 
-        ctx.visitor_id = Some(visitor.visitor_id.clone());
-        ctx.visitor_id_i32 = Some(visitor.visitor_id_i32);
-        ctx.session_id = Some(session.session_id.clone());
-        ctx.session_id_i32 = Some(session.session_id_i32);
-        ctx.is_new_session = session.is_new_session;
-
-        // Log visitor debug
         debug!(
             "HTML request from visitor {} with session {} (new: {}) for project {}",
-            visitor.visitor_id,
-            session.session_id,
-            session.is_new_session,
-            project_context.as_ref().map(|p| p.project.id).unwrap_or(0)
+            visitor_uuid,
+            session_decision.session_uuid,
+            session_decision.is_new_session,
+            ctx.project.as_ref().map(|p| p.id).unwrap_or(0)
         );
+    }
 
-        Ok(())
+    /// Returns true when a page view should be tracked (visitor/session created).
+    /// This replaces the old `VisitorManager::should_track_visitor` trait method.
+    pub fn should_track_page(path: &str, content_type: Option<&str>, status_code: u16) -> bool {
+        // Don't track internal API calls
+        if path.starts_with(ROUTE_PREFIX_TEMPS) {
+            return false;
+        }
+
+        // Don't track static assets
+        if path.contains('.')
+            && (path.ends_with(".js")
+                || path.ends_with(".css")
+                || path.ends_with(".png")
+                || path.ends_with(".jpg")
+                || path.ends_with(".svg")
+                || path.ends_with(".ico"))
+        {
+            return false;
+        }
+
+        // Track HTML pages or error pages
+        let is_html = content_type
+            .map(|ct| ct.starts_with("text/html"))
+            .unwrap_or(false);
+
+        is_html || status_code >= 400
     }
 
     async fn finalize_response(
@@ -1125,6 +1183,12 @@ impl LoadBalancer {
             host, token
         );
 
+        // Direct DB query accepted here: this code path is reachable only for
+        // requests whose path starts with `/.well-known/acme-challenge/`, which
+        // is rare by construction (only Let's Encrypt validation requests hit
+        // it). See item H in IMPLEMENTATION_PLAN.md §2 — intentionally left
+        // as-is because caching transient challenge tokens would complicate the
+        // cert-provisioning flow with no meaningful throughput benefit.
         let domain_record = domains::Entity::find()
             .filter(domains::Column::Domain.eq(host))
             .filter(domains::Column::HttpChallengeToken.eq(token))
@@ -1188,9 +1252,9 @@ impl LoadBalancer {
     /// (`!is_tls_connection`) and that the manager is wired, so this function
     /// performs NO TLS check and NO settings fetch in the common path. Settings
     /// are loaded lazily only when an ephemeral host actually reaches the
-    /// `redirect_to_env` branch — see the HIGH finding in the ADR-018 security
-    /// review: `get_settings()` is an uncached DB query and must not run per
-    /// request.
+    /// `redirect_to_env` branch — `get_settings()` is TTL-cached in
+    /// `temps_config::ConfigService`, so even on that rare branch it is a
+    /// fast in-memory read rather than a Postgres round-trip.
     ///
     /// Returns `Ok(true)` when a response was written (caller must return early),
     /// `Ok(false)` when the request should continue down the normal path.
@@ -1235,8 +1299,8 @@ impl LoadBalancer {
         }
 
         // Only now — for an ephemeral routed host — do we need the setting that
-        // decides http-vs-redirect. This is the rare branch, so the DB read here
-        // does not amplify request floods the way a per-request fetch would.
+        // decides http-vs-redirect. This is the rare branch; get_settings() is
+        // TTL-cached so it is an in-memory read, not a Postgres round-trip.
         let settings = match self.config_service.get_settings().await {
             Ok(s) => s,
             Err(e) => {
@@ -1289,7 +1353,7 @@ impl LoadBalancer {
         &self,
         _session: &PingoraSession,
         upstream_response: &ResponseHeader,
-        ctx: &ProxyContext,
+        ctx: &mut ProxyContext,
     ) -> Result<()> {
         // Skip logging for internal temps API routes
         if ctx.path.starts_with(ROUTE_PREFIX_TEMPS) {
@@ -1300,14 +1364,26 @@ impl LoadBalancer {
 
         // Asynchronously log to proxy_logs table via batch writer (skip static assets)
         if Self::should_log_request(&ctx.path) {
-            // Extract request size from Content-Length header
-            let request_size = ctx
-                .request_headers
-                .as_ref()
-                .and_then(|h| h.get("content-length"))
-                .and_then(|v| v.parse::<i64>().ok());
+            // Request body has already fully streamed through request_body_filter
+            // by the time response headers arrive (the client finishes sending
+            // before the upstream replies), so the accumulated count is reliable
+            // here. Fall back to Content-Length only for bodies that never
+            // reached the filter (e.g. HEAD).
+            let request_size = if ctx.client_body_bytes_received > 0 {
+                Some(ctx.client_body_bytes_received as i64)
+            } else {
+                ctx.request_headers
+                    .as_ref()
+                    .and_then(|h| h.get("content-length"))
+                    .and_then(|v| v.parse::<i64>().ok())
+            };
 
-            // Extract response size from Content-Length header
+            // This function runs when response *headers* arrive — the response
+            // body hasn't streamed through response_body_filter yet, so
+            // upstream_body_bytes_received is always 0 here. Content-Length is
+            // the best information available now; the `logging` hook (true
+            // end-of-request, after the body has fully streamed) overwrites
+            // this with the accumulated byte count before the entry is sent.
             let response_size = ctx
                 .response_headers
                 .as_ref()
@@ -1334,8 +1410,10 @@ impl LoadBalancer {
                 project_id: ctx.project.as_ref().map(|p| p.id),
                 environment_id: ctx.environment.as_ref().map(|e| e.id),
                 deployment_id: ctx.deployment.as_ref().map(|d| d.id),
-                session_id: ctx.session_id_i32,
-                visitor_id: ctx.visitor_id_i32,
+                session_id: None,
+                visitor_id: None,
+                visitor_uuid: ctx.visitor_id.clone(),
+                session_uuid: ctx.session_id.clone(),
                 container_id: ctx.container_id.clone(),
                 upstream_host: ctx.upstream_host.clone(),
                 error_message: ctx.error_message.clone(),
@@ -1366,13 +1444,10 @@ impl LoadBalancer {
                 error_group_id: None,
             };
 
-            // Send to batch writer with backpressure (blocks briefly if buffer full)
-            let handle = self.proxy_log_handle.clone();
-            tokio::spawn(async move {
-                if !handle.send(proxy_log_request).await {
-                    warn!("Proxy log batch writer is closed, log entry dropped");
-                }
-            });
+            // Stash rather than send: the `logging` hook fires after the
+            // response body has fully streamed and patches response_size_bytes
+            // with the accurate accumulated count before enqueueing.
+            ctx.pending_proxy_log = Some(proxy_log_request);
         }
 
         Ok(())
@@ -1460,8 +1535,10 @@ impl LoadBalancer {
             project_id: ctx.project.as_ref().map(|p| p.id),
             environment_id: ctx.environment.as_ref().map(|e| e.id),
             deployment_id: ctx.deployment.as_ref().map(|d| d.id),
-            session_id: ctx.session_id_i32,
-            visitor_id: ctx.visitor_id_i32,
+            session_id: None,
+            visitor_id: None,
+            visitor_uuid: ctx.visitor_id.clone(),
+            session_uuid: ctx.session_id.clone(),
             container_id: None,
             upstream_host: Some(format!("static://{}", static_dir)),
             error_message,
@@ -1488,88 +1565,105 @@ impl LoadBalancer {
             error_group_id: None,
         };
 
-        // Send to batch writer (non-blocking, drops if buffer full)
-        if !self.proxy_log_handle.try_send(proxy_log_request) {
-            warn!("Proxy log batch writer full, static file log entry dropped");
-        }
+        // Non-blocking enqueue; shed with rate-limited accounting when full.
+        self.proxy_log_handle.send_or_drop(proxy_log_request);
     }
 
-    /// Set visitor and session cookies on the response
-    /// This can be called from both finalize_response and early_request_filter (for static files)
+    /// Set visitor and session cookies on the response.
+    ///
+    /// Visitor cookie: set only when the request doesn't already carry a valid one.
+    /// Session cookie: always re-issued with the current timestamp embedded in the
+    /// v2 payload so the server-side freshness check stays accurate.
     async fn set_tracking_cookies(
         &self,
         session: &mut PingoraSession,
         response: &mut ResponseHeader,
         ctx: &ProxyContext,
     ) -> Result<()> {
-        // Set visitor cookie using the trait
+        let is_https = self.is_https_request(session);
+        let project_id = ctx.project.as_ref().map(|p| p.id);
+
+        // ── Visitor cookie ──────────────────────────────────────────────────
         if let Some(visitor_id) = &ctx.visitor_id {
-            let project_id = ctx.project.as_ref().map(|p| p.id);
-            let expected_cookie_name = get_visitor_cookie_name(project_id);
+            let cookie_name = get_visitor_cookie_name(project_id);
 
             let has_valid_visitor_cookie = session
                 .req_header()
                 .headers
                 .get_all("Cookie")
                 .iter()
-                .filter_map(|cookie_header| cookie_header.to_str().ok())
-                .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
-                .any(|cookie| {
-                    cookie.name() == expected_cookie_name
-                        && self.crypto.decrypt(cookie.value()).is_ok()
-                });
+                .filter_map(|h| h.to_str().ok())
+                .flat_map(|s| Cookie::split_parse(s).filter_map(|c| c.ok()))
+                .any(|c| c.name() == cookie_name && self.crypto.decrypt(c.value()).is_ok());
 
             if !has_valid_visitor_cookie {
-                let visitor = Visitor {
-                    visitor_id: visitor_id.clone(),
-                    visitor_id_i32: ctx.visitor_id_i32.unwrap_or(0),
-                    is_crawler: false, // We'd need to track this properly
-                    crawler_name: None,
-                };
-
-                let is_https = self.is_https_request(session);
-                let visitor_cookie = match self
-                    .visitor_manager
-                    .generate_visitor_cookie(&visitor, is_https, ctx.get_project_context().as_ref())
-                    .await
-                {
-                    Ok(cookie) => cookie,
-                    Err(e) => {
-                        error!("Failed to generate visitor cookie: {:?}", e);
-                        return Err(Error::new_str("Failed to generate visitor cookie"));
+                let encrypted = match self.crypto.encrypt(visitor_id) {
+                    Ok(e) => e,
+                    Err(err) => {
+                        error!("Failed to encrypt visitor cookie: {:?}", err);
+                        return Err(Error::new_str("Failed to encrypt visitor cookie"));
                     }
                 };
-                response.append_header("Set-Cookie", visitor_cookie)?;
+                let cookie_value = self.build_cookie_string(
+                    &cookie_name,
+                    &encrypted,
+                    cookie::time::Duration::days(self.cookie_config.visitor_max_age_days),
+                    is_https,
+                );
+                response.append_header("Set-Cookie", cookie_value)?;
             }
         }
 
-        // Set session cookie using the trait
-        // IMPORTANT: Always regenerate the cookie to refresh the max_age expiration time
-        // This prevents the cookie from expiring after 30 minutes even though the session is still active
+        // ── Session cookie ──────────────────────────────────────────────────
+        // Always re-issue with the current timestamp to keep the sliding window fresh.
         if let Some(session_id) = &ctx.session_id {
-            let session_obj = crate::traits::Session {
-                session_id: session_id.clone(),
-                session_id_i32: ctx.session_id_i32.unwrap_or(0),
-                visitor_id_i32: ctx.visitor_id_i32.unwrap_or(0),
-                is_new_session: ctx.is_new_session,
-            };
-
-            let is_https = self.is_https_request(session);
-            let session_cookie = match self
-                .session_manager
-                .generate_session_cookie(&session_obj, is_https, ctx.get_project_context().as_ref())
-                .await
-            {
-                Ok(cookie) => cookie,
-                Err(e) => {
-                    error!("Failed to generate session cookie: {:?}", e);
-                    return Err(Error::new_str("Failed to generate session cookie"));
+            let cookie_name = get_session_cookie_name(project_id);
+            let now_secs = chrono::Utc::now().timestamp();
+            let payload = make_v2_session_payload(session_id, now_secs);
+            let encrypted = match self.crypto.encrypt(&payload) {
+                Ok(e) => e,
+                Err(err) => {
+                    error!("Failed to encrypt session cookie: {:?}", err);
+                    return Err(Error::new_str("Failed to encrypt session cookie"));
                 }
             };
-            response.append_header("Set-Cookie", session_cookie)?;
+            let cookie_value = self.build_cookie_string(
+                &cookie_name,
+                &encrypted,
+                cookie::time::Duration::minutes(self.cookie_config.session_max_age_minutes),
+                is_https,
+            );
+            response.append_header("Set-Cookie", cookie_value)?;
         }
 
         Ok(())
+    }
+
+    /// Build a `Set-Cookie` header value with the configured attributes.
+    fn build_cookie_string(
+        &self,
+        name: &str,
+        value: &str,
+        max_age: cookie::time::Duration,
+        is_https: bool,
+    ) -> String {
+        let mut builder = Cookie::build((name.to_owned(), value.to_owned()))
+            .path("/")
+            .max_age(max_age)
+            .http_only(self.cookie_config.http_only)
+            .secure(is_https && self.cookie_config.secure);
+
+        if let Some(ref same_site) = self.cookie_config.same_site {
+            let ss = match same_site.to_lowercase().as_str() {
+                "strict" => cookie::SameSite::Strict,
+                "lax" => cookie::SameSite::Lax,
+                "none" => cookie::SameSite::None,
+                _ => cookie::SameSite::Lax,
+            };
+            builder = builder.same_site(ss);
+        }
+
+        builder.build().to_string()
     }
 
     /// Serve a static file from the filesystem
@@ -1844,40 +1938,36 @@ impl LoadBalancer {
         }
     }
 
-    /// Serve a static asset from CAS via database lookup.
-    /// Queries static_asset_cache for URL→hash, then reads blob from CAS.
-    /// Returns Ok(true) if served, Ok(false) if not found.
+    /// Serve a static asset from CAS via the in-memory lookup cache.
+    ///
+    /// `static_asset_lookup` resolves `(project_id, url_path) → content_hash`
+    /// using a moka TTL cache (60 s) so the `static_asset_cache` table is not
+    /// queried on every cacheable-asset request. Both hits and misses are cached;
+    /// the miss case (no fallback row — the common path for container deployments)
+    /// is the most important one to protect. See WS4 / `static_asset_lookup.rs`.
+    ///
+    /// Returns `Ok(true)` if the asset was served, `Ok(false)` if not found.
     async fn serve_asset_from_store(
         &self,
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
         url_path: &str,
     ) -> Result<bool> {
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
-        use temps_entities::static_asset_cache;
-
         let file_store = match &self.file_store {
             Some(fs) => fs,
             None => return Ok(false),
         };
 
-        // Look up content hash from database (most recent deployment first)
-        let project_id = ctx.project.as_ref().map(|p| p.id);
-        let cache_entry = if let Some(pid) = project_id {
-            static_asset_cache::Entity::find()
-                .filter(static_asset_cache::Column::ProjectId.eq(pid))
-                .filter(static_asset_cache::Column::UrlPath.eq(url_path))
-                .order_by_desc(static_asset_cache::Column::DeploymentId)
-                .one(self.db.as_ref())
+        // Resolve project_id, then look up the content hash via cache (no DB on hit/cached-miss).
+        let content_hash = match ctx.project.as_ref().map(|p| p.id) {
+            Some(pid) => match self
+                .static_asset_lookup
+                .get_content_hash(pid, url_path)
                 .await
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
-
-        let content_hash = match cache_entry {
-            Some(entry) => entry.content_hash,
+            {
+                Some(hash) => hash,
+                None => return Ok(false),
+            },
             None => return Ok(false),
         };
 
@@ -2028,45 +2118,6 @@ impl LoadBalancer {
     }
 }
 
-/// Returns true when `host` (or its wildcard parent) has an active TLS
-/// certificate stored in the database. Used to make the HTTP→HTTPS redirect
-/// per-domain rather than a global toggle: redirect only when a cert exists,
-/// serve plain HTTP otherwise. Mirrors the wildcard lookup in `tls_cert_loader`.
-async fn host_has_active_cert(db: &DbConnection, host: &str) -> bool {
-    // Exact match
-    let exact = domains::Entity::find()
-        .filter(domains::Column::Domain.eq(host))
-        // "active_renewal_failed" still serves a valid cert, so it counts here too.
-        .filter(domains::Column::Status.is_in(domains::CERT_SERVING_STATUSES))
-        .filter(domains::Column::Certificate.is_not_null())
-        .one(db)
-        .await
-        .ok()
-        .flatten();
-    if exact.is_some() {
-        return true;
-    }
-
-    // Wildcard match: api.example.com → *.example.com
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() >= 2 {
-        let wildcard = format!("*.{}", parts[1..].join("."));
-        let wc = domains::Entity::find()
-            .filter(domains::Column::Domain.eq(&wildcard))
-            .filter(domains::Column::Status.is_in(domains::CERT_SERVING_STATUSES))
-            .filter(domains::Column::Certificate.is_not_null())
-            .one(db)
-            .await
-            .ok()
-            .flatten();
-        if wc.is_some() {
-            return true;
-        }
-    }
-
-    false
-}
-
 /// Map an on-demand cert in-process state to the port-80 503 response the end
 /// user sees while the TLS handshake fast-fails (ADR-018 §5). Pure so the
 /// status/body contract is unit-tested without a Pingora session.
@@ -2116,6 +2167,102 @@ fn ephemeral_redirect_location(
     Some(location)
 }
 
+/// Core response-body-filter logic (SSE/WebSocket passthrough, buffered
+/// Markdown conversion, default passthrough). Split out as a free function
+/// so `response_body_filter` can wrap it with byte-counting that applies
+/// uniformly to every exit path — see `ProxyContext::upstream_body_bytes_received`.
+fn response_body_filter_inner(
+    body: &mut Option<Bytes>,
+    end_of_stream: bool,
+    ctx: &mut ProxyContext,
+) -> Result<Option<std::time::Duration>> {
+    // For SSE or WebSocket responses, pass through immediately without buffering
+    if ctx.is_sse || ctx.is_websocket {
+        if let Some(chunk) = body {
+            let stream_type = if ctx.is_sse { "SSE" } else { "WebSocket" };
+            debug!("Streaming {} chunk: {} bytes", stream_type, chunk.len());
+        }
+        return Ok(None);
+    }
+
+    // HTML-to-Markdown conversion: buffer chunks, convert on end_of_stream.
+    if ctx.wants_markdown {
+        if let Some(chunk) = body.take() {
+            // Enforce 2 MB limit — mirrors Cloudflare's Markdown for Agents constraint.
+            if ctx.markdown_buffer.len() + chunk.len() > MAX_MARKDOWN_BODY_BYTES {
+                warn!(
+                    "Response body exceeds 2 MB markdown conversion limit for path={}, \
+                     falling back to passthrough",
+                    ctx.path
+                );
+                // Disable markdown, flush the buffer + current chunk as-is.
+                ctx.wants_markdown = false;
+                let mut flushed = std::mem::take(&mut ctx.markdown_buffer);
+                flushed.extend_from_slice(&chunk);
+                *body = Some(Bytes::from(flushed));
+                return Ok(None);
+            }
+            ctx.markdown_buffer.extend_from_slice(&chunk);
+        }
+
+        if end_of_stream {
+            let html = String::from_utf8_lossy(&ctx.markdown_buffer);
+            // Parse the document once — reuse it for both meta extraction
+            // and content extraction.
+            let document = scraper::Html::parse_document(&html);
+            let meta = extract_page_meta(&document);
+            // Extract <main> (or <body> fallback), stripping script/style.
+            let content = extract_content_html(&document);
+            let markdown = match htmd::convert(&content) {
+                Ok(md) => md,
+                Err(e) => {
+                    warn!(
+                        "HTML-to-Markdown conversion failed for path={}: {}",
+                        ctx.path, e
+                    );
+                    // Fall back to the original HTML bytes so the client gets something.
+                    let original = std::mem::take(&mut ctx.markdown_buffer);
+                    *body = Some(Bytes::from(original));
+                    return Ok(None);
+                }
+            };
+
+            let token_estimate = estimate_markdown_tokens(&markdown);
+            debug!(
+                "Markdown conversion complete for path={}: {} bytes, ~{} tokens",
+                ctx.path,
+                markdown.len(),
+                token_estimate
+            );
+
+            // The x-markdown-tokens header must be a trailer because the response
+            // headers have already been sent. Pingora does not support HTTP trailers
+            // for regular HTTP/1.1 clients, so we log the value and skip injecting it
+            // into headers here — the header is set in response_filter instead via
+            // a sentinel value once we know the body size upfront (not possible when
+            // streaming).  Best-effort: we set it here anyway; Pingora will silently
+            // drop it if trailers are unsupported.
+            // Note: if you need reliable x-markdown-tokens delivery, switch to a
+            // buffered response pattern (write_response_* directly in request_filter).
+
+            // Prepend YAML front-matter built from <head> meta tags,
+            // matching Cloudflare's Markdown for Agents output format.
+            let final_markdown = match meta.to_frontmatter() {
+                Some(fm) => fm + &markdown,
+                None => markdown,
+            };
+
+            ctx.markdown_buffer = Vec::new(); // free memory
+            *body = Some(Bytes::from(final_markdown));
+        }
+        // Suppress intermediate chunks — only emit on end_of_stream.
+        return Ok(None);
+    }
+
+    // Default: pass all responses through without buffering
+    Ok(None)
+}
+
 #[async_trait]
 impl ProxyHttp for LoadBalancer {
     type CTX = ProxyContext;
@@ -2140,9 +2287,7 @@ impl ProxyHttp for LoadBalancer {
             referrer: None,
             ip_address: None,
             visitor_id: None,
-            visitor_id_i32: None,
             session_id: None,
-            session_id_i32: None,
             is_new_session: false,
             request_headers: None,
             response_headers: None,
@@ -2161,10 +2306,14 @@ impl ProxyHttp for LoadBalancer {
             tls_cipher: None,
             sni_hostname: None,
             upstream_body_bytes_received: 0,
+            client_body_bytes_received: 0,
+            pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
+            upstream_start_time: None,
+            upstream_response_time_ms: None,
             preview_route: None,
         }
     }
@@ -2429,7 +2578,7 @@ impl ProxyHttp for LoadBalancer {
                         return Ok(true);
                     }
 
-                    let stored_hash = match lookup_sandbox(&self.db, &hex).await {
+                    let stored_hash = match self.sandbox_lookup_cache.lookup(&hex).await {
                         PreviewSandboxLookup::Protected { password_hash } => password_hash,
                         PreviewSandboxLookup::Open => {
                             // No password configured — nothing to verify. Redirect to `/`.
@@ -2619,7 +2768,7 @@ impl ProxyHttp for LoadBalancer {
                     .map(|s| s.to_string());
 
                 let outcome = check_preview_auth(
-                    &self.db,
+                    &self.sandbox_lookup_cache,
                     &self.crypto,
                     &self.preview_auth_limiter,
                     preview_host,
@@ -3239,11 +3388,10 @@ impl ProxyHttp for LoadBalancer {
         // non-existent cert.
         // Gate on the cheap, in-memory checks FIRST so the common case (HTTPS
         // traffic, and HTTP hosts with no on-demand cert state) costs nothing.
-        // Critically, `get_settings()` is an uncached DB round-trip, so it must
-        // NOT run on every request: a request flood would otherwise amplify into
-        // a Postgres QPS flood. The on-demand UX only applies to plain-HTTP
-        // connections, and settings are needed solely for the rare ephemeral
-        // `redirect_to_env` branch — which `handle_on_demand_http` fetches lazily.
+        // `get_settings()` is TTL-cached (no Postgres round-trip), but the lazy
+        // fetch is still kept inside `handle_on_demand_http` so it only runs for
+        // the rare ephemeral `redirect_to_env` branch rather than for every
+        // plain-HTTP request.
         if self.on_demand_cert_manager.is_some()
             && !self.is_tls_connection(session)
             && self.handle_on_demand_http(session, ctx).await?
@@ -3262,9 +3410,11 @@ impl ProxyHttp for LoadBalancer {
         //
         // `disable_https_redirect` is a global escape hatch (set by the service
         // unit in local/testing mode) that bypasses the check entirely.
+        // WS3: cert-host check is now a lock-free ArcSwap snapshot read; the
+        // background `CertHostCache::run_refresh_loop` keeps it current (±30 s).
         let needs_redirect = !self.disable_https_redirect
             && !self.is_tls_connection(session)
-            && host_has_active_cert(self.db.as_ref(), &ctx.host).await;
+            && self.cert_host_cache.has_cert_for_host(&ctx.host);
         if needs_redirect {
             // Build the HTTPS redirect URL preserving path and query string
             let redirect_url = if let Some(query) = &ctx.query_string {
@@ -3489,10 +3639,7 @@ impl ProxyHttp for LoadBalancer {
                         || ctx.path.ends_with(".txt"));
 
                 if !is_static_asset {
-                    if let Err(e) = self.ensure_visitor_session(ctx).await {
-                        error!("Failed to ensure visitor session for static file: {:?}", e);
-                        // Continue serving the file even if visitor/session creation fails
-                    }
+                    self.ensure_visitor_session(ctx).await;
                 }
 
                 // Serve static file
@@ -3695,6 +3842,14 @@ impl ProxyHttp for LoadBalancer {
         Self::CTX: Send + Sync,
     {
         debug!("Upstream response filter headers: {:?}", upstream_response);
+
+        // First upstream header = backend latency (connect + upstream time).
+        if ctx.upstream_response_time_ms.is_none() {
+            if let Some(start) = ctx.upstream_start_time {
+                ctx.upstream_response_time_ms = Some(start.elapsed().as_millis() as u64);
+            }
+        }
+
         ctx.upstream_response_headers = Some(upstream_response.clone());
 
         let headers_map: HashMap<String, String> = upstream_response
@@ -3739,6 +3894,30 @@ impl ProxyHttp for LoadBalancer {
         Ok(())
     }
 
+    /// Accumulate request body bytes as they stream in. The only reliable
+    /// way to measure upload size — chunked-encoded request bodies carry no
+    /// `Content-Length` header and would otherwise log as 0 (see `log_request`).
+    async fn request_body_filter(
+        &self,
+        _session: &mut PingoraSession,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if let Some(chunk) = body.as_ref() {
+            ctx.client_body_bytes_received += chunk.len();
+        }
+        Ok(())
+    }
+
+    /// Thin wrapper over `response_body_filter_inner` that accumulates the
+    /// bytes actually forwarded to the client on every exit path (passthrough,
+    /// SSE/WebSocket, and the buffered Markdown conversion below). Chunked
+    /// responses carry no `Content-Length` header, so this accumulated count
+    /// is the only reliable source for response bandwidth (see `log_request`).
     fn response_body_filter(
         &self,
         _session: &mut PingoraSession,
@@ -3749,91 +3928,11 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
-        // For SSE or WebSocket responses, pass through immediately without buffering
-        if ctx.is_sse || ctx.is_websocket {
-            if let Some(chunk) = body {
-                let stream_type = if ctx.is_sse { "SSE" } else { "WebSocket" };
-                debug!("Streaming {} chunk: {} bytes", stream_type, chunk.len());
-            }
-            return Ok(None);
+        let result = response_body_filter_inner(body, end_of_stream, ctx);
+        if let Some(chunk) = body.as_ref() {
+            ctx.upstream_body_bytes_received += chunk.len();
         }
-
-        // HTML-to-Markdown conversion: buffer chunks, convert on end_of_stream.
-        if ctx.wants_markdown {
-            if let Some(chunk) = body.take() {
-                // Enforce 2 MB limit — mirrors Cloudflare's Markdown for Agents constraint.
-                if ctx.markdown_buffer.len() + chunk.len() > MAX_MARKDOWN_BODY_BYTES {
-                    warn!(
-                        "Response body exceeds 2 MB markdown conversion limit for path={}, \
-                         falling back to passthrough",
-                        ctx.path
-                    );
-                    // Disable markdown, flush the buffer + current chunk as-is.
-                    ctx.wants_markdown = false;
-                    let mut flushed = std::mem::take(&mut ctx.markdown_buffer);
-                    flushed.extend_from_slice(&chunk);
-                    *body = Some(Bytes::from(flushed));
-                    return Ok(None);
-                }
-                ctx.markdown_buffer.extend_from_slice(&chunk);
-            }
-
-            if end_of_stream {
-                let html = String::from_utf8_lossy(&ctx.markdown_buffer);
-                // Parse the document once — reuse it for both meta extraction
-                // and content extraction.
-                let document = scraper::Html::parse_document(&html);
-                let meta = extract_page_meta(&document);
-                // Extract <main> (or <body> fallback), stripping script/style.
-                let content = extract_content_html(&document);
-                let markdown = match htmd::convert(&content) {
-                    Ok(md) => md,
-                    Err(e) => {
-                        warn!(
-                            "HTML-to-Markdown conversion failed for path={}: {}",
-                            ctx.path, e
-                        );
-                        // Fall back to the original HTML bytes so the client gets something.
-                        let original = std::mem::take(&mut ctx.markdown_buffer);
-                        *body = Some(Bytes::from(original));
-                        return Ok(None);
-                    }
-                };
-
-                let token_estimate = estimate_markdown_tokens(&markdown);
-                debug!(
-                    "Markdown conversion complete for path={}: {} bytes, ~{} tokens",
-                    ctx.path,
-                    markdown.len(),
-                    token_estimate
-                );
-
-                // The x-markdown-tokens header must be a trailer because the response
-                // headers have already been sent. Pingora does not support HTTP trailers
-                // for regular HTTP/1.1 clients, so we log the value and skip injecting it
-                // into headers here — the header is set in response_filter instead via
-                // a sentinel value once we know the body size upfront (not possible when
-                // streaming).  Best-effort: we set it here anyway; Pingora will silently
-                // drop it if trailers are unsupported.
-                // Note: if you need reliable x-markdown-tokens delivery, switch to a
-                // buffered response pattern (write_response_* directly in request_filter).
-
-                // Prepend YAML front-matter built from <head> meta tags,
-                // matching Cloudflare's Markdown for Agents output format.
-                let final_markdown = match meta.to_frontmatter() {
-                    Some(fm) => fm + &markdown,
-                    None => markdown,
-                };
-
-                ctx.markdown_buffer = Vec::new(); // free memory
-                *body = Some(Bytes::from(final_markdown));
-            }
-            // Suppress intermediate chunks — only emit on end_of_stream.
-            return Ok(None);
-        }
-
-        // Default: pass all responses through without buffering
-        Ok(None)
+        result
     }
 
     async fn response_filter(
@@ -3953,16 +4052,9 @@ impl ProxyHttp for LoadBalancer {
 
         let is_api_endpoint = ctx.path.starts_with("/api/") || ctx.path.starts_with("/_temps/");
 
-        // Check if we should track this visitor using the trait
-        let should_track = self
-            .visitor_manager
-            .should_track_visitor(
-                &ctx.path,
-                ctx.content_type.as_deref(),
-                status_code,
-                None, // We'll pass project context if available
-            )
-            .await;
+        // Check if we should track this page view
+        let should_track =
+            Self::should_track_page(&ctx.path, ctx.content_type.as_deref(), status_code);
 
         // Only create visitor/session for appropriate requests (skip for SSE)
         if !ctx.skip_tracking
@@ -3971,9 +4063,7 @@ impl ProxyHttp for LoadBalancer {
             && !is_static_asset
             && !is_api_endpoint
         {
-            if let Err(e) = self.ensure_visitor_session(ctx).await {
-                error!("Failed to ensure visitor session: {:?}", e);
-            }
+            self.ensure_visitor_session(ctx).await;
         } else {
             debug!(
                 "Skipping visitor creation for: path={}, content_type={:?}, status={}, skip_tracking={}",
@@ -3998,6 +4088,10 @@ impl ProxyHttp for LoadBalancer {
         session: &mut PingoraSession,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
+        // Backend-latency basis. On connect retries this is re-stamped, so the
+        // metric measures the attempt that actually served the response.
+        ctx.upstream_start_time = Some(Instant::now());
+
         // WebSocket upgrades legitimately sit silent for minutes (idle
         // terminals, push-only feeds). Cap them at 1h instead of the 60s
         // default that HTTP uses, otherwise Pingora RSTs the socket every
@@ -4018,8 +4112,16 @@ impl ProxyHttp for LoadBalancer {
         // Workspace preview gateway: skip the route table and forward straight
         // to the local gateway. The host header is preserved so the gateway
         // can decode `ws-<sid>-<port>` and pick the right sandbox container.
-        if ctx.preview_route.is_some() {
+        //
+        // Every preview target shares this same physical peer address, so
+        // `group_key` MUST be set per-target — otherwise Pingora's
+        // connection pool considers all sandboxes' requests interchangeable
+        // and can hand a connection opened for one sandbox back out to
+        // serve a different sandbox's request (see `preview_peer_group_key`
+        // doc comment for the full mechanism).
+        if let Some(host) = &ctx.preview_route {
             let mut peer = Box::new(HttpPeer::new(PREVIEW_GATEWAY_PEER, false, String::new()));
+            peer.group_key = preview_peer_group_key(host);
             peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
             peer.options.read_timeout = Some(io_timeout);
             peer.options.write_timeout = Some(io_timeout);
@@ -4171,12 +4273,16 @@ impl ProxyHttp for LoadBalancer {
 
         // Asynchronously log failed proxy request (skip static assets)
         if Self::should_log_request(&ctx.path) {
-            // Extract request size from Content-Length header
-            let request_size = ctx
-                .request_headers
-                .as_ref()
-                .and_then(|h| h.get("content-length"))
-                .and_then(|v| v.parse::<i64>().ok());
+            // Prefer bytes actually received from the client (see log_request);
+            // fall back to Content-Length if the body never reached the filter.
+            let request_size = if ctx.client_body_bytes_received > 0 {
+                Some(ctx.client_body_bytes_received as i64)
+            } else {
+                ctx.request_headers
+                    .as_ref()
+                    .and_then(|h| h.get("content-length"))
+                    .and_then(|v| v.parse::<i64>().ok())
+            };
 
             // For failed requests, response size is the error message size
             let response_size = Some(SERVICE_UNAVAILABLE_BODY.len() as i64);
@@ -4194,8 +4300,10 @@ impl ProxyHttp for LoadBalancer {
                 project_id: ctx.project.as_ref().map(|p| p.id),
                 environment_id: ctx.environment.as_ref().map(|e| e.id),
                 deployment_id: ctx.deployment.as_ref().map(|d| d.id),
-                session_id: ctx.session_id_i32,
-                visitor_id: ctx.visitor_id_i32,
+                session_id: None,
+                visitor_id: None,
+                visitor_uuid: ctx.visitor_id.clone(),
+                session_uuid: ctx.session_id.clone(),
                 container_id: None,
                 upstream_host: None,
                 error_message: ctx.error_message.clone(),
@@ -4225,15 +4333,55 @@ impl ProxyHttp for LoadBalancer {
                 error_group_id: None,
             };
 
-            // Send to batch writer (non-blocking, drops if buffer full)
-            if !self.proxy_log_handle.try_send(proxy_log_request) {
-                warn!("Proxy log batch writer full, failed request log entry dropped");
-            }
+            // Non-blocking enqueue; shed with rate-limited accounting when full.
+            self.proxy_log_handle.send_or_drop(proxy_log_request);
         }
 
         FailToProxy {
             error_code,
             can_reuse_downstream,
+        }
+    }
+
+    /// End-of-request hook — Pingora calls this exactly once for EVERY
+    /// request, whether it was proxied, served directly from `request_filter`
+    /// (redirects, password walls, ACME challenges, static files), or failed.
+    /// This is therefore the single record site for hot-path metrics, which
+    /// guarantees the destination counters sum to `proxy.requests`.
+    async fn logging(&self, session: &mut PingoraSession, _e: Option<&Error>, ctx: &mut Self::CTX)
+    where
+        Self::CTX: Send + Sync,
+    {
+        // No response written (client abort / connect failure with no reply)
+        // has no status; 0 falls into the 5xx class, which is the honest read.
+        let status_code = session
+            .response_written()
+            .map(|resp| resp.status.as_u16())
+            .unwrap_or(0);
+
+        let destination = crate::metrics::RequestDestination::classify(
+            ctx.project.is_some(),
+            &ctx.routing_status,
+        );
+
+        // Hot path: a handful of relaxed atomic adds, no locks, no I/O.
+        self.proxy_metrics.record(
+            status_code,
+            ctx.start_time.elapsed().as_millis() as u64,
+            ctx.upstream_response_time_ms,
+            destination,
+        );
+
+        // The response body has now fully streamed through response_body_filter
+        // (this hook fires in Pingora's finish(), after every body task), so
+        // upstream_body_bytes_received holds the real byte count. Patch it into
+        // the entry log_request stashed at header-time and send it now — this
+        // is the only place a proxied response's byte count is accurate.
+        if let Some(mut pending) = ctx.pending_proxy_log.take() {
+            if ctx.upstream_body_bytes_received > 0 {
+                pending.response_size_bytes = Some(ctx.upstream_body_bytes_received as i64);
+            }
+            self.proxy_log_handle.send_or_drop(pending);
         }
     }
 }
@@ -4502,9 +4650,7 @@ mod markdown_tests {
             referrer: None,
             ip_address: Some("127.0.0.1".to_string()),
             visitor_id: None,
-            visitor_id_i32: None,
             session_id: None,
-            session_id_i32: None,
             is_new_session: false,
             request_headers: None,
             response_headers: None,
@@ -4523,10 +4669,14 @@ mod markdown_tests {
             tls_cipher: None,
             sni_hostname: None,
             upstream_body_bytes_received: 0,
+            client_body_bytes_received: 0,
+            pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
+            upstream_start_time: None,
+            upstream_response_time_ms: None,
             preview_route: None,
         }
     }
@@ -5043,9 +5193,7 @@ mod markdown_pipeline_tests {
             referrer: None,
             ip_address: Some("127.0.0.1".to_string()),
             visitor_id: None,
-            visitor_id_i32: None,
             session_id: None,
-            session_id_i32: None,
             is_new_session: false,
             request_headers: None,
             response_headers: None,
@@ -5064,10 +5212,14 @@ mod markdown_pipeline_tests {
             tls_cipher: None,
             sni_hostname: None,
             upstream_body_bytes_received: 0,
+            client_body_bytes_received: 0,
+            pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
+            upstream_start_time: None,
+            upstream_response_time_ms: None,
             preview_route: None,
         }
     }

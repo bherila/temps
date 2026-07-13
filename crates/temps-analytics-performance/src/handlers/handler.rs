@@ -1,7 +1,8 @@
 use super::types::AppState;
 use crate::services::service::{
     GroupBy, GroupedPageMetric, GroupedPageMetricsResponse, MetricsOverTimeResponse,
-    PerformanceMetricsResponse, RecordPerformanceMetricsConfig, UpdatePerformanceMetricsConfig,
+    PerformanceMetricsResponse, RecordPerformanceMetricsConfig, SpeedSegmentFilters,
+    UpdatePerformanceMetricsConfig,
 };
 use axum::http::header::HeaderMap;
 use axum::Extension;
@@ -14,9 +15,44 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use temps_auth::{AuthContext, Permission, RequireAuth};
 use temps_core::DateTime;
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
+
+/// Manual auth check for this crate's dashboard-query handlers.
+///
+/// These handlers predate the `Result<impl IntoResponse, Problem>` convention
+/// used elsewhere and return `(StatusCode, Json<ErrorResponse>)` instead, so
+/// they can't use the `permission_guard!`/`project_scope_guard!` macros
+/// directly (those return `Problem`). This mirrors the same two checks.
+fn require_analytics_read(
+    auth: &AuthContext,
+    project_id: i32,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if !auth.has_permission(&Permission::AnalyticsRead) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Insufficient permissions".to_string(),
+                details: Some("This operation requires the AnalyticsRead permission".to_string()),
+            }),
+        ));
+    }
+    if !auth.is_scoped_to_project(project_id) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Cross-project access denied".to_string(),
+                details: Some(
+                    "This deployment token is scoped to a different project and cannot access this resource"
+                        .to_string(),
+                ),
+            }),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Deserialize, Clone, ToSchema)]
 pub struct PerformanceMetricsQuery {
@@ -27,6 +63,14 @@ pub struct PerformanceMetricsQuery {
     deployment_id: Option<i32>,
     /// Device type filter: "desktop" or "mobile"
     device_type: Option<String>,
+    /// Include crawler/datacenter (bot) samples. Defaults to false — bots
+    /// are excluded from the read view but always stored at ingest.
+    include_bots: Option<bool>,
+    /// Segment filters (filter_path, filter_country, filter_region,
+    /// filter_city, filter_browser, filter_operating_system) — flattened so
+    /// each remains a top-level query string param.
+    #[serde(flatten)]
+    segment: SpeedSegmentFilters,
 }
 
 #[derive(Deserialize, Clone, ToSchema)]
@@ -36,7 +80,15 @@ pub struct GroupedPageMetricsQuery {
     project_id: i32,
     environment_id: Option<i32>,
     deployment_id: Option<i32>,
-    group_by: String, // "path", "country", "device_type", "browser", "operating_system"
+    /// Device type filter: "desktop" or "mobile"
+    device_type: Option<String>,
+    /// Include crawler/datacenter (bot) samples. Defaults to false.
+    include_bots: Option<bool>,
+    // "path", "country", "region", "city", "device_type", "browser", "operating_system"
+    group_by: String,
+    /// Segment filters — same shape as `PerformanceMetricsQuery`.
+    #[serde(flatten)]
+    segment: SpeedSegmentFilters,
 }
 
 #[derive(Deserialize, Clone, ToSchema)]
@@ -155,18 +207,31 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
         ("project_id" = i32, Query, description = "Project ID or slug"),
         ("environment_id" = Option<i32>, Query, description = "Environment ID (optional)"),
         ("deployment_id" = Option<i32>, Query, description = "Deployment ID (optional)"),
-        ("device_type" = Option<String>, Query, description = "Device type filter: desktop or mobile (optional)")
+        ("device_type" = Option<String>, Query, description = "Device type filter: desktop or mobile (optional)"),
+        ("include_bots" = Option<bool>, Query, description = "Include crawler/datacenter bot samples (default false)"),
+        ("filter_path" = Option<String>, Query, description = "Filter to one page pathname (optional)"),
+        ("filter_country" = Option<String>, Query, description = "Filter to one country (optional)"),
+        ("filter_region" = Option<String>, Query, description = "Filter to one region (optional)"),
+        ("filter_city" = Option<String>, Query, description = "Filter to one city (optional)"),
+        ("filter_browser" = Option<String>, Query, description = "Filter to one browser (optional)"),
+        ("filter_operating_system" = Option<String>, Query, description = "Filter to one operating system (optional)")
     ),
     responses(
         (status = 200, description = "Successfully retrieved performance metrics", body = PerformanceMetricsResponse),
         (status = 400, description = "Invalid date format or missing parameters", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 async fn get_performance_metrics(
+    RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Query(query): Query<PerformanceMetricsQuery>,
 ) -> Result<Json<PerformanceMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_analytics_read(&auth, query.project_id)?;
+
     match state
         .performance_service
         .get_metrics(
@@ -176,6 +241,8 @@ async fn get_performance_metrics(
             query.environment_id,
             query.deployment_id,
             query.device_type,
+            &query.segment,
+            query.include_bots.unwrap_or(false),
         )
         .await
     {
@@ -204,18 +271,31 @@ async fn get_performance_metrics(
         ("project_id" = i32, Query, description = "Project ID or slug"),
         ("environment_id" = Option<i32>, Query, description = "Environment ID (optional)"),
         ("deployment_id" = Option<i32>, Query, description = "Deployment ID (optional)"),
-        ("device_type" = Option<String>, Query, description = "Device type filter: desktop or mobile (optional)")
+        ("device_type" = Option<String>, Query, description = "Device type filter: desktop or mobile (optional)"),
+        ("include_bots" = Option<bool>, Query, description = "Include crawler/datacenter bot samples (default false)"),
+        ("filter_path" = Option<String>, Query, description = "Filter to one page pathname (optional)"),
+        ("filter_country" = Option<String>, Query, description = "Filter to one country (optional)"),
+        ("filter_region" = Option<String>, Query, description = "Filter to one region (optional)"),
+        ("filter_city" = Option<String>, Query, description = "Filter to one city (optional)"),
+        ("filter_browser" = Option<String>, Query, description = "Filter to one browser (optional)"),
+        ("filter_operating_system" = Option<String>, Query, description = "Filter to one operating system (optional)")
     ),
     responses(
         (status = 200, description = "Successfully retrieved metrics over time", body = MetricsOverTimeResponse),
         (status = 400, description = "Invalid date format or missing parameters", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 async fn get_metrics_over_time(
+    RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Query(query): Query<PerformanceMetricsQuery>,
 ) -> Result<Json<MetricsOverTimeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_analytics_read(&auth, query.project_id)?;
+
     match state
         .performance_service
         .get_metrics_over_time(
@@ -225,6 +305,8 @@ async fn get_metrics_over_time(
             query.environment_id,
             query.deployment_id,
             query.device_type,
+            &query.segment,
+            query.include_bots.unwrap_or(false),
         )
         .await
     {
@@ -253,21 +335,37 @@ async fn get_metrics_over_time(
         ("project_id" = i32, Query, description = "Project ID or slug"),
         ("environment_id" = Option<i32>, Query, description = "Environment ID (optional)"),
         ("deployment_id" = Option<i32>, Query, description = "Deployment ID (optional)"),
-        ("group_by" = String, Query, description = "Group by: path, country, device_type, browser, operating_system")
+        ("group_by" = String, Query, description = "Group by: path, country, region, city, device_type, browser, operating_system"),
+        ("device_type" = Option<String>, Query, description = "Device type filter: desktop or mobile (optional)"),
+        ("include_bots" = Option<bool>, Query, description = "Include crawler/datacenter bot samples (default false)"),
+        ("filter_path" = Option<String>, Query, description = "Filter to one page pathname (optional)"),
+        ("filter_country" = Option<String>, Query, description = "Filter to one country (optional)"),
+        ("filter_region" = Option<String>, Query, description = "Filter to one region (optional)"),
+        ("filter_city" = Option<String>, Query, description = "Filter to one city (optional)"),
+        ("filter_browser" = Option<String>, Query, description = "Filter to one browser (optional)"),
+        ("filter_operating_system" = Option<String>, Query, description = "Filter to one operating system (optional)")
     ),
     responses(
         (status = 200, description = "Successfully retrieved grouped page metrics", body = GroupedPageMetricsResponse),
         (status = 400, description = "Invalid date format, missing parameters, or invalid group_by value", body = ErrorResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 async fn get_grouped_page_metrics(
+    RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Query(query): Query<GroupedPageMetricsQuery>,
 ) -> Result<Json<GroupedPageMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_analytics_read(&auth, query.project_id)?;
+
     let group_by = match query.group_by.as_str() {
         "path" => GroupBy::Path,
         "country" => GroupBy::Country,
+        "region" => GroupBy::Region,
+        "city" => GroupBy::City,
         "device_type" => GroupBy::DeviceType,
         "browser" => GroupBy::Browser,
         "operating_system" => GroupBy::OperatingSystem,
@@ -277,7 +375,7 @@ async fn get_grouped_page_metrics(
                 Json(ErrorResponse {
                     error: "Invalid group_by parameter".to_string(),
                     details: Some(
-                        "group_by must be one of: path, country, device_type, browser, operating_system"
+                        "group_by must be one of: path, country, region, city, device_type, browser, operating_system"
                             .to_string(),
                     ),
                 }),
@@ -293,6 +391,9 @@ async fn get_grouped_page_metrics(
             query.project_id,
             query.environment_id,
             query.deployment_id,
+            query.device_type.clone(),
+            &query.segment,
+            query.include_bots.unwrap_or(false),
             group_by,
         )
         .await
@@ -321,13 +422,19 @@ async fn get_grouped_page_metrics(
     ),
     responses(
         (status = 200, description = "Successfully checked performance metrics availability", body = HasMetricsResponse),
+        (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 async fn has_performance_metrics(
+    RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Query(query): Query<HasMetricsQuery>,
 ) -> Result<Json<HasMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_analytics_read(&auth, query.project_id)?;
+
     match state
         .performance_service
         .has_metrics(query.project_id)

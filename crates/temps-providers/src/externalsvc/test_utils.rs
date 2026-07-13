@@ -33,12 +33,10 @@ mod docker_utils {
             use bollard::query_parameters::CreateImageOptions;
             use futures::StreamExt;
 
-            // Sweep any `temps-test-minio-*` containers left behind by a
-            // killed previous test run. Even though container names are
-            // already unique-per-call (timestamp + random suffix), the
-            // leaked instances hold ports + memory and pile up on dev
-            // machines and CI runners. This sweep is best-effort —
-            // anything we can't remove just stays for someone else.
+            // Sweep stale `temps-test-minio-*` containers left behind by a
+            // killed previous test run. The sweep is state/age aware so a test
+            // that starts multiple MinIO instances does not delete its own
+            // first container when creating the second one.
             sweep_orphan_test_containers(&docker, "temps-test-minio-").await;
 
             // Find available port for MinIO - use random offset to avoid parallel test conflicts
@@ -48,6 +46,17 @@ mod docker_utils {
             let secret_key = "minioadmin";
 
             println!("Starting MinIO container on port {}...", port);
+
+            // Join the same app network the real Postgres/Redis/S3/MongoDB
+            // service containers use (see `ensure_network_exists`) so
+            // `S3Credentials::resolve_endpoint_for_container` can find this
+            // container by name and resolve a proper container-to-container
+            // address, instead of falling back to `host.docker.internal`
+            // (unreliable/unset on Linux without an explicit host-gateway
+            // mapping, which is exactly what caused backup tests to hang).
+            crate::utils::ensure_network_exists(&docker)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
 
             // Pull MinIO image
             let mut pull_stream = docker.create_image(
@@ -84,6 +93,12 @@ mod docker_utils {
                         }]),
                     )])),
                     ..Default::default()
+                }),
+                networking_config: Some(bollard::models::NetworkingConfig {
+                    endpoints_config: Some(HashMap::from([(
+                        temps_core::NETWORK_NAME.to_string(),
+                        bollard::models::EndpointSettings::default(),
+                    )])),
                 }),
                 ..Default::default()
             };
@@ -195,16 +210,24 @@ mod docker_utils {
         /// Build S3Credentials from the test container's configuration.
         /// In tests, credentials are plaintext (not encrypted).
         ///
-        /// Uses `host.docker.internal` instead of `localhost` because these credentials
-        /// are passed as environment variables to WAL-G running *inside* Docker containers.
-        /// From inside a container, `localhost` refers to the container itself, not the host
-        /// where MinIO is exposed. `host.docker.internal` resolves to the host on Docker Desktop.
+        /// Uses `localhost`, matching `s3_source.endpoint` above — these
+        /// credentials are passed to WAL-G running *inside* a Docker
+        /// container, and `run_walg_backup_push` resolves the endpoint via
+        /// `S3Credentials::resolve_endpoint_for_container` before use. That
+        /// resolver specifically detects `localhost`/`127.0.0.1` and looks up
+        /// this MinIO container by name on the shared app network (see
+        /// `ensure_network_exists` above), only falling back to
+        /// `host.docker.internal` if it can't find it. Hardcoding
+        /// `host.docker.internal` here bypassed that lookup entirely and
+        /// relied on a hostname that isn't reliably resolvable on Linux
+        /// without an explicit host-gateway mapping — the root cause of
+        /// backup tests hanging indefinitely on CI.
         pub fn s3_credentials(&self) -> super::super::S3Credentials {
             super::super::S3Credentials {
                 access_key_id: self.access_key.clone(),
                 secret_key: self.secret_key.clone(),
                 region: "us-east-1".to_string(),
-                endpoint: Some(format!("http://host.docker.internal:{}", self.port)),
+                endpoint: Some(format!("http://localhost:{}", self.port)),
                 bucket_name: self.bucket_name.clone(),
                 bucket_path: "".to_string(),
                 force_path_style: true,
@@ -312,22 +335,23 @@ mod docker_utils {
         ))
     }
 
-    /// Best-effort removal of orphaned test containers whose names start
-    /// with `name_prefix`. Used by integration helpers (e.g.
-    /// `MinioTestContainer::start`) to keep dev machines and CI runners
-    /// from accumulating leaked containers when a test panics before
-    /// reaching its cleanup path.
+    /// Best-effort removal of stale test containers whose names start with
+    /// `name_prefix`. Used by integration helpers (e.g.
+    /// `MinioTestContainer::start`) to keep dev machines and CI runners from
+    /// accumulating leaked containers when a test panics before reaching its
+    /// cleanup path.
     ///
     /// All errors are swallowed — this is a "make a best attempt"
     /// hygiene step, not a correctness gate.
     pub(super) async fn sweep_orphan_test_containers(docker: &Docker, name_prefix: &str) {
         use bollard::query_parameters::{ListContainersOptions, RemoveContainerOptions};
 
+        const ACTIVE_CONTAINER_GRACE_SECONDS: i64 = 60 * 60;
+
         let mut filters = HashMap::new();
         // Docker matches `name` filters as a substring, so the prefix
-        // alone is enough; the per-test timestamp/random suffix keeps
-        // it from sweeping concurrent siblings since each test waits
-        // on its own future.
+        // alone is enough; state/age checks below keep this from sweeping
+        // active siblings in the same test process.
         filters.insert("name".to_string(), vec![name_prefix.to_string()]);
 
         let Ok(containers) = docker
@@ -342,6 +366,27 @@ mod docker_utils {
         };
 
         for c in containers {
+            let is_active = matches!(
+                c.state,
+                Some(
+                    bollard::models::ContainerSummaryStateEnum::CREATED
+                        | bollard::models::ContainerSummaryStateEnum::RUNNING
+                        | bollard::models::ContainerSummaryStateEnum::RESTARTING
+                )
+            );
+            if is_active {
+                let too_young_to_sweep = c
+                    .created
+                    .map(|created| {
+                        chrono::Utc::now().timestamp().saturating_sub(created)
+                            < ACTIVE_CONTAINER_GRACE_SECONDS
+                    })
+                    .unwrap_or(true);
+                if too_young_to_sweep {
+                    continue;
+                }
+            }
+
             let id = match c.id {
                 Some(id) => id,
                 None => continue,
@@ -414,6 +459,8 @@ pub fn create_mock_external_service(
         consecutive_health_failures: 0,
         health_metadata: None,
         metrics_enabled: false,
+        default_backup_provisioned: false,
+        container_name: None,
     }
 }
 

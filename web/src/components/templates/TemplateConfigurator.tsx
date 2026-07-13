@@ -70,7 +70,6 @@ import {
   EyeOff,
   ExternalLink,
   GitBranch,
-  Gitlab,
   Loader2,
   Lock,
   Plus,
@@ -82,6 +81,7 @@ import {
   X,
 } from 'lucide-react'
 import Github from '@/icons/Github'
+import Gitlab from '@/icons/Gitlab'
 
 /**
  * Renders the correct icon for a Git provider type — used in the connection
@@ -106,6 +106,7 @@ function ProviderIcon({
 // Common service types
 const SERVICE_TYPES = [
   { id: 'postgres' as ServiceTypeRoute, name: 'PostgreSQL', description: 'Reliable Relational Database' },
+  { id: 'mariadb' as ServiceTypeRoute, name: 'MariaDB', description: 'Shared MySQL-compatible Database' },
   { id: 'redis' as ServiceTypeRoute, name: 'Redis', description: 'In-Memory Data Store' },
   { id: 's3' as ServiceTypeRoute, name: 'S3 / RustFS', description: 'S3-compatible Object Storage' },
   { id: 'libsql' as ServiceTypeRoute, name: 'LibSQL', description: 'SQLite-compatible Database' },

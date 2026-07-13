@@ -5,6 +5,146 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.46] - 2026-07-12
+
+### Added
+
+- **otel,proxy:** Parameterize ClickHouse retention via per-row retention_days
+- **web:** Add per-dimension web vitals breakdown to speed insights
+- **analytics-performance:** Geo breakdowns and segment filters for speed metrics
+- **web:** World map of web vitals by country on the speed page
+- **analytics-performance:** Read-time bot filtering for speed metrics
+
+### Documentation
+
+- **agents:** Document Docker safety constraints ([#232](https://github.com/gotempsh/temps/issues/232))
+- **retention:** Remove EE mentions from OSS comments
+
+### Fixed
+
+- **web:** Adapt chart and replay types to recharts 3 and rrweb-player 2 ([#277](https://github.com/gotempsh/temps/issues/277))
+- **otel,proxy:** Register RetentionResolver via the service registry
+- **otel,proxy:** Defer RetentionResolver lookup past plugin registration order
+- **analytics:** Exclude bots and datacenter IPs from live-visitors ([#281](https://github.com/gotempsh/temps/issues/281))
+- **proxy:** Thread a shared RetentionResolver into the live Pingora proxy
+- **retention:** Write-once guard on RetentionResolverSlot + guardrail docs
+- **analytics-performance:** Group page metrics on performance_metrics columns
+- **react-analytics:** Send pathname field the speed ingest endpoint expects
+- **security:** Close three unauthenticated-access CRITICALs ([#288](https://github.com/gotempsh/temps/issues/288))
+- **providers:** Reject client-supplied internal-only fields on external-service create ([#287](https://github.com/gotempsh/temps/issues/287))
+
+### Miscellaneous
+
+- **deps-dev:** Bump eslint from 9.37.0 to 10.6.0 in /web ([#213](https://github.com/gotempsh/temps/issues/213))
+- **deps-dev:** Bump @rsbuild/core from 1.5.1 to 2.1.4 in /web ([#209](https://github.com/gotempsh/temps/issues/209))
+- **deps-dev:** Bump @rsbuild/plugin-react from 1.4.0 to 2.1.0 in /web ([#217](https://github.com/gotempsh/temps/issues/217))
+- **sdk:** Bump analytics-browser, kv, blob, node-sdk for npm publish ([#286](https://github.com/gotempsh/temps/issues/286))
+
+### Performance
+
+- **proxy:** Serve proxy-log stats from a 1-minute continuous aggregate ([#278](https://github.com/gotempsh/temps/issues/278))
+- **otel:** Make storage quota opt-in, disabled by default ([#283](https://github.com/gotempsh/temps/issues/283))
+
+## [0.1.0-beta.45] - 2026-07-11
+
+### Added
+
+- **web:** Add Let's Encrypt contact email to Settings page ([#273](https://github.com/gotempsh/temps/issues/273))
+- **dns:** Add Pebble challtestsrv-backed DNS provider for local testing ([#275](https://github.com/gotempsh/temps/issues/275))
+
+### CI
+
+- **release:** Cut macOS/web build time in release pipeline ([#271](https://github.com/gotempsh/temps/issues/271))
+
+### Fixed
+
+- **proxy:** Isolate preview connection-pool by sandbox target ([#274](https://github.com/gotempsh/temps/issues/274))
+- **proxy:** Track real body bytes for request/response bandwidth ([#276](https://github.com/gotempsh/temps/issues/276))
+
+## [0.1.0-beta.44] - 2026-07-10
+
+### Fixed
+
+- **domains:** Wire config/DNS services into TlsService for auto-renewal ([#270](https://github.com/gotempsh/temps/issues/270))
+
+## [0.1.0-beta.43] - 2026-07-10
+
+### Added
+
+- **analytics-sdk:** Exclude sensitive paths from session replay by default
+- **auth:** Audit concurrent sessions and allow requiring MFA for admins ([#189](https://github.com/gotempsh/temps/issues/189))
+- **deployments:** Add generic DeploymentGate extension point ([#229](https://github.com/gotempsh/temps/issues/229))
+- **providers:** Add managed S3 backend protocol + minIO support ([#144](https://github.com/gotempsh/temps/issues/144))
+- **auth:** Add platform-admin role, key/token rotation, and MCP kill-switch ([#191](https://github.com/gotempsh/temps/issues/191))
+- **deployments:** Add SecretsManagerResolver OSS extension seam (ADR 0009 §1-2) ([#252](https://github.com/gotempsh/temps/issues/252))
+- **proxy:** Hot-path metrics with node dashboard and default alerts ([#258](https://github.com/gotempsh/temps/issues/258))
+- **auth:** Add ProjectAccessChecker trait and project_access_guard! macro (ADR 028 Phase A) ([#260](https://github.com/gotempsh/temps/issues/260))
+- **ai-chat:** Allow AI write tool to provision and link external services ([#256](https://github.com/gotempsh/temps/issues/256))
+- **auth:** Wire project_access_guard! into all project-scoped handlers (ADR 028 Phase B) ([#261](https://github.com/gotempsh/temps/issues/261))
+- **ai-tools:** Expose deployment and node metrics to AI read allowlist ([#265](https://github.com/gotempsh/temps/issues/265))
+- **auth:** Project-scoped permission narrowing (project_permission_guard!) ([#268](https://github.com/gotempsh/temps/issues/268))
+
+### CI
+
+- Add dependency and container scanning for Temps' own supply chain ([#187](https://github.com/gotempsh/temps/issues/187))
+- Auto-merge dependabot patch/minor PRs once CI passes ([#228](https://github.com/gotempsh/temps/issues/228))
+- Reduce rust-cache eviction churn and stop starving PRs of it ([#248](https://github.com/gotempsh/temps/issues/248))
+- Fix unit-tests build taking 22m+ due to feature-flag cache mismatch
+- Build test binaries once via cargo-nextest, share across all jobs ([#253](https://github.com/gotempsh/temps/issues/253))
+
+### Documentation
+
+- Forbid environment variables for runtime configuration
+- Require new features to scale on small resources ([#257](https://github.com/gotempsh/temps/issues/257))
+- **adr:** Project-scoped RBAC enforcement (ADR 028) ([#259](https://github.com/gotempsh/temps/issues/259))
+
+### Fixed
+
+- **ci:** Make rust-tests reliably fail on test failures
+- **providers:** Bind provisioned service ports to 127.0.0.1 instead of 0.0.0.0 ([#190](https://github.com/gotempsh/temps/issues/190))
+- **ci:** Serialize docker-deployments integration tests to stop Postgres deadlocks ([#195](https://github.com/gotempsh/temps/issues/195))
+- **test-utils:** Disable TimescaleDB background workers in TestDatabase ([#196](https://github.com/gotempsh/temps/issues/196))
+- **ci:** Disable TimescaleDB background workers in integration-tests services container ([#197](https://github.com/gotempsh/temps/issues/197))
+- **web:** Resolve gitlab vs github commit links and trace UI polish ([#231](https://github.com/gotempsh/temps/issues/231))
+- **web:** Add web TypeScript check to CI and fix all errors ([#233](https://github.com/gotempsh/temps/issues/233))
+- Resolve stacked dependency-bump compilation breaks on main ([#247](https://github.com/gotempsh/temps/issues/247))
+- Repair rcgen 0.14 API breaks on main ([#250](https://github.com/gotempsh/temps/issues/250))
+- **providers:** Persist actual bound port after container creation retry ([#254](https://github.com/gotempsh/temps/issues/254))
+- **auth:** Enforce privilege ceiling on custom API key permissions ([#267](https://github.com/gotempsh/temps/issues/267))
+- **analytics:** Resolve visitor_id on lookup miss instead of dropping it ([#269](https://github.com/gotempsh/temps/issues/269))
+
+### Miscellaneous
+
+- **scripts:** Add local testcontainer orphan-cleanup script ([#246](https://github.com/gotempsh/temps/issues/246))
+
+### Performance
+
+- **proxy:** Remove per-request database dependencies from the hot path ([#230](https://github.com/gotempsh/temps/issues/230))
+- **otel:** Cache storage quota checks to cut ingest DB load ([#262](https://github.com/gotempsh/temps/issues/262))
+- **auth:** Throttle last_used_at writes on every authenticated request ([#264](https://github.com/gotempsh/temps/issues/264))
+- Bound proxy-log and monitor-health hypertable lookups by time ([#266](https://github.com/gotempsh/temps/issues/266))
+
+### Security
+
+- Gate unauthenticated admin endpoints + expand AI chat allowlist ([#249](https://github.com/gotempsh/temps/issues/249))
+
+## [0.1.0-beta.42] - 2026-07-04
+
+### Added
+
+- **web:** Surface AI invocations inline in trace views ([#185](https://github.com/gotempsh/temps/issues/185))
+- **otel:** Label filters and per-series dynamic alerting for metric alerts
+- **otel:** Cross-project trace linking (ADR-027) ([#186](https://github.com/gotempsh/temps/issues/186))
+
+### Fixed
+
+- **analytics:** Exclude zero-visitor groups from property breakdown
+- **analytics:** Exclude zero-visitor groups from ClickHouse breakdown
+- **domains:** Stop ACME TXT records from stacking across renewals ([#182](https://github.com/gotempsh/temps/issues/182))
+- **analytics:** Stop fabricating +/-100% dashboard trend when there's no baseline
+- **providers:** Harden postgres major upgrades ([#151](https://github.com/gotempsh/temps/issues/151))
+- **deployer:** Make cluster DNS injection opt-in (experimental beta) ([#194](https://github.com/gotempsh/temps/issues/194))
+
 ## [0.1.0-beta.41] - 2026-07-02
 
 ### CI
@@ -180,24 +320,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **multi-node:** Real container deploy over mTLS (gated live test)
 - **dev-cluster:** From-scratch multi-node e2e harness (mTLS join + deploy)
 - **providers:** Isolate lifecycle tests' ports and container names ([#171](https://github.com/gotempsh/temps/issues/171))
-- **Postgres lifecycle waits for usable databases**: managed Postgres
-  container startup now waits for real `psql SELECT 1` connectivity, creates
-  the configured database if the cluster is alive but it is absent, and
-  includes container logs on readiness failures. This prevents major-upgrade
-  restores from treating `pg_isready` as sufficient before the target database
-  exists.
-- **Postgres major upgrades require a clean live volume**: the upgrade
-  snapshot and rollback phases now remove the temporary copy sidecar before
-  deleting the old live data volume, fail if Docker still cannot remove that
-  volume, and wait for the final healthy Postgres container before creating
-  the target database, preventing Postgres 18+ containers from reopening stale
-  17-era PGDATA after a supposedly clean handoff.
-
-### Tests
-- **Postgres upgrade Docker tests use real backup FK rows**:
-  `postgres_upgrade` integration fixtures now insert a matching `backups` row
-  for the fake pre-upgrade backup id, keeping the existing rollback/upgrade
-  assertions valid after FK enforcement.
 
 ## [0.1.0-beta.39] - 2026-06-25
 

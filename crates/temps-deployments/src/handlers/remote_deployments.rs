@@ -21,7 +21,7 @@ use axum::{
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_permission_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, DeploymentCreatedJob, Job, RequestMetadata, UtcDateTime};
 use temps_entities::deployments::DeploymentMetadata;
@@ -309,7 +309,12 @@ pub async fn deploy_from_image(
     Extension(metadata): Extension<RequestMetadata>,
     Json(req): Json<DeployFromImageRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsCreate);
+    project_permission_guard!(
+        auth,
+        DeploymentsCreate,
+        project_id,
+        state.project_access_checker
+    );
 
     // Validate optional deploy-time health-check path override up front
     if let Some(ref path) = req.health_check_path {
@@ -500,47 +505,26 @@ pub async fn deploy_from_image(
                 deployment.id
             );
 
-            // Update deployment status to Running
-            if let Err(e) =
-                crate::services::job_processor::JobProcessorService::update_deployment_status(
-                    &state.db,
-                    deployment.id,
-                    PipelineStatus::Running,
-                )
-                .await
-            {
-                error!("Failed to update deployment status: {}", e);
-            }
-
-            // Execute the workflow in background
+            // Gate check (if a plugin registered one), then transition to
+            // Running and execute the workflow. Delegates to the same
+            // helper the job-queue dispatch loop uses so this manual-deploy
+            // path can't bypass a gate that the git-push / deploy-image job
+            // paths honor.
             let workflow_executor = state.workflow_executor.clone();
+            let deployment_gate = state.deployment_gate.clone();
             let deployment_id = deployment.id;
             let db = state.db.clone();
+            let environment_name = environment.name.clone();
             tokio::spawn(async move {
-                match workflow_executor
-                    .execute_deployment_workflow(deployment_id)
-                    .await
-                {
-                    Ok(_) => {
-                        info!(
-                            "Workflow execution completed for deployment {}",
-                            deployment_id
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "Workflow execution failed for deployment {}: {}",
-                            deployment_id, e
-                        );
-                        let _ = crate::services::job_processor::JobProcessorService::update_deployment_status_with_message(
-                            &db,
-                            deployment_id,
-                            PipelineStatus::Failed,
-                            Some(e.to_string()),
-                        )
-                        .await;
-                    }
-                }
+                crate::services::job_processor::JobProcessorService::gate_check_then_run(
+                    &db,
+                    &workflow_executor,
+                    &deployment_gate,
+                    project_id,
+                    &environment_name,
+                    deployment_id,
+                )
+                .await;
             });
         }
         Err(e) => {
@@ -616,7 +600,12 @@ pub async fn deploy_from_static(
     Extension(metadata): Extension<RequestMetadata>,
     Json(req): Json<DeployFromStaticRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsCreate);
+    project_permission_guard!(
+        auth,
+        DeploymentsCreate,
+        project_id,
+        state.project_access_checker
+    );
 
     // Validate optional deploy-time health-check path override up front
     if let Some(ref path) = req.health_check_path {
@@ -785,47 +774,26 @@ pub async fn deploy_from_static(
                 deployment.id
             );
 
-            // Update deployment status to Running
-            if let Err(e) =
-                crate::services::job_processor::JobProcessorService::update_deployment_status(
-                    &state.db,
-                    deployment.id,
-                    PipelineStatus::Running,
-                )
-                .await
-            {
-                error!("Failed to update deployment status: {}", e);
-            }
-
-            // Execute the workflow in background
+            // Gate check (if a plugin registered one), then transition to
+            // Running and execute the workflow. Delegates to the same
+            // helper the job-queue dispatch loop uses so this manual-deploy
+            // path can't bypass a gate that the git-push / deploy-image job
+            // paths honor.
             let workflow_executor = state.workflow_executor.clone();
+            let deployment_gate = state.deployment_gate.clone();
             let deployment_id = deployment.id;
             let db = state.db.clone();
+            let environment_name = environment.name.clone();
             tokio::spawn(async move {
-                match workflow_executor
-                    .execute_deployment_workflow(deployment_id)
-                    .await
-                {
-                    Ok(_) => {
-                        info!(
-                            "Workflow execution completed for deployment {}",
-                            deployment_id
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "Workflow execution failed for deployment {}: {}",
-                            deployment_id, e
-                        );
-                        let _ = crate::services::job_processor::JobProcessorService::update_deployment_status_with_message(
-                            &db,
-                            deployment_id,
-                            PipelineStatus::Failed,
-                            Some(e.to_string()),
-                        )
-                        .await;
-                    }
-                }
+                crate::services::job_processor::JobProcessorService::gate_check_then_run(
+                    &db,
+                    &workflow_executor,
+                    &deployment_gate,
+                    project_id,
+                    &environment_name,
+                    deployment_id,
+                )
+                .await;
             });
         }
         Err(e) => {
@@ -907,7 +875,12 @@ pub async fn deploy_from_image_upload(
     Query(query): Query<DeployFromImageUploadQuery>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsCreate);
+    project_permission_guard!(
+        auth,
+        DeploymentsCreate,
+        project_id,
+        state.project_access_checker
+    );
 
     // Validate optional deploy-time health-check path override up front
     if let Some(ref path) = query.health_check_path {
@@ -1201,51 +1174,26 @@ pub async fn deploy_from_image_upload(
                 deployment.id
             );
 
-            // Update deployment status to Running
-            if let Err(e) =
-                crate::services::job_processor::JobProcessorService::update_deployment_status(
-                    &state.db,
-                    deployment.id,
-                    PipelineStatus::Running,
-                )
-                .await
-            {
-                error!("Failed to update deployment status: {}", e);
-            }
-
-            // Execute the workflow in background
+            // Gate check (if a plugin registered one), then transition to
+            // Running and execute the workflow. Delegates to the same
+            // helper the job-queue dispatch loop uses so this manual-deploy
+            // path can't bypass a gate that the git-push / deploy-image job
+            // paths honor.
             let workflow_executor = state.workflow_executor.clone();
+            let deployment_gate = state.deployment_gate.clone();
             let deployment_id = deployment.id;
             let db = state.db.clone();
+            let environment_name = environment.name.clone();
             tokio::spawn(async move {
-                match workflow_executor
-                    .execute_deployment_workflow(deployment_id)
-                    .await
-                {
-                    Ok(_) => {
-                        info!(
-                            "Workflow execution completed for deployment {}",
-                            deployment_id
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "Workflow execution failed for deployment {}: {}",
-                            deployment_id, e
-                        );
-                        // Update deployment status to Failed
-                        if let Err(e) =
-                            crate::services::job_processor::JobProcessorService::update_deployment_status(
-                                &db,
-                                deployment_id,
-                                PipelineStatus::Failed,
-                            )
-                            .await
-                        {
-                            error!("Failed to update deployment status: {}", e);
-                        }
-                    }
-                }
+                crate::services::job_processor::JobProcessorService::gate_check_then_run(
+                    &db,
+                    &workflow_executor,
+                    &deployment_gate,
+                    project_id,
+                    &environment_name,
+                    deployment_id,
+                )
+                .await;
             });
         }
         Err(e) => {
@@ -1327,7 +1275,12 @@ pub async fn upload_static_bundle(
     Extension(request_metadata): Extension<RequestMetadata>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DeploymentsCreate);
+    project_permission_guard!(
+        auth,
+        DeploymentsCreate,
+        project_id,
+        state.project_access_checker
+    );
 
     debug!("Uploading static bundle for project {}", project_id);
 
@@ -1541,7 +1494,7 @@ pub async fn upload_static_bundle(
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(&file_bytes);
-    let checksum = format!("sha256:{:x}", hasher.finalize());
+    let checksum = format!("sha256:{}", hex::encode(hasher.finalize()));
 
     // Store static bundle in local data directory
     let local_path = state.data_dir.join(&blob_path);
@@ -1648,6 +1601,7 @@ pub async fn register_external_image(
     Json(req): Json<RegisterImageRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsCreate);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
         "Registering external image for project {}: {}",
@@ -1728,6 +1682,7 @@ pub async fn list_remote_external_images(
     Query(query): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (images, total) = state
         .remote_deployment_service
@@ -1771,9 +1726,10 @@ pub async fn list_remote_external_images(
 pub async fn get_remote_external_image(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
-    Path((_project_id, image_id)): Path<(i32, i32)>,
+    Path((project_id, image_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let image = state
         .remote_deployment_service
@@ -1817,6 +1773,7 @@ pub async fn delete_external_image(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsDelete);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
         .remote_deployment_service
@@ -1877,6 +1834,7 @@ pub async fn list_static_bundles(
     Query(query): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (bundles, total) = state
         .remote_deployment_service
@@ -1920,9 +1878,10 @@ pub async fn list_static_bundles(
 pub async fn get_static_bundle(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
-    Path((_project_id, bundle_id)): Path<(i32, i32)>,
+    Path((project_id, bundle_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let bundle = state
         .remote_deployment_service
@@ -1966,6 +1925,7 @@ pub async fn delete_static_bundle(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsDelete);
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
         .remote_deployment_service

@@ -9,16 +9,38 @@ use utoipa::{openapi::OpenApi, OpenApi as UtoimaOpenApi};
 
 use crate::{
     handlers,
-    services::{DeploymentService, JobProcessorService, WorkflowExecutionService},
+    services::{
+        DeploymentGateSlot, DeploymentService, JobProcessorService, SecretsResolverSlot,
+        WorkflowExecutionService,
+    },
     WorkflowPlanner,
 };
 
 /// Deployments Plugin for managing deployment operations
-pub struct DeploymentsPlugin;
+pub struct DeploymentsPlugin {
+    /// Handle to the job processor's `deployment_gate` slot, captured in
+    /// `register_services` (before the processor is moved into its spawned
+    /// task) and written into from `initialize_plugin_services`, which runs
+    /// only after every plugin has registered its services. See
+    /// `JobProcessorService::deployment_gate` for why this two-phase
+    /// handoff is needed: `register_services` runs in plugin-registration
+    /// order, and this plugin registers (and starts its processor) before
+    /// any later-registered plugin gets a chance to provide a gate.
+    deployment_gate_slot: tokio::sync::OnceCell<DeploymentGateSlot>,
+    /// Handle to the `WorkflowPlanner`'s `secrets_resolver` slot, captured
+    /// before the planner is moved into the background task. Uses the same
+    /// two-phase handoff pattern as `deployment_gate_slot`: the actual EE
+    /// resolver is written in `initialize_plugin_services` once every plugin
+    /// has registered.  Remains `None` on OSS-only builds — a strict no-op.
+    secrets_resolver_slot: tokio::sync::OnceCell<SecretsResolverSlot>,
+}
 
 impl DeploymentsPlugin {
     pub fn new() -> Self {
-        Self
+        Self {
+            deployment_gate_slot: tokio::sync::OnceCell::new(),
+            secrets_resolver_slot: tokio::sync::OnceCell::new(),
+        }
     }
 }
 
@@ -247,6 +269,15 @@ impl TempsPlugin for DeploymentsPlugin {
                 encryption_service,
             ));
 
+            // Capture the secrets-resolver handle BEFORE moving workflow_planner
+            // into the job processor.  This is the two-phase handoff: the actual
+            // EE resolver (if any) is written into this slot in
+            // initialize_plugin_services, which runs only after every plugin has
+            // registered its services.  Any EE plugin that registers a
+            // SecretsManagerResolver will register AFTER this plugin, so looking
+            // it up here with get_service would always return None.
+            let secrets_resolver_handle = workflow_planner.secrets_resolver_handle();
+
             // Clone workflow_execution_service before passing to job processor
             // (the job processor takes ownership, but we need to register it too)
             let workflow_execution_service_for_processor = workflow_execution_service.clone();
@@ -259,6 +290,28 @@ impl TempsPlugin for DeploymentsPlugin {
                 workflow_planner,
                 git_provider_manager,
             );
+
+            // Capture a handle to the job processor's gate slot before it's
+            // moved into the spawned task below. Any plugin that registers
+            // after this one would still be unregistered at this point, so
+            // looking the gate up here with get_service would always find
+            // nothing — initialize_plugin_services (below) does the actual
+            // lookup once every plugin has registered.
+            if self
+                .deployment_gate_slot
+                .set(job_processor.deployment_gate_handle())
+                .is_err()
+            {
+                unreachable!("register_services runs exactly once per plugin instance");
+            }
+
+            if self
+                .secrets_resolver_slot
+                .set(secrets_resolver_handle)
+                .is_err()
+            {
+                unreachable!("register_services runs exactly once per plugin instance");
+            }
 
             // Start the job processor in a background task
             tokio::spawn(async move {
@@ -286,10 +339,49 @@ impl TempsPlugin for DeploymentsPlugin {
         })
     }
 
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Runs after every plugin has registered its services, so this
+            // is the first point at which an optional DeploymentGate (e.g.
+            // from a plugin implementing manual approvals) can actually be
+            // found.
+            if let Some(slot) = self.deployment_gate_slot.get() {
+                if let Some(gate) = context.get_service::<dyn temps_core::DeploymentGate>() {
+                    *slot.write().await = Some(gate);
+                    tracing::debug!("Deployment gate wired into job processor");
+                }
+            }
+
+            // Wire the optional EE-provided SecretsManagerResolver into the
+            // WorkflowPlanner.  Uses get_service (not require_service) so that
+            // OSS-only builds — where no EE plugin registers the resolver —
+            // continue to work without secrets support (strict no-op).
+            if let Some(slot) = self.secrets_resolver_slot.get() {
+                if let Some(resolver) =
+                    context.get_service::<dyn temps_core::SecretsManagerResolver>()
+                {
+                    *slot.write().await = Some(resolver);
+                    tracing::debug!("SecretsManagerResolver wired into WorkflowPlanner");
+                }
+            }
+
+            Ok(())
+        })
+    }
+
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let deployment_service = context.require_service::<DeploymentService>();
         let log_service = context.require_service::<temps_logs::LogService>();
         let cron_service = context.require_service::<crate::services::DatabaseCronConfigService>();
+
+        // Optional. configure_routes runs only after every plugin's
+        // initialize_plugin_services has completed (see PluginManager::initialize_plugins),
+        // so unlike register_services this get_service call reliably finds
+        // a gate registered by any plugin.
+        let deployment_gate = context.get_service::<dyn temps_core::DeploymentGate>();
 
         // Create external deployment manager for handling external images and operations
         let external_deployment_manager =
@@ -318,8 +410,32 @@ impl TempsPlugin for DeploymentsPlugin {
             encryption_service,
         ));
 
+        // Wire the SecretsManagerResolver into this secondary WorkflowPlanner
+        // (used for the remote-deployment handlers). configure_routes runs
+        // after initialize_plugin_services, so the resolver is already in the
+        // service registry if an EE plugin provided one.  The lock is freshly
+        // created and uncontested, so try_write() always succeeds here.
+        if let Some(resolver) = context.get_service::<dyn temps_core::SecretsManagerResolver>() {
+            match workflow_planner.secrets_resolver_handle().try_write() {
+                Ok(mut guard) => {
+                    *guard = Some(resolver);
+                    tracing::debug!("SecretsManagerResolver wired into secondary WorkflowPlanner");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Could not acquire secrets resolver slot in configure_routes; \
+                         secrets-manager bindings will be unavailable for remote deployments"
+                    );
+                }
+            }
+        }
+
         // Get WorkflowExecutionService
         let workflow_executor = context.require_service::<WorkflowExecutionService>();
+
+        // Get DeploymentTokenService for deployment-token management routes
+        let deployment_token_service =
+            context.require_service::<crate::services::deployment_token_service::DeploymentTokenService>();
 
         // Get ImageBuilder for uploading Docker image tarballs
         let image_builder = context.require_service::<dyn temps_deployer::ImageBuilder>();
@@ -329,6 +445,25 @@ impl TempsPlugin for DeploymentsPlugin {
 
         // Get audit service for logging write operations
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+
+        // Optional: team-based project access checker registered by a plugin.
+        // `configure_routes` runs after all plugins have completed
+        // `initialize_plugin_services`, so a checker registered by another
+        // plugin is guaranteed to be present in the registry by this point.
+        // When absent (plain OSS binary), project_access_guard! is a no-op.
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+
+        // Deployment-token management routes carry their own app state
+        // (`DeploymentTokenAppState`), so build it here and mount the router as
+        // a sub-router below. Without this wiring the token endpoints -- create,
+        // list, get, update, delete, and the rotate route -- 404 at runtime and
+        // never appear in the OpenAPI schema.
+        let deployment_token_state =
+            Arc::new(handlers::deployment_tokens::DeploymentTokenAppState {
+                deployment_token_service,
+                audit_service: audit_service.clone(),
+                project_access_checker: project_access_checker.clone(),
+            });
 
         // Get data directory for local file storage
         let data_dir = config_service.data_dir();
@@ -363,6 +498,8 @@ impl TempsPlugin for DeploymentsPlugin {
             encryption_service,
             config_service: config_service.clone(),
             docker: docker_for_exec,
+            deployment_gate,
+            project_access_checker,
         });
 
         let deployments_routes = handlers::deployments::configure_routes();
@@ -371,12 +508,18 @@ impl TempsPlugin for DeploymentsPlugin {
         let remote_deployments_routes = handlers::remote_deployments::configure_routes();
         let admin_node_routes = handlers::nodes::configure_admin_routes();
 
+        // Token routes use their own state; apply it before merging so the
+        // combined router resolves to a single `Router<()>`.
+        let deployment_token_routes =
+            handlers::deployment_tokens::configure_routes().with_state(deployment_token_state);
+
         let routes = deployments_routes
             .merge(cron_routes)
             .merge(external_images_routes)
             .merge(remote_deployments_routes)
             .merge(admin_node_routes)
-            .with_state(app_state);
+            .with_state(app_state)
+            .merge(deployment_token_routes);
 
         Some(PluginRoutes::new(routes))
     }
@@ -390,6 +533,8 @@ impl TempsPlugin for DeploymentsPlugin {
         let remote_deployments_schema =
             <handlers::remote_deployments::RemoteDeploymentsApiDoc as UtoimaOpenApi>::openapi();
         let nodes_schema = <handlers::nodes::NodesApiDoc as UtoimaOpenApi>::openapi();
+        let deployment_tokens_schema =
+            <handlers::deployment_tokens::DeploymentTokensApiDoc as UtoimaOpenApi>::openapi();
 
         Some(temps_core::openapi::merge_openapi_schemas(
             deployments_schema,
@@ -398,6 +543,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 external_images_schema,
                 remote_deployments_schema,
                 nodes_schema,
+                deployment_tokens_schema,
             ],
         ))
     }
@@ -415,7 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deployments_plugin_default() {
-        let deployments_plugin = DeploymentsPlugin;
+        let deployments_plugin = DeploymentsPlugin::default();
         assert_eq!(deployments_plugin.name(), "deployments");
     }
 
@@ -428,5 +574,31 @@ mod tests {
 
         // The actual job processor functionality is tested separately
         // This test just verifies the plugin structure is correct
+    }
+
+    // Guards against the deployment-token router/schema being dropped from the
+    // plugin wiring: those endpoints previously never appeared in the OpenAPI
+    // schema (and 404'd at runtime) because `deployment_tokens` was merged into
+    // neither `configure_routes` nor `openapi_schema`.
+    #[test]
+    fn openapi_schema_exposes_deployment_token_routes() {
+        let schema = DeploymentsPlugin::new()
+            .openapi_schema()
+            .expect("deployments plugin must expose an OpenAPI schema");
+        let paths = schema.paths.paths;
+
+        assert!(
+            paths.contains_key("/projects/{project_id}/deployment-tokens/{token_id}/rotate"),
+            "deployment-token rotate path must be in the merged OpenAPI schema; got paths: {:?}",
+            paths.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            paths.contains_key("/projects/{project_id}/deployment-tokens"),
+            "deployment-token create/list paths must be in the merged OpenAPI schema"
+        );
+        assert!(
+            paths.contains_key("/projects/{project_id}/deployment-tokens/{token_id}"),
+            "deployment-token item route must be in the merged OpenAPI schema"
+        );
     }
 }

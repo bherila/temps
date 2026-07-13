@@ -45,6 +45,22 @@ pub struct Model {
     /// `m20260601_000002_add_monitoring_settings`.
     #[sea_orm(default_value = false)]
     pub metrics_enabled: bool,
+    /// Whether the auto-provisioning reconcile loop has already created a
+    /// default daily full-backup schedule for this service. Acts as a one-shot
+    /// latch: provisioning happens exactly once (when `false`), then this is
+    /// set to `true` so we never recreate a schedule the operator later
+    /// deletes. Added by migration
+    /// `m20260623_000001_add_external_services_default_backup_provisioned`.
+    #[sea_orm(default_value = false)]
+    pub default_backup_provisioned: bool,
+    /// Real Docker container name this service's logs are collected under.
+    /// Plaintext (unlike the encrypted `config`) so the log collector can map
+    /// a running container back to its service without decryption. Set for
+    /// IMPORTED services to the pre-existing container's actual name (which
+    /// carries no `temps.*` labels); NULL for Temps-created services, which
+    /// the collector already resolves via the `temps.service_name` Docker
+    /// label. Added by `m20260707_000002_add_external_services_container_name`.
+    pub container_name: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

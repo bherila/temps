@@ -8,6 +8,7 @@ import {
 import type {
   CrossProjectSiblingRef,
   LogRecord,
+  ProblemDetails,
   ProjectRef,
   SpanRecord,
 } from '@/api/client/types.gen'
@@ -34,6 +35,7 @@ import {
   TabsTrigger,
 } from '@/components/ui/tabs'
 import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
+import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   SpanWaterfall,
   formatDuration,
@@ -560,6 +562,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
 
   const tree = useMemo(() => buildSpanTree(displaySpans), [displaySpans])
   const flatSpans = useMemo(() => flattenTree(tree), [tree])
+  usePageTitle(tree[0]?.span?.name ?? 'Trace')
 
   // Calculate trace-level timing for waterfall positioning
   const traceStart = useMemo(() => {
@@ -675,7 +678,12 @@ export default function TraceDetail({ project }: TraceDetailProps) {
         <Card>
           <CardContent className="flex items-center gap-3 p-6 text-destructive">
             <AlertCircle className="h-5 w-5" />
-            <span>Failed to load trace: {(error as Error).message}</span>
+            <span>
+              Failed to load trace:{' '}
+              {(error as ProblemDetails)?.detail ??
+                (error as ProblemDetails)?.title ??
+                'Unknown error'}
+            </span>
           </CardContent>
         </Card>
       </div>

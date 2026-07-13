@@ -122,6 +122,7 @@ mod m20260618_000001_create_on_demand_cert_attempts;
 mod m20260618_000002_add_domains_on_demand_backoff;
 mod m20260619_000001_add_settings_change_trigger;
 mod m20260621_000001_create_telemetry_milestones;
+mod m20260623_000001_add_external_services_default_backup_provisioned;
 mod m20260626_000001_create_metric_dashboards;
 mod m20260626_000002_create_metric_alert_rules;
 mod m20260627_000001_add_ai_alert_summaries;
@@ -139,6 +140,13 @@ mod m20260702_000001_add_label_filters_to_metric_alert_rules;
 mod m20260702_000002_add_dynamic_alerting_to_metric_alert_rules;
 mod m20260702_000003_add_grouped_threshold_and_series_state_to_metric_alert_rules;
 mod m20260703_000001_cross_project_trace_refs;
+mod m20260705_000001_add_visitor_unique_index;
+mod m20260707_000001_add_external_service_to_logs;
+mod m20260707_000002_add_external_services_container_name;
+mod m20260708_000001_add_node_id_to_monitoring_alert_rules;
+mod m20260711_000001_add_proxy_logs_stats_cagg;
+mod m20260711_000002_add_ip_geolocations_hosting_provider;
+mod m20260711_000003_add_visitor_non_crawler_partial_index;
 
 pub struct Migrator;
 
@@ -264,6 +272,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260618_000002_add_domains_on_demand_backoff::Migration),
             Box::new(m20260619_000001_add_settings_change_trigger::Migration),
             Box::new(m20260621_000001_create_telemetry_milestones::Migration),
+            Box::new(m20260623_000001_add_external_services_default_backup_provisioned::Migration),
             Box::new(m20260626_000001_create_metric_dashboards::Migration),
             Box::new(m20260626_000002_create_metric_alert_rules::Migration),
             Box::new(m20260627_000001_add_ai_alert_summaries::Migration),
@@ -283,6 +292,13 @@ impl MigratorTrait for Migrator {
                 m20260702_000003_add_grouped_threshold_and_series_state_to_metric_alert_rules::Migration,
             ),
             Box::new(m20260703_000001_cross_project_trace_refs::Migration),
+            Box::new(m20260705_000001_add_visitor_unique_index::Migration),
+            Box::new(m20260707_000001_add_external_service_to_logs::Migration),
+            Box::new(m20260707_000002_add_external_services_container_name::Migration),
+            Box::new(m20260708_000001_add_node_id_to_monitoring_alert_rules::Migration),
+            Box::new(m20260711_000001_add_proxy_logs_stats_cagg::Migration),
+            Box::new(m20260711_000002_add_ip_geolocations_hosting_provider::Migration),
+            Box::new(m20260711_000003_add_visitor_non_crawler_partial_index::Migration),
         ]
     }
 }
