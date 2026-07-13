@@ -67,8 +67,6 @@ pub struct EnvVarEnvironment {
 pub const DEFAULT_CPU_REQUEST: i32 = 500_000; // 0.5 cores
 pub const DEFAULT_MEMORY_REQUEST: i32 = 128; // 128 MB
 pub const DEFAULT_MEMORY_LIMIT: i32 = 512; // 512 MB (small hosted website profile)
-pub const STANDARD_HOSTED_MEMORY_LIMIT: i32 = 1024; // 1 GiB
-pub const DEDICATED_HOSTED_MEMORY_LIMIT: Option<i32> = None; // explicit uncapped escape hatch
 
 // Add these constants at the top of the file proper key management
 pub const NONCE_LENGTH: usize = 12;
