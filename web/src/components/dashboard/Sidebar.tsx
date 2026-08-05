@@ -27,12 +27,14 @@ import {
   ChevronsUpDown,
   Clock,
   Cloud,
+  Check,
   CreditCard,
   Database,
   DatabaseBackup,
   FileText,
   FileLock2,
   Filter,
+  Flag,
   Folder,
   Gauge,
   GitBranch,
@@ -47,6 +49,7 @@ import {
   LogOut,
   Mail,
   Monitor,
+  Moon,
   Network,
   Play,
   Puzzle,
@@ -54,30 +57,37 @@ import {
   Rss,
   Search,
   ScrollText,
+  MessageSquare,
   Server,
   Settings,
   Settings2,
   Shield,
   ShieldAlert,
+  Sun,
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
   Users,
+  UsersRound,
   Wand2,
   Webhook,
   Workflow,
   Zap,
 } from 'lucide-react'
 
+import { ProjectResponse } from '@/api/client'
 import { getProjectBySlugOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useAuth } from '@/contexts/AuthContext'
+import { useGettingStarted } from '@/hooks/useGettingStarted'
+import { useProjectSetup } from '@/hooks/useProjectSetup'
+import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { ChevronRight, Eye, type LucideIcon } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Link, useLocation } from 'react-router-dom'
+import { Link, useLocation } from 'react-router'
 import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar'
 import {
   DropdownMenu,
@@ -86,8 +96,12 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '../ui/dropdown-menu'
+import { useTheme } from 'next-themes'
 
 // Daily-use root: short, scannable list. Dense areas (AI, Source) drill
 // down into sub-views per the §6.12 sidebar standard.
@@ -125,6 +139,7 @@ const navWorkflow: PlatformNavItem[] = [
     url: '/ai-gateway',
     icon: Sparkles,
     subItems: [
+      { title: 'AI Chat', url: '/chat', icon: MessageSquare },
       { title: 'AI Gateway', url: '/ai-gateway', icon: Sparkles },
       { title: 'AI Workflows', url: '/agent-sandbox', icon: Bot },
       { title: 'Skills', url: '/skills', icon: Wand2 },
@@ -172,6 +187,7 @@ const settingsGroups: SettingsGroupDef[] = [
     label: 'Access',
     items: [
       { title: 'Users', url: '/settings/users', icon: Users },
+      { title: 'Teams', url: '/settings/teams', icon: UsersRound },
       { title: 'Authentication', url: '/settings/auth', icon: KeyRound },
       { title: 'API Keys', url: '/settings/keys', icon: Key },
     ],
@@ -180,7 +196,11 @@ const settingsGroups: SettingsGroupDef[] = [
     label: 'Infrastructure',
     items: [
       { title: 'Load Balancer', url: '/settings/load-balancer', icon: Server },
-      { title: 'Docker Registry', url: '/settings/docker-registry', icon: Boxes },
+      {
+        title: 'Docker Registry',
+        url: '/settings/docker-registry',
+        icon: Boxes,
+      },
       { title: 'Build Limits', url: '/settings/build-limits', icon: Gauge },
       { title: 'Worker Nodes', url: '/settings/nodes', icon: Network },
       { title: 'Plugins', url: '/settings/plugins', icon: Puzzle },
@@ -191,8 +211,16 @@ const settingsGroups: SettingsGroupDef[] = [
     items: [
       { title: 'Security Headers', url: '/settings/security', icon: Shield },
       { title: 'Rate Limiting', url: '/settings/rate-limiting', icon: Monitor },
-      { title: 'Disk Monitoring', url: '/settings/disk-monitoring', icon: HardDrive },
-      { title: 'Metrics Monitoring', url: '/settings/metrics-monitoring', icon: BarChart3 },
+      {
+        title: 'Disk Monitoring',
+        url: '/settings/disk-monitoring',
+        icon: HardDrive,
+      },
+      {
+        title: 'Metrics Monitoring',
+        url: '/settings/metrics-monitoring',
+        icon: BarChart3,
+      },
     ],
   },
 ]
@@ -320,22 +348,18 @@ export default function AppSidebar() {
   //   anything else     → default workspace nav
   // /projects (the list) and /projects/new keep the default nav.
   const settingsMode = location.pathname.startsWith('/settings')
-  const projectMatch = location.pathname.match(
-    /^\/projects\/([^/]+)(?:\/.*)?$/
-  )
+  const projectMatch = location.pathname.match(/^\/projects\/([^/]+)(?:\/.*)?$/)
   const projectSlug =
-    projectMatch && !['new', 'import-wizard', 'import'].includes(projectMatch[1])
+    projectMatch &&
+    !['new', 'import-wizard', 'import'].includes(projectMatch[1])
       ? projectMatch[1]
       : null
 
   // Override: user pressed Back from a route-driven swap; show DefaultNav
-  // even though we're still on /settings or /projects/:slug. Cleared on
-  // any pathname change (so re-clicking Settings or any sub-link
-  // re-triggers the swap).
-  const [forceDefault, setForceDefault] = useState(false)
-  useEffect(() => {
-    setForceDefault(false)
-  }, [location.pathname])
+  // only for that exact pathname. Navigating anywhere else clears the override
+  // by derivation, without a setState-in-effect render cycle.
+  const [forceDefaultPath, setForceDefaultPath] = useState<string | null>(null)
+  const forceDefault = forceDefaultPath === location.pathname
 
   const compact = isMinimal && !isMobile
 
@@ -381,20 +405,20 @@ export default function AppSidebar() {
         </SidebarMenu>
       </SidebarHeader>
       <SidebarContent>
+        <NavCommandTrigger />
+        <GettingStartedNavItem />
         {showDefault ? (
           <DefaultNav
             pluginItems={pluginItems}
-            pinnedProjectSlug={
-              forceDefault && projectSlug ? projectSlug : null
-            }
-            onReturnToProject={() => setForceDefault(false)}
+            pinnedProjectSlug={forceDefault && projectSlug ? projectSlug : null}
+            onReturnToProject={() => setForceDefaultPath(null)}
           />
         ) : settingsMode ? (
-          <SettingsNav onBack={() => setForceDefault(true)} />
+          <SettingsNav onBack={() => setForceDefaultPath(location.pathname)} />
         ) : projectSlug ? (
           <ProjectNav
             slug={projectSlug}
-            onBack={() => setForceDefault(true)}
+            onBack={() => setForceDefaultPath(location.pathname)}
           />
         ) : null}
       </SidebarContent>
@@ -436,8 +460,7 @@ function NavSection({
       allUrls
         .filter(
           (url) =>
-            location.pathname === url ||
-            location.pathname.startsWith(url + '/')
+            location.pathname === url || location.pathname.startsWith(url + '/')
         )
         .reduce<string | null>(
           (best, url) =>
@@ -448,9 +471,7 @@ function NavSection({
   )
   return (
     <SidebarGroup
-      className={
-        compact ? '' : 'group-data-[collapsible=icon]:hidden'
-      }
+      className={compact ? '' : 'group-data-[collapsible=icon]:hidden'}
     >
       <SidebarGroupLabel className={compact ? 'hidden' : ''}>
         {label}
@@ -478,6 +499,94 @@ function NavSection({
         })}
       </SidebarMenu>
     </SidebarGroup>
+  )
+}
+
+// Persistent link to platform setup progress, pinned just below the Find
+// (⌘K) box at the top of the sidebar content so it shows on every page
+// regardless of which nav mode (default/settings/project) is active. Styled
+// as a bordered callout card (not a plain nav row) with a mini progress bar
+// so it reads as a distinct "you have setup left" prompt. Full checklist
+// detail lives on its own /setup page. Renders nothing once dismissed or
+// fully complete (same visibility rule as the /setup page).
+function GettingStartedNavItem() {
+  const { isMinimal, isMobile } = useSidebar()
+  const compact = isMinimal && !isMobile
+  const { completedCount, totalCount, visible } = useGettingStarted()
+
+  if (!visible) return null
+
+  const pct = Math.round((completedCount / totalCount) * 100)
+
+  if (compact) {
+    return (
+      <SidebarGroup className="pb-0">
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              asChild
+              tooltip={`Finish setup — ${completedCount}/${totalCount}`}
+              className="justify-center"
+            >
+              <Link to="/setup">
+                <BadgeCheck />
+              </Link>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
+      </SidebarGroup>
+    )
+  }
+
+  return (
+    <SidebarGroup className="pb-0">
+      <Link
+        to="/setup"
+        className="group flex flex-col gap-2 rounded-lg border border-sidebar-border bg-sidebar-accent/40 px-3 py-2.5 transition-colors hover:border-primary/40 hover:bg-sidebar-accent/70"
+      >
+        <div className="flex items-center gap-2">
+          <BadgeCheck className="size-4 shrink-0 text-primary" />
+          <span className="flex-1 text-sm font-medium">Finish setup</span>
+          <span className="text-xs tabular-nums text-muted-foreground">
+            {completedCount}/{totalCount}
+          </span>
+        </div>
+        <div className="h-1 w-full overflow-hidden rounded-full bg-sidebar-border">
+          <div
+            className="h-full rounded-full bg-primary transition-all duration-500"
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+      </Link>
+    </SidebarGroup>
+  )
+}
+
+/** Light / Dark / System, nested under the account menu. */
+function ThemeSubmenu() {
+  const { theme, setTheme } = useTheme()
+  const options = [
+    { value: 'light', label: 'Light', icon: Sun },
+    { value: 'dark', label: 'Dark', icon: Moon },
+    { value: 'system', label: 'System', icon: Monitor },
+  ] as const
+  const current = options.find((o) => o.value === theme) ?? options[2]
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger>
+        <current.icon className="mr-2 h-4 w-4" />
+        <span>Appearance</span>
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent>
+        {options.map((o) => (
+          <DropdownMenuItem key={o.value} onClick={() => setTheme(o.value)}>
+            <o.icon className="mr-2 h-4 w-4" />
+            <span>{o.label}</span>
+            {theme === o.value && <Check className="ml-auto h-4 w-4" />}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
   )
 }
 
@@ -602,6 +711,10 @@ function NavUser() {
                   <span>Account</span>
                 </Link>
               </DropdownMenuItem>
+              {/* Appearance lives with the account rather than as a fourth
+                  icon in the header — it's a per-user preference you set once,
+                  not something you reach for while working. */}
+              <ThemeSubmenu />
             </DropdownMenuGroup>
             <DropdownMenuSeparator />
             <DropdownMenuItem
@@ -708,10 +821,13 @@ function DefaultNav({
   const flatItems = navWorkflow.filter((it) => !it.subItems?.length)
   const grouped = navWorkflow.filter((it) => it.subItems?.length)
   const { navItems: extraNavItems } = useConsoleExtensions()
+  const canViewAuditLogs = useCanViewAuditLogs()
+  const observabilityItems = canViewAuditLogs
+    ? navObservability
+    : navObservability.filter((it) => it.url !== '/audit-logs')
 
   return (
     <>
-      <NavCommandTrigger />
       {pinnedProjectSlug && onReturnToProject && (
         <CurrentProjectPin
           slug={pinnedProjectSlug}
@@ -726,7 +842,7 @@ function DefaultNav({
           items={group.subItems!}
         />
       ))}
-      <NavSection label="Observe" items={navObservability} />
+      <NavSection label="Observe" items={observabilityItems} />
       <NavPlugins items={pluginItems} />
       <ExtensionNav items={extraNavItems} />
       <SidebarGroup className="mt-auto">
@@ -763,8 +879,7 @@ function SettingsNav({ onBack }: { onBack: () => void }) {
   )
   return (
     <>
-      <NavCommandTrigger />
-      <SwapHeader title="Settings" onBack={onBack} />
+      <SwapHeader title="Settings" onBack={onBack} backLabel="Back to menu" />
       {settingsGroups.map((group) => {
         const ownUrls = new Set(group.items.map((i) => i.url))
         const siblings = allSettingsUrls.filter((u) => !ownUrls.has(u))
@@ -816,7 +931,12 @@ const projectBaseNav: ProjectNavItem[] = [
     ],
   },
   { title: 'Databases', url: 'storage', icon: Database },
-  { title: 'Environment Variables', url: 'environment-variables', icon: KeyRound },
+  {
+    title: 'Environment Variables',
+    url: 'environment-variables',
+    icon: KeyRound,
+  },
+  { title: 'Feature Flags', url: 'flags', icon: Flag },
   { title: 'Domains', url: 'domains', icon: Globe },
   { title: 'Git', url: 'git', icon: GitFork },
   { title: 'Logs', url: 'runtime', icon: ScrollText },
@@ -854,6 +974,7 @@ const projectBaseNav: ProjectNavItem[] = [
       { title: 'General', url: 'settings/general', icon: SlidersHorizontal },
       { title: 'Secrets', url: 'settings/secrets', icon: FileLock2 },
       { title: 'Security', url: 'settings/security', icon: Shield },
+      { title: 'Access', url: 'settings/access', icon: Users },
       { title: 'Cron Jobs', url: 'settings/cron-jobs', icon: Clock },
       { title: 'Webhooks', url: 'settings/webhooks', icon: Webhook },
       { title: 'Skills', url: 'settings/skills', icon: Wand2 },
@@ -863,13 +984,98 @@ const projectBaseNav: ProjectNavItem[] = [
   },
 ]
 
-function ProjectNav({
-  slug,
-  onBack,
-}: {
-  slug: string
-  onBack: () => void
-}) {
+function ProjectSetupNavItem({ project }: { project: ProjectResponse }) {
+  const { isMinimal, isMobile } = useSidebar()
+  const compact = isMinimal && !isMobile
+  const setup = useProjectSetup(project)
+  const remainingSteps = setup.steps.filter((step) => !step.done)
+
+  if (setup.isLoading || remainingSteps.length === 0) return null
+
+  if (compact) {
+    return (
+      <SidebarGroup className="py-0 pb-2">
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              asChild
+              tooltip={`Project setup — ${setup.completedCount}/${setup.totalCount}`}
+              className="justify-center"
+            >
+              <Link to={`/projects/${project.slug}/setup`}>
+                <BadgeCheck />
+              </Link>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
+      </SidebarGroup>
+    )
+  }
+
+  const visibleSteps = remainingSteps.slice(0, 2)
+  const hiddenCount = remainingSteps.length - visibleSteps.length
+
+  return (
+    <SidebarGroup className="py-0 pb-2">
+      <div className="overflow-hidden rounded-lg border border-sidebar-border bg-sidebar-accent/30">
+        <Link
+          to={`/projects/${project.slug}/setup`}
+          className="group block px-3 py-2.5 transition-colors hover:bg-sidebar-accent/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sidebar-ring"
+        >
+          <div className="flex items-center gap-2">
+            <BadgeCheck className="size-4 shrink-0 text-primary" />
+            <span className="flex-1 text-sm font-medium">Project setup</span>
+            <span className="text-xs tabular-nums text-muted-foreground">
+              {setup.completedCount}/{setup.totalCount}
+            </span>
+            <ChevronRight className="size-3.5 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
+          </div>
+          <div
+            className="mt-2 h-1 w-full overflow-hidden rounded-full bg-sidebar-border"
+            role="progressbar"
+            aria-label={`${project.name} setup progress`}
+            aria-valuemin={0}
+            aria-valuemax={setup.totalCount}
+            aria-valuenow={setup.completedCount}
+          >
+            <div
+              className="h-full rounded-full bg-primary transition-all duration-500"
+              style={{ width: `${setup.percent}%` }}
+            />
+          </div>
+        </Link>
+        <ul role="list" className="border-t border-sidebar-border p-1.5">
+          {visibleSteps.map((step) => (
+            <li key={step.id}>
+              <Link
+                to={step.href}
+                className="group flex items-center gap-2 rounded-md px-1.5 py-2 text-xs transition-colors hover:bg-sidebar-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+              >
+                <step.icon className="size-3.5 shrink-0 text-muted-foreground group-hover:text-foreground" />
+                <span className="min-w-0 flex-1 leading-tight">
+                  {step.title}
+                </span>
+                <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+              </Link>
+            </li>
+          ))}
+          {hiddenCount > 0 && (
+            <li>
+              <Link
+                to={`/projects/${project.slug}/setup`}
+                className="block rounded-md px-1.5 pb-1 pt-0.5 text-[11px] text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+              >
+                +{hiddenCount} more {hiddenCount === 1 ? 'step' : 'steps'}
+              </Link>
+            </li>
+          )}
+        </ul>
+      </div>
+    </SidebarGroup>
+  )
+}
+
+function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
   const { data: project } = useQuery({
     ...getProjectBySlugOptions({ path: { slug } }),
   })
@@ -932,6 +1138,8 @@ function ProjectNav({
     if (didSyncDrillRef.current || !activeRoute) return
     didSyncDrillRef.current = true
     const parent = findDrillParent(activeRoute)
+    // Reconcile the async project lookup with the route-derived initial view.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (parent) setDrilledTo(parent)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeRoute])
@@ -960,16 +1168,17 @@ function ProjectNav({
   if (!project) {
     return (
       <>
-        <NavCommandTrigger />
-        <SwapHeader title="Loading…" onBack={onBack} />
+        <SwapHeader title="Loading…" onBack={onBack} backLabel="Back to menu" />
       </>
     )
   }
 
   const isActive = (url: string) => {
     const pathOnly = url.split('?')[0]
-    if (pathOnly === 'project') return activeRoute === '' || activeRoute === 'project'
-    if (pathOnly === 'environments') return activeRoute.startsWith('environments')
+    if (pathOnly === 'project')
+      return activeRoute === '' || activeRoute === 'project'
+    if (pathOnly === 'environments')
+      return activeRoute.startsWith('environments')
     return pathOnly === bestMatchUrl
   }
   const isParentActive = (item: ProjectNavItem) =>
@@ -981,8 +1190,11 @@ function ProjectNav({
     if (parent?.subItems?.length) {
       return (
         <>
-          <NavCommandTrigger />
-          <SwapHeader title={parent.title} onBack={() => setDrilledTo(null)} />
+          <SwapHeader
+            title={parent.title}
+            onBack={() => setDrilledTo(null)}
+            backLabel={`Back to ${project.name}`}
+          />
           <SidebarGroup className="pt-0">
             <SidebarMenu>
               {parent.subItems.map((sub) => {
@@ -995,7 +1207,7 @@ function ProjectNav({
                       className={cn(
                         compact ? 'justify-center' : 'justify-start',
                         active &&
-                        'bg-sidebar-accent text-sidebar-accent-foreground'
+                          'bg-sidebar-accent text-sidebar-accent-foreground'
                       )}
                     >
                       <Link to={`/projects/${project.slug}/${sub.url}`}>
@@ -1015,8 +1227,12 @@ function ProjectNav({
 
   return (
     <>
-      <NavCommandTrigger />
-      <SwapHeader title={project.name} onBack={onBack} />
+      <SwapHeader
+        title={project.name}
+        onBack={onBack}
+        backLabel="Back to menu"
+      />
+      <ProjectSetupNavItem project={project} />
       <SidebarGroup className="pt-0">
         <SidebarMenu>
           {items.map((item) => {
@@ -1024,7 +1240,10 @@ function ProjectNav({
             const hasSub = !!item.subItems?.length
             const splitRow = hasSub && item.navigateOnClick
             return (
-              <SidebarMenuItem key={item.title}>
+              <SidebarMenuItem
+                key={item.title}
+                data-tour={item.url.split('?')[0]}
+              >
                 {splitRow ? (
                   <SidebarMenuButton
                     asChild
@@ -1033,7 +1252,7 @@ function ProjectNav({
                     className={cn(
                       compact ? 'justify-center' : 'justify-start',
                       active &&
-                      'bg-sidebar-accent text-sidebar-accent-foreground'
+                        'bg-sidebar-accent text-sidebar-accent-foreground'
                     )}
                   >
                     <Link to={`/projects/${project.slug}/${item.url}`}>
@@ -1053,7 +1272,7 @@ function ProjectNav({
                     className={cn(
                       compact ? 'justify-center' : 'justify-start',
                       active &&
-                      'bg-sidebar-accent text-sidebar-accent-foreground'
+                        'bg-sidebar-accent text-sidebar-accent-foreground'
                     )}
                   >
                     <item.icon />
@@ -1071,7 +1290,7 @@ function ProjectNav({
                     className={cn(
                       compact ? 'justify-center' : 'justify-start',
                       active &&
-                      'bg-sidebar-accent text-sidebar-accent-foreground'
+                        'bg-sidebar-accent text-sidebar-accent-foreground'
                     )}
                   >
                     <Link to={`/projects/${project.slug}/${item.url}`}>
@@ -1141,16 +1360,43 @@ function CurrentProjectPin({
 
 // Shared back-arrow header used by Settings, Project, and drill-down
 // sub-views. `onBack` is a state callback — it never navigates.
+//
+// `backLabel` names the destination, and is only surfaced when the sidebar is
+// collapsed: expanded, the row reads "← Analytics" (where you *are*, which the
+// surrounding items already imply), but collapsed there is nothing but an arrow,
+// so the tooltip has to say where it goes.
 function SwapHeader({
   title,
   onBack,
+  backLabel = 'Back',
 }: {
   title: string
   onBack: () => void
+  backLabel?: string
 }) {
   const { isMinimal, isMobile } = useSidebar()
   const compact = isMinimal && !isMobile
-  if (compact) return null
+  // Collapsed, this used to render nothing at all — leaving a second-level nav
+  // (e.g. a project's Analytics sub-items) with no way back out except
+  // re-expanding the sidebar or using the breadcrumb.
+  if (compact) {
+    return (
+      <SidebarGroup className="pb-0">
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              tooltip={backLabel}
+              aria-label={backLabel}
+              onClick={onBack}
+              className="justify-center text-muted-foreground hover:text-foreground"
+            >
+              <ArrowLeft />
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
+      </SidebarGroup>
+    )
+  }
   return (
     <SidebarGroup className="pb-0">
       <button

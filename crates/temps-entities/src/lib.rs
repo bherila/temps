@@ -54,6 +54,8 @@ pub mod external_images;
 pub mod external_service_backups;
 pub mod external_service_health_checks;
 pub mod external_services;
+pub mod feature_flag_environments;
+pub mod feature_flags;
 pub mod funnel_steps;
 pub mod funnels;
 pub mod git_provider_connections;
@@ -91,19 +93,28 @@ pub mod secrets;
 pub mod service_endpoints;
 pub mod service_members;
 pub mod sessions;
+pub mod source_bundles;
 pub mod source_type;
 pub mod static_asset_cache;
 pub mod static_bundles;
+pub mod suppressed_recipients;
 pub mod tls_acme_certificates;
 pub mod types;
 pub mod upstream_config;
 pub mod user_roles;
 pub mod users;
 
+// Teams + project-scoped RBAC entities
+pub mod project_team_access;
+pub mod team_members;
+pub mod team_role;
+pub mod teams;
+
+pub use team_role::{TeamRole, TeamRoleParseError};
+
 // OpenTelemetry entities
 
 pub mod events;
-pub mod magic_link_tokens;
 pub mod session_replay_events;
 pub mod session_replay_sessions;
 pub mod settings;
@@ -115,6 +126,7 @@ pub mod error_alert_rules;
 pub mod error_events;
 pub mod error_groups;
 pub mod project_dsns;
+pub mod source_files;
 pub mod source_maps;
 pub mod tokenizer;
 
@@ -152,6 +164,7 @@ pub mod log_chunks;
 pub mod log_events;
 
 // Standalone sandbox API (Vercel-compatible)
+pub mod sandbox_events;
 pub mod sandboxes;
 
 // Workflow memory

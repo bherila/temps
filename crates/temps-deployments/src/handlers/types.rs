@@ -57,6 +57,10 @@ pub struct AppState {
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
     /// Resolves the per-managed-domain public hostname strategy (Standard/Flat).
     pub hostname_resolver: Arc<dyn temps_core::PublicHostnameResolver>,
+    /// Optional metrics store, present only when metrics collection is
+    /// enabled. Serves container CPU/memory history (written by the
+    /// container health monitor under `source_kind = container`).
+    pub metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>>,
 }
 
 use crate::services::types::Deployment;
@@ -615,6 +619,8 @@ pub struct DeploymentJobResponse {
     pub finished_at: Option<i64>,
     pub log_id: String,
     pub error_message: Option<String>,
+    /// Internal workflow configuration is intentionally redacted. It can
+    /// contain legacy plaintext secrets or encrypted secret envelopes.
     pub job_config: Option<serde_json::Value>,
     pub outputs: Option<serde_json::Value>,
     pub dependencies: Option<serde_json::Value>,
@@ -637,7 +643,10 @@ impl From<temps_entities::deployment_jobs::Model> for DeploymentJobResponse {
             finished_at: job.finished_at.map(|t| t.timestamp_millis()),
             log_id: job.log_id,
             error_message: job.error_message,
-            job_config: job.job_config,
+            // Job configuration is executor-internal. Returning it here would
+            // expose legacy plaintext secrets and encrypted envelopes to roles
+            // that only have deployment-read access.
+            job_config: None,
             outputs: job.outputs,
             dependencies: job.dependencies,
             execution_order: job.execution_order,
@@ -738,6 +747,11 @@ impl From<temps_deployer::ContainerInfo> for ContainerInfoResponse {
 pub struct ContainerListResponse {
     pub containers: Vec<ContainerInfoResponse>,
     pub total: usize,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ContainerEnvironmentVariableValueResponse {
+    pub value: String,
 }
 
 /// Detailed container information with environment variables and metrics
@@ -847,6 +861,31 @@ pub struct ContainerMetricsResponse {
     /// Timestamp of metrics collection
     #[schema(example = "2025-10-12T12:15:47.609192Z")]
     pub timestamp: String,
+}
+
+/// Query parameters for the container metrics history endpoint.
+#[derive(Deserialize, ToSchema, utoipa::IntoParams)]
+pub struct ContainerMetricsHistoryQuery {
+    /// Dotted metric name, e.g. `container.cpu_percent` or
+    /// `container.memory_used_bytes`.
+    pub metric: String,
+    /// Time window: `1h`, `6h`, `24h`, or `7d` (defaults to `1h`).
+    #[serde(default = "default_metrics_range")]
+    pub range: String,
+}
+
+fn default_metrics_range() -> String {
+    "1h".to_string()
+}
+
+/// One bucketed data point of a container resource metric time series.
+#[derive(Serialize, ToSchema)]
+pub struct ContainerMetricHistoryPoint {
+    /// Bucket timestamp (ISO 8601 with `Z` suffix).
+    #[schema(example = "2025-10-12T12:15:00+00:00")]
+    pub time: String,
+    /// Averaged metric value for the bucket.
+    pub value: f64,
 }
 
 /// Response indicating success of container state change

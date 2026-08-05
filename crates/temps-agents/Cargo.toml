@@ -9,6 +9,7 @@ homepage.workspace = true
 
 [dependencies]
 temps-core = { path = "../temps-core" }
+temps-vm-agent = { path = "../temps-vm-agent" }
 temps-entities = { path = "../temps-entities" }
 temps-database = { path = "../temps-database" }
 temps-git = { path = "../temps-git" }
@@ -31,7 +32,7 @@ chrono = { workspace = true }
 axum = { workspace = true }
 axum-macros = { workspace = true }
 http = { workspace = true }
-cron = "0.15"
+cron = "0.17"
 temps-error-tracking = { path = "../temps-error-tracking" }
 temps-agents-mcp-proxy = { path = "../temps-agents-mcp-proxy" }
 anyhow = { workspace = true }

@@ -46,6 +46,23 @@ use crate::handlers::SandboxAppState;
 /// working while new sandbox-only API tokens don't need broader project
 /// access just to manage sandboxes. The fallback is the quiet-deprecation
 /// path: operators can migrate tokens without breaking integrations.
+/// Gate host-global operations (rootfs inventory / GC) on admin. These
+/// expose or mutate storage across every tenant, so ordinary sandbox
+/// scopes are not enough.
+fn require_sandbox_admin(auth: &temps_auth::context::AuthContext) -> Result<(), Problem> {
+    if auth.is_admin() {
+        return Ok(());
+    }
+    Err(
+        temps_core::error_builder::ErrorBuilder::new(axum::http::StatusCode::FORBIDDEN)
+            .type_("https://temps.sh/probs/insufficient-permissions")
+            .title("Insufficient Permissions")
+            .detail("This operation requires an administrator role")
+            .value("user_role", auth.effective_role.to_string())
+            .build(),
+    )
+}
+
 fn sandbox_permission_guard(
     auth: &temps_auth::context::AuthContext,
     primary: Permission,
@@ -103,6 +120,9 @@ impl From<SandboxError> for Problem {
             SandboxError::InvalidState { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Invalid Sandbox State")
                 .with_detail(error.to_string()),
+            SandboxError::ManagedByAgentRun { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Sandbox Managed By Agent Run")
+                .with_detail(error.to_string()),
             SandboxError::Timeout { .. } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
                 .with_title("Sandbox Operation Timed Out")
                 .with_detail(error.to_string()),
@@ -114,6 +134,11 @@ impl From<SandboxError> for Problem {
             SandboxError::PasswordHashFailed { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Password Hashing Failed")
+                    .with_detail(error.to_string())
+            }
+            SandboxError::PreviewGrantFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Preview Grant Minting Failed")
                     .with_detail(error.to_string())
             }
             SandboxError::Database(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -205,6 +230,7 @@ fn validate_seed_url(url: &str, kind: &str) -> Result<(), SandboxError> {
             | UrlValidationError::MulticastIp
             | UrlValidationError::BroadcastIp
             | UrlValidationError::DocumentationIp
+            | UrlValidationError::ReservedIp
             | UrlValidationError::UnspecifiedIp
             | UrlValidationError::DomainResolvesToBlockedIp => {
                 "host points to a private, loopback, or metadata address".to_string()
@@ -372,6 +398,10 @@ pub struct CreateSandboxBody {
     pub memory_limit_mb: Option<u64>,
     #[serde(default)]
     pub pids_limit: Option<i64>,
+    /// Root disk size in MB (Firecracker only; Docker ignores it). Omit for
+    /// the platform default (1 GiB).
+    #[serde(default)]
+    pub disk_size_mb: Option<u64>,
     /// `@vercel/sandbox`'s nested resources object. When present, its
     /// `memory` / `vcpus` populate `memory_limit_mb` / `cpu_limit` if those
     /// weren't sent directly.
@@ -394,6 +424,13 @@ pub struct CreateSandboxBody {
     /// extra round-trip.
     #[serde(default)]
     pub ports: Vec<u16>,
+    /// Isolation backend: `"docker"` (default) or `"firecracker"` (ADR-029,
+    /// hardware-virtualized microVM — requires a host provisioned with
+    /// `temps firecracker setup`). Omit for the platform default; existing
+    /// clients are unaffected. Requesting an unavailable backend fails with
+    /// 400 rather than silently downgrading isolation.
+    #[serde(default)]
+    pub backend: Option<String>,
 
     // ── `@vercel/sandbox` fields accepted for compatibility and ignored.
     // We accept them so SDK calls don't 422 on `deny_unknown_fields`; we
@@ -417,9 +454,11 @@ impl From<CreateSandboxBody> for CreateSandboxRequest {
             cpu_limit: b.cpu_limit.or(resources.vcpus),
             memory_limit_mb: b.memory_limit_mb.or(resources.memory),
             pids_limit: b.pids_limit,
+            disk_size_mb: b.disk_size_mb,
             source: b.source.map(SandboxSource::from),
             preview_password: b.preview_password,
             ports: b.ports,
+            backend: b.backend,
         }
     }
 }
@@ -470,9 +509,21 @@ pub struct SandboxInner {
     // temps-native extras — the SDK ignores fields it doesn't know about.
     pub name: String,
     pub image: Option<String>,
+    /// Isolation backend: "docker" | "firecracker". `None` on legacy rows
+    /// created before the backend was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Configured root disk size in MB (Firecracker). `None` when unknown or
+    /// the default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_size_mb: Option<u64>,
     pub preview_url_template: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview_password_hint: Option<String>,
+    /// Agent run this sandbox executes (autofixer / workflow agent).
+    /// `None` for sandboxes created via this API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_run_id: Option<i32>,
 }
 
 /// `@vercel/sandbox` wraps every single-sandbox response as
@@ -526,8 +577,11 @@ impl SandboxResponse {
                 cwd: s.work_dir,
                 name: s.name,
                 image: s.image,
+                backend: s.backend,
+                disk_size_mb: s.disk_size_mb,
                 preview_url_template: template,
                 preview_password_hint: s.preview_password_hint,
+                agent_run_id: s.agent_run_id,
             },
             routes,
         }
@@ -870,6 +924,138 @@ pub async fn list_sandboxes(
     Ok(Json(resp))
 }
 
+/// One entry in a sandbox's operations timeline.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SandboxEvent {
+    /// Machine-readable operation (`created`, `stopped`, `resumed`,
+    /// `restarted`, `timeout_extended`, `resized`, `preview_password_set`,
+    /// `preview_password_cleared`, `preview_share_link_created`, `source_seeded`,
+    /// `destroyed`).
+    pub event_type: String,
+    /// Optional structured context (shape depends on `event_type`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+    /// Unix epoch milliseconds.
+    pub at: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SandboxEventsResponse {
+    pub events: Vec<SandboxEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EventsQuery {
+    /// Max events to return (default 100, clamped to 500).
+    pub limit: Option<u64>,
+}
+
+/// The operations timeline for a sandbox (lifecycle events only — never
+/// shell/exec activity), newest first.
+#[utoipa::path(
+    tag = "Sandboxes",
+    get,
+    path = "/v1/sandboxes/{id}/events",
+    responses((status = 200, description = "Operations timeline", body = SandboxEventsResponse)),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_events(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<SandboxAppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<EventsQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    sandbox_permission_guard(&auth, Permission::SandboxesRead, Permission::ProjectsRead)?;
+    let rows = state
+        .sandbox_service
+        .list_events(&id, auth.user_id(), q.limit.unwrap_or(100))
+        .await?;
+    let events = rows
+        .into_iter()
+        .map(|e| SandboxEvent {
+            event_type: e.event_type,
+            detail: e.detail,
+            at: e.created_at.timestamp_millis(),
+        })
+        .collect();
+    Ok(Json(SandboxEventsResponse { events }))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResizeSandboxBody {
+    /// New root disk size in MB. Grow-only; must exceed the current size.
+    pub disk_size_mb: u64,
+}
+
+/// Grow a Firecracker sandbox's root disk. Offline resize — the VM reboots
+/// (filesystem/data persist) rather than resizing fully live.
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/v1/sandboxes/{id}/resize",
+    request_body = ResizeSandboxBody,
+    responses(
+        (status = 200, description = "Resized", body = SandboxResponse),
+        (status = 400, description = "Invalid size or unsupported backend")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn resize_sandbox(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<SandboxAppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ResizeSandboxBody>,
+) -> Result<impl IntoResponse, Problem> {
+    sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
+    let model = state
+        .sandbox_service
+        .resize_sandbox(&id, auth.user_id(), body.disk_size_mb)
+        .await?;
+    let envelopes = build_summary_responses(&state, vec![SandboxSummary::from(&model)]).await;
+    Ok(Json(envelopes.into_iter().next()))
+}
+
+/// Inspect rootfs storage: the Firecracker digest-keyed cache (with which
+/// sandboxes reference each entry) and per-VM disks. Empty on Docker-only
+/// hosts. Admin/read scope — this exposes host storage layout.
+#[utoipa::path(
+    tag = "Sandboxes",
+    get,
+    path = "/v1/sandboxes/rootfs",
+    responses((status = 200, description = "Rootfs storage report")),
+    security(("bearer_auth" = []))
+)]
+pub async fn rootfs_report(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<SandboxAppState>>,
+) -> Result<impl IntoResponse, Problem> {
+    // Host-global inventory (every tenant's VM names + image digests) — admin
+    // only, so one sandbox user can't enumerate the whole host.
+    require_sandbox_admin(&auth)?;
+    let report = state.sandbox_service.rootfs_report().await?;
+    Ok(Json(report))
+}
+
+/// Reclaim rootfs cache entries not backing any live sandbox. Idempotent;
+/// safe to call any time (live VMs hold their own per-VM disks).
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/v1/sandboxes/rootfs/gc",
+    responses((status = 200, description = "Reclaimed cache entries")),
+    security(("bearer_auth" = []))
+)]
+pub async fn rootfs_gc(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<SandboxAppState>>,
+) -> Result<impl IntoResponse, Problem> {
+    // Host-wide reclaim — admin only.
+    require_sandbox_admin(&auth)?;
+    let report = state.sandbox_service.gc_rootfs().await?;
+    Ok(Json(report))
+}
+
 #[utoipa::path(
     tag = "Sandboxes",
     get,
@@ -899,7 +1085,8 @@ pub async fn get_sandbox(
     path = "/v1/sandboxes/{id}/stop",
     responses(
         (status = 204, description = "Sandbox stopped and destroyed"),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Sandbox belongs to an active agent run — stop the run instead")
     ),
     security(("bearer_auth" = []))
 )]
@@ -922,7 +1109,8 @@ pub async fn stop_sandbox(
     path = "/v1/sandboxes/{id}/destroy",
     responses(
         (status = 204, description = "Sandbox destroyed (alias for `/stop` with an explicit verb)"),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Sandbox belongs to an active agent run — stop the run instead")
     ),
     security(("bearer_auth" = []))
 )]
@@ -2128,12 +2316,101 @@ pub async fn clear_preview_password(
 
 // ── Routing ─────────────────────────────────────────────────────────────────
 
+// ── Shareable preview link ──────────────────────────────────────────────────
+
+/// Request body for minting a preview share link.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PreviewShareLinkBody {
+    /// Port inside the sandbox the preview serves on.
+    pub port: u16,
+    /// Path the recipient lands on. Must be same-origin (start with a single
+    /// `/`); anything else is replaced with `/` so a share link can never be
+    /// turned into an open redirect.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// How long the link stays usable, in seconds. Clamped to 24 hours.
+    /// Defaults to one hour — long enough to send to a reviewer, short enough
+    /// that a link pasted in a ticket does not stay live indefinitely.
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PreviewShareLinkResponse {
+    /// The full link. Its fragment contains the grant and must be treated as a
+    /// credential; URL fragments are not sent to servers or in Referer headers.
+    pub url: String,
+    /// Unix seconds after which the link stops working.
+    pub expires_at: u64,
+}
+
+/// Mint a shareable link to a sandbox preview.
+///
+/// `GET /domain` returns the bare preview URL, which is useless to anyone who
+/// does not already hold the sandbox's preview password — so sharing a
+/// protected preview meant sharing that password, which is the same secret for
+/// every recipient and can only be withdrawn by rotating it for all of them.
+///
+/// This returns the same URL carrying a short-lived, sandbox-scoped grant. The
+/// recipient's browser exchanges it for the ordinary preview cookie and lands
+/// on `path`. The grant never reaches the sandbox, so preview application code
+/// cannot read it and re-share it.
+///
+/// Anyone holding the returned URL can view the preview until it expires;
+/// there is no per-link revocation short of rotating the preview password.
+#[utoipa::path(
+    tag = "Sandboxes",
+    operation_id = "sandbox_create_preview_link",
+    post,
+    path = "/v1/sandboxes/{id}/preview-link",
+    request_body = PreviewShareLinkBody,
+    responses(
+        (status = 200, description = "Shareable preview link", body = PreviewShareLinkResponse),
+        (status = 400, description = "Invalid port"),
+        (status = 404, description = "Sandbox not found"),
+        (status = 409, description = "Sandbox has no preview password"),
+        (status = 500, description = "Preview grant minting failed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_preview_link(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<SandboxAppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<PreviewShareLinkBody>,
+) -> Result<impl IntoResponse, Problem> {
+    // Write, not read: this mints a credential that grants someone else access,
+    // which is a stronger act than reading the sandbox yourself. Matches the
+    // gate on `preview-password`.
+    sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
+
+    let ttl = std::time::Duration::from_secs(body.ttl_seconds.unwrap_or(60 * 60));
+    let (url, expires_at) = state
+        .sandbox_service
+        .preview_share_link(
+            &id,
+            auth.user_id(),
+            body.port,
+            body.path.as_deref().unwrap_or("/"),
+            ttl,
+        )
+        .await?;
+
+    Ok(Json(PreviewShareLinkResponse { url, expires_at }))
+}
+
 pub fn routes() -> Router<Arc<SandboxAppState>> {
     Router::new()
         .route("/v1/sandboxes", post(create_sandbox).get(list_sandboxes))
+        // Rootfs management. Registered before `/{id}` — a static segment so
+        // it never collides with the id capture.
+        .route("/v1/sandboxes/rootfs", get(rootfs_report))
+        .route("/v1/sandboxes/rootfs/gc", post(rootfs_gc))
         .route("/v1/sandboxes/{id}", get(get_sandbox))
         .route("/v1/sandboxes/{id}/stop", post(stop_sandbox))
         .route("/v1/sandboxes/{id}/destroy", post(destroy_sandbox))
+        .route("/v1/sandboxes/{id}/events", get(list_events))
+        .route("/v1/sandboxes/{id}/resize", post(resize_sandbox))
         .route("/v1/sandboxes/{id}/pause", post(pause_sandbox))
         .route("/v1/sandboxes/{id}/resume", post(resume_sandbox))
         .route("/v1/sandboxes/{id}/restart", post(restart_sandbox))
@@ -2174,12 +2451,51 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
             "/v1/sandboxes/{id}/preview-password",
             put(set_preview_password).delete(clear_preview_password),
         )
+        .route("/v1/sandboxes/{id}/preview-link", post(create_preview_link))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
+    use temps_auth::context::AuthContext;
+    use temps_auth::permissions::Role;
+    use temps_entities::users;
+
+    fn test_user() -> users::Model {
+        let now = Utc::now();
+        users::Model {
+            id: 1,
+            name: "Platform Admin".to_string(),
+            email: "platform-admin@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn platform_admin_cannot_pass_create_sandbox_permission_guard() {
+        let auth = AuthContext::new_session(test_user(), Role::PlatformAdmin);
+
+        let problem =
+            sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)
+                .expect_err("PlatformAdmin must not be allowed to create a sandbox");
+
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+    }
 
     // ── Tar extraction (SDK fs/write path) ─────────────────────────────────
 
@@ -2299,6 +2615,9 @@ mod tests {
             expires_at: now,
             preview_password_hint: None,
             ports: vec![],
+            backend: None,
+            disk_size_mb: None,
+            agent_run_id: None,
         };
         let r = SandboxResponse::from(summary);
         assert_eq!(r.sandbox.id, "sbx_abc");
@@ -2323,6 +2642,9 @@ mod tests {
             expires_at: now,
             preview_password_hint: None,
             ports: vec![3000, 5173],
+            backend: None,
+            disk_size_mb: None,
+            agent_run_id: None,
         };
         let parts = PreviewUrlParts {
             protocol: "https".into(),

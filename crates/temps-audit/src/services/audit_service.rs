@@ -132,10 +132,15 @@ impl AuditService {
         // Fetch related user and IP geolocation data for each log
         let mut audit_details = Vec::new();
         for log in logs {
-            // Fetch related user
-            let user = temps_entities::users::Entity::find_by_id(log.user_id)
-                .one(self.db.as_ref())
-                .await?;
+            // Fetch related user (user_id is None once the account is deleted)
+            let user = match log.user_id {
+                Some(uid) => {
+                    temps_entities::users::Entity::find_by_id(uid)
+                        .one(self.db.as_ref())
+                        .await?
+                }
+                None => None,
+            };
 
             // Fetch related IP geolocation if present
             let ip_address = if let Some(ip_address_id) = log.ip_address_id {
@@ -163,10 +168,15 @@ impl AuditService {
             .map_err(|e| anyhow::anyhow!("Failed to get audit log by ID {}: {}", log_id, e))?;
 
         if let Some(log) = log {
-            // Fetch related user
-            let user = temps_entities::users::Entity::find_by_id(log.user_id)
-                .one(self.db.as_ref())
-                .await?;
+            // Fetch related user (user_id is None once the account is deleted)
+            let user = match log.user_id {
+                Some(uid) => {
+                    temps_entities::users::Entity::find_by_id(uid)
+                        .one(self.db.as_ref())
+                        .await?
+                }
+                None => None,
+            };
 
             // Fetch related IP geolocation if present
             let ip_address = if let Some(ip_address_id) = log.ip_address_id {
@@ -194,5 +204,156 @@ impl AuditLogger for AuditService {
     async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
         self.create_audit_log_typed(operation).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase, Value};
+    use temps_geo::geoip_service::{GeoIpService, MockGeoIpService};
+
+    fn service_with(db: sea_orm::DatabaseConnection) -> AuditService {
+        let db = Arc::new(db);
+        let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
+        let ip_service = Arc::new(IpAddressService::new(db.clone(), geoip));
+        AuditService::new(db, ip_service)
+    }
+
+    fn log_row(user_id: Option<i32>) -> audit_logs::Model {
+        let now = Utc::now();
+        audit_logs::Model {
+            id: 1,
+            user_id,
+            user_agent: "test-agent".to_string(),
+            operation_type: "user.login".to_string(),
+            ip_address_id: None,
+            audit_date: now,
+            created_at: now,
+            data: "{}".to_string(),
+        }
+    }
+
+    #[derive(Serialize)]
+    struct TestAuditOperation {
+        user_id: Option<i32>,
+    }
+
+    impl AuditOperation for TestAuditOperation {
+        fn operation_type(&self) -> String {
+            "TEST_OPERATION".to_string()
+        }
+
+        fn user_id(&self) -> Option<i32> {
+            self.user_id
+        }
+
+        fn ip_address(&self) -> Option<String> {
+            None
+        }
+
+        fn user_agent(&self) -> &str {
+            "test-agent"
+        }
+
+        fn serialize(&self) -> anyhow::Result<String> {
+            serde_json::to_string(self)
+                .map_err(|error| anyhow::anyhow!("Failed to serialize test audit: {}", error))
+        }
+    }
+
+    async fn persisted_actor_value<T: AuditOperation>(
+        operation: &T,
+        user_id: Option<i32>,
+    ) -> Value {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![log_row(user_id)]])
+                .into_connection(),
+        );
+        let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
+        let ip_service = Arc::new(IpAddressService::new(db.clone(), geoip));
+        let service = AuditService::new(db.clone(), ip_service);
+
+        service
+            .create_audit_log_typed(operation)
+            .await
+            .expect("test audit should be inserted");
+
+        drop(service);
+        let transactions = Arc::try_unwrap(db)
+            .expect("audit service should release the database connection")
+            .into_transaction_log();
+        let statement = &transactions
+            .first()
+            .expect("audit insert should execute one statement")
+            .statements()[0];
+        statement
+            .values
+            .as_ref()
+            .expect("audit insert should bind values")
+            .0
+            .first()
+            .expect("user_id should be the first bound audit value")
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn test_create_audit_log_persists_null_actor() {
+        let operation = TestAuditOperation { user_id: None };
+        assert_eq!(
+            persisted_actor_value(&operation, operation.user_id()).await,
+            Value::Int(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_audit_log_persists_known_actor() {
+        let operation = TestAuditOperation { user_id: Some(42) };
+        assert_eq!(
+            persisted_actor_value(&operation, operation.user_id()).await,
+            Value::Int(Some(42))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_log_by_id_without_user_skips_user_lookup() {
+        // Only the audit row itself is prepared. If the service issued a
+        // users lookup for a log whose user_id is NULL (account deleted),
+        // the mock would have no result for it and the call would error.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![log_row(None)]])
+            .into_connection();
+        let service = service_with(db);
+
+        let details = service
+            .get_log_by_id(1)
+            .await
+            .expect("audit log 1 with NULL user_id should load")
+            .expect("audit log 1 should exist");
+
+        assert_eq!(details.log.user_id, None);
+        assert!(details.user.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_log_by_id_with_user_id_performs_user_lookup() {
+        // A second (empty) result set is prepared for the users query: the
+        // service must consume it when user_id is present, and tolerate the
+        // referenced user row being absent.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![log_row(Some(7))]])
+            .append_query_results([Vec::<temps_entities::users::Model>::new()])
+            .into_connection();
+        let service = service_with(db);
+
+        let details = service
+            .get_log_by_id(1)
+            .await
+            .expect("audit log 1 with user_id 7 should load")
+            .expect("audit log 1 should exist");
+
+        assert_eq!(details.log.user_id, Some(7));
+        assert!(details.user.is_none());
     }
 }

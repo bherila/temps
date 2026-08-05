@@ -202,8 +202,8 @@ impl temps_core::AuditOperation for LogsPurgedAudit {
         "LOGS_PURGED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -758,6 +758,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -794,6 +795,7 @@ mod tests {
                         email_verification_expires: None,
                         password_reset_token: None,
                         password_reset_expires: None,
+                        must_change_password: false,
                         deleted_at: None,
                         mfa_secret: None,
                         mfa_enabled: false,

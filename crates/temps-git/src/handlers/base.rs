@@ -155,6 +155,16 @@ impl From<GitProviderError> for Problem {
                 .with_type("https://docs.temps.sh/errors/api_error")
                 .with_title("API Error")
                 .with_detail(msg),
+            GitProviderError::CommitNotFound {
+                repository,
+                commit_sha,
+            } => problem_new(StatusCode::NOT_FOUND)
+                .with_type("https://docs.temps.sh/errors/commit_not_found")
+                .with_title("Commit Not Found")
+                .with_detail(format!(
+                    "Commit '{}' was not found in repository '{}'",
+                    commit_sha, repository
+                )),
             GitProviderError::RepositoryAlreadyExists { ref name } => {
                 problem_new(StatusCode::CONFLICT)
                     .with_type("https://docs.temps.sh/errors/repository_already_exists")
@@ -771,7 +781,7 @@ pub async fn list_connections(
 
     let (connections, total_count) = state
         .git_provider_manager
-        .get_user_connections_paginated(page, per_page, sort, direction)
+        .get_user_connections_paginated(auth.user_id(), page, per_page, sort, direction)
         .await?;
 
     let response_connections: Vec<ConnectionResponse> = connections
@@ -819,6 +829,18 @@ pub async fn sync_repositories(
     Path(connection_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitRepositoriesSync);
+
+    // Ownership check, mirroring list_repositories_by_connection below:
+    // without this, any authenticated user could trigger a background sync
+    // (including an OAuth token refresh) on another user's git connection by
+    // guessing/enumerating an integer connection_id.
+    let connection = state
+        .git_provider_manager
+        .get_connection(connection_id)
+        .await?;
+    if connection.user_id != Some(auth.user_id()) {
+        return Err(GitProviderManagerError::ConnectionNotFound(connection_id.to_string()).into());
+    }
 
     // Fire and forget: the manager spawns a detached task owning a drop
     // guard that resets `syncing=false` on every exit path. We can
@@ -875,6 +897,14 @@ pub async fn list_repositories_by_connection(
     Query(query): Query<RepositoryListQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitRepositoriesRead);
+
+    let connection = state
+        .git_provider_manager
+        .get_connection(connection_id)
+        .await?;
+    if connection.user_id != Some(auth.user_id()) {
+        return Err(GitProviderManagerError::ConnectionNotFound(connection_id.to_string()).into());
+    }
 
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(30).min(100);
@@ -2378,6 +2408,7 @@ pub struct PresetLiveQuery {
     ),
     responses(
         (status = 200, description = "Repository presets calculated successfully - includes root preset and projects in subdirectories", body = RepositoryPresetResponse),
+        (status = 401, description = "The git provider rejected the stored credential - the connection must be re-authorized"),
         (status = 404, description = "Repository not found"),
         (status = 400, description = "Bad request"),
         (status = 500, description = "Internal server error")
@@ -2449,9 +2480,12 @@ pub async fn get_provider_connections(
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitConnectionsRead);
 
+    // Every connection under this provider, not just the caller's active ones:
+    // this list is what tells the user why a provider cannot be deleted, so a
+    // connection it hides is a dead end.
     let connections = state
         .git_provider_manager
-        .get_provider_connections(provider_id)
+        .get_all_provider_connections(provider_id)
         .await?;
 
     let response: Vec<ConnectionResponse> = connections

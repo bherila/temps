@@ -146,10 +146,33 @@ mod m20260707_000001_add_external_service_to_logs;
 mod m20260707_000002_add_external_services_container_name;
 mod m20260708_000001_add_node_id_to_monitoring_alert_rules;
 mod m20260711_000001_add_proxy_logs_stats_cagg;
+mod m20260711_000001_normalize_email_event_types;
 mod m20260711_000002_add_ip_geolocations_hosting_provider;
+mod m20260711_000002_create_suppressed_recipients;
 mod m20260711_000003_add_visitor_non_crawler_partial_index;
 mod m20260713_000001_add_mfa_pending_to_sessions;
 mod m20260714_000001_fix_otel_spans_compression_segmentby;
+mod m20260714_000001_secure_sns_email_events;
+mod m20260716_000001_observability_compression_24h;
+mod m20260717_000001_drop_magic_link_tokens;
+mod m20260720_000001_add_backend_to_sandboxes;
+mod m20260720_000001_audit_logs_keep_history_on_user_delete;
+mod m20260720_000002_create_sandbox_events;
+mod m20260722_000001_create_source_files;
+mod m20260722_000002_add_source_context_enabled_to_projects;
+mod m20260723_000001_add_error_source_root_to_projects;
+mod m20260724_000001_add_run_config_to_agent_runs;
+mod m20260725_000001_sandboxes_agent_run_link;
+mod m20260728_000001_add_environment_id_to_metric_alert_rules;
+mod m20260730_000001_add_architecture_to_nodes;
+mod m20260730_000001_create_teams_rbac;
+mod m20260731_000001_create_source_bundles;
+mod m20260802_000001_add_environment_force_https;
+mod m20260802_000002_create_feature_flags;
+mod m20260803_000001_add_flag_last_evaluated_at;
+mod m20260803_000001_add_template_slug_to_projects;
+mod m20260803_000002_add_step_up_expires_at_to_sessions;
+mod m20260804_000001_add_must_change_password_to_users;
 
 pub struct Migrator;
 
@@ -301,10 +324,35 @@ impl MigratorTrait for Migrator {
             Box::new(m20260707_000002_add_external_services_container_name::Migration),
             Box::new(m20260708_000001_add_node_id_to_monitoring_alert_rules::Migration),
             Box::new(m20260711_000001_add_proxy_logs_stats_cagg::Migration),
+            Box::new(m20260711_000001_normalize_email_event_types::Migration),
             Box::new(m20260711_000002_add_ip_geolocations_hosting_provider::Migration),
+            Box::new(m20260711_000002_create_suppressed_recipients::Migration),
             Box::new(m20260711_000003_add_visitor_non_crawler_partial_index::Migration),
             Box::new(m20260713_000001_add_mfa_pending_to_sessions::Migration),
             Box::new(m20260714_000001_fix_otel_spans_compression_segmentby::Migration),
+            Box::new(m20260714_000001_secure_sns_email_events::Migration),
+            Box::new(m20260716_000001_observability_compression_24h::Migration),
+            Box::new(m20260717_000001_drop_magic_link_tokens::Migration),
+            Box::new(m20260720_000001_add_backend_to_sandboxes::Migration),
+            Box::new(m20260720_000002_create_sandbox_events::Migration),
+            Box::new(m20260720_000001_audit_logs_keep_history_on_user_delete::Migration),
+            Box::new(m20260722_000001_create_source_files::Migration),
+            Box::new(m20260722_000002_add_source_context_enabled_to_projects::Migration),
+            Box::new(m20260723_000001_add_error_source_root_to_projects::Migration),
+            Box::new(m20260724_000001_add_run_config_to_agent_runs::Migration),
+            Box::new(m20260725_000001_sandboxes_agent_run_link::Migration),
+            Box::new(
+                m20260728_000001_add_environment_id_to_metric_alert_rules::Migration,
+            ),
+            Box::new(m20260730_000001_add_architecture_to_nodes::Migration),
+            Box::new(m20260730_000001_create_teams_rbac::Migration),
+            Box::new(m20260731_000001_create_source_bundles::Migration),
+            Box::new(m20260802_000001_add_environment_force_https::Migration),
+            Box::new(m20260802_000002_create_feature_flags::Migration),
+            Box::new(m20260803_000001_add_flag_last_evaluated_at::Migration),
+            Box::new(m20260803_000001_add_template_slug_to_projects::Migration),
+            Box::new(m20260803_000002_add_step_up_expires_at_to_sessions::Migration),
+            Box::new(m20260804_000001_add_must_change_password_to_users::Migration),
         ]
     }
 }

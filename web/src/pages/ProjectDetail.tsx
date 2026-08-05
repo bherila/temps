@@ -8,6 +8,7 @@ import {
 import NotFound from '@/components/global/NotFound'
 import { ProjectAnalytics } from '@/components/project/ProjectAnalytics'
 import { ProjectDeployments } from '@/components/project/ProjectDeployments'
+import { ProjectDrop } from '@/pages/ProjectDrop'
 import { ProjectDetailHeader } from '@/components/project/ProjectDetailHeader'
 import { ProjectOverview } from '@/components/project/ProjectOverview'
 import { ProjectRevenue } from '@/components/project/ProjectRevenue'
@@ -15,6 +16,7 @@ import { ProjectRuntime } from '@/components/project/ProjectRuntime'
 import { ProjectServices } from '@/components/project/ProjectServices'
 import { ProjectSettings } from '@/components/project/ProjectSettings'
 import { EnvironmentVariablesSettings } from '@/components/project/settings/EnvironmentVariablesSettings'
+import { ProjectFeatureFlags } from '@/components/project/flags/ProjectFeatureFlags'
 import { DomainsSettings } from '@/components/project/settings/DomainsSettings'
 import { GitSettings, ChangeRepositoryPage } from '@/components/project/settings/GitSettings'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
@@ -35,6 +37,7 @@ import { AlertRuleForm } from '@/pages/AlertRuleForm'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { resolveStableUrl } from '@/lib/deployment-url'
 import { useAssistantProject } from '@/components/ai/AiAssistantContext'
 import { DeploymentDetails } from '@/pages/DeploymentDetails'
 import { ErrorEventDetail } from './ErrorEventDetail'
@@ -45,6 +48,8 @@ import ProjectAiCrawlers from './ProjectAiCrawlers'
 import Traces from './Traces'
 import LogsList from './LogsList'
 import Metrics from './Metrics'
+import { ProjectTour } from '@/components/project/ProjectTour'
+import { ProjectSetup } from './ProjectSetup'
 import { ProjectAgentActivity } from './AiGateway'
 import { AutofixerPage } from '@/components/autofixer/AutofixerPage'
 import { AutofixRedirect } from '@/components/autofixer/AutofixRedirect'
@@ -60,7 +65,7 @@ import {
   Routes,
   useParams,
   useSearchParams,
-} from 'react-router-dom'
+} from 'react-router'
 import { Card, CardContent } from '@/components/ui/card'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { ShieldAlert } from 'lucide-react'
@@ -302,7 +307,9 @@ export function ProjectDetail() {
                 ? `https://github.com/${project.repo_owner}/${project.repo_name}`
                 : undefined)
             }
-            lastDeploymentUrl={lastDeployment?.url}
+            lastDeploymentUrl={
+              lastDeployment ? resolveStableUrl(lastDeployment) : null
+            }
             isLoadingLastDeployment={isLoadingLastDeployment}
           />
           <div className="flex-1 overflow-y-auto overflow-x-hidden p-4">
@@ -326,6 +333,7 @@ export function ProjectDetail() {
                 </AlertDescription>
               </Alert>
             )}
+            <ProjectTour />
             <Routes>
               <Route
                 index
@@ -340,6 +348,7 @@ export function ProjectDetail() {
                   />
                 }
               />
+              <Route path="setup" element={<ProjectSetup project={project} />} />
               <Route
                 path="deployments"
                 element={<ProjectDeployments project={project} />}
@@ -348,9 +357,14 @@ export function ProjectDetail() {
                 path="deployments/:deploymentId"
                 element={<DeploymentDetails project={project} />}
               />
+              <Route path="drop" element={<ProjectDrop project={project} />} />
               <Route
                 path="environment-variables"
                 element={<EnvironmentVariablesSettings project={project} />}
+              />
+              <Route
+                path="flags"
+                element={<ProjectFeatureFlags project={project} />}
               />
               <Route
                 path="domains"

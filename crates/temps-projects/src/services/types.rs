@@ -66,6 +66,10 @@ pub struct Project {
     pub ai_alert_summaries_enabled: Option<bool>,
     pub ai_debug_chat_enabled: Option<bool>,
     pub ai_write_actions_enabled: bool,
+    /// Opt-in for native error-tracking source context.
+    pub error_source_context_enabled: bool,
+    /// Auto-capture source root (relative to the checkout); None = build context.
+    pub error_source_root: Option<String>,
     pub enable_preview_environments: bool,
     /// When true, newly-created preview environments default to on-demand mode.
     pub preview_envs_on_demand: bool,
@@ -104,6 +108,11 @@ pub struct CreateProjectRequest {
     /// Source type for deployments (git, docker_image, or static_files)
     #[serde(default)]
     pub source_type: SourceType,
+    /// Bounded template provenance: a reviewed bundled slug or the fixed
+    /// `custom` marker. Internal only; normal project-creation paths leave it
+    /// unset and operator-defined slugs are never persisted here.
+    #[serde(default)]
+    pub template_slug: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -173,6 +182,9 @@ pub enum ProjectError {
 
     #[error("Deployment error: {0}")]
     DeploymentError(String),
+
+    #[error("Failed to remove deployment containers for project {project_id}: {reason}")]
+    DeploymentCleanupFailed { project_id: i32, reason: String },
 
     #[error("Other error: {0}")]
     Other(String),

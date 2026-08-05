@@ -4,12 +4,108 @@ use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
 use temps_migrations::Migrator;
 
+/// True when an external database is configured. CI can only *empty* an env
+/// var per matrix entry, not unset it, so empty counts as "not configured" —
+/// otherwise the skip-guards below would fire in the dedicated migrations
+/// lane and this suite would (again) never actually run anywhere.
+fn external_db_configured() -> bool {
+    std::env::var("TEMPS_TEST_DATABASE_URL")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+async fn session_step_up_column_exists(db: &DatabaseConnection) -> anyhow::Result<bool> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT EXISTS (\
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' \
+                  AND table_name = 'sessions' \
+                  AND column_name = 'step_up_expires_at'\
+             ) AS present"
+                .to_string(),
+        ))
+        .await?
+        .expect("column existence query returns one row");
+    Ok(row.try_get::<bool>("", "present")?)
+}
+
+#[tokio::test]
+async fn test_step_up_session_expiration_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!(
+            "⏭️  Skipping test_step_up_session_expiration_migration_up_and_down: using external database via TEMPS_TEST_DATABASE_URL"
+        );
+        return Ok(());
+    }
+
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "⏭️  Skipping test_step_up_session_expiration_migration_up_and_down: Docker unavailable ({error})"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    let db = connect_with_retries(&db_url).await?;
+
+    let target = "m20260803_000002_add_step_up_expires_at_to_sessions";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+
+    assert!(!session_step_up_column_exists(&db).await?);
+    Migrator::up(&db, Some(1)).await?;
+    assert!(session_step_up_column_exists(&db).await?);
+
+    let metadata = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT data_type, is_nullable \
+             FROM information_schema.columns \
+             WHERE table_schema = 'public' \
+               AND table_name = 'sessions' \
+               AND column_name = 'step_up_expires_at'"
+                .to_string(),
+        ))
+        .await?
+        .expect("step-up expiration column metadata");
+    let data_type: String = metadata.try_get("", "data_type")?;
+    let is_nullable: String = metadata.try_get("", "is_nullable")?;
+    assert_eq!(data_type, "timestamp with time zone");
+    assert_eq!(is_nullable, "YES");
+
+    Migrator::down(&db, Some(1)).await?;
+    assert!(!session_step_up_column_exists(&db).await?);
+
+    Ok(())
+}
+
 /// Test that migrations can be applied successfully
 #[tokio::test]
 async fn test_migration_up() -> anyhow::Result<()> {
     // Skip this test if TEMPS_TEST_DATABASE_URL is set
     // (external databases may already have migrations applied)
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!(
             "⏭️  Skipping test_migration_up: using external database via TEMPS_TEST_DATABASE_URL"
         );
@@ -22,6 +118,18 @@ async fn test_migration_up() -> anyhow::Result<()> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -75,12 +183,246 @@ async fn test_migration_up() -> anyhow::Result<()> {
     }
 }
 
+#[tokio::test]
+async fn test_secure_sns_migration_upgrades_applied_global_suppression_schema() -> anyhow::Result<()>
+{
+    if external_db_configured() {
+        return Ok(());
+    }
+
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping secure SNS migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    let db = connect_with_retries(&db_url).await?;
+
+    let target = "m20260714_000001_secure_sns_email_events";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .expect("secure SNS migration must be registered");
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+
+    db.execute_unprepared(
+        r#"
+        INSERT INTO email_providers (name, provider_type, region, credentials)
+            VALUES ('legacy-migration-test', 'ses', 'us-east-1', 'test');
+        INSERT INTO email_domains (provider_id, domain)
+            SELECT id, domain
+            FROM email_providers
+            CROSS JOIN (VALUES
+                ('legacy-one.example'), ('legacy-two.example')
+            ) AS domains(domain)
+            WHERE name = 'legacy-migration-test';
+        "#,
+    )
+    .await?;
+
+    // Reproduce the exact schema #296 installed before this PR changed it.
+    db.execute_unprepared(
+        r#"
+        DROP INDEX IF EXISTS idx_suppressed_recipients_domain_email;
+        ALTER TABLE suppressed_recipients ALTER COLUMN domain_id DROP NOT NULL;
+        ALTER TABLE suppressed_recipients
+            DROP CONSTRAINT IF EXISTS suppressed_recipients_domain_id_fkey;
+        ALTER TABLE suppressed_recipients
+            ADD CONSTRAINT suppressed_recipients_domain_id_fkey
+            FOREIGN KEY (domain_id) REFERENCES email_domains(id) ON DELETE SET NULL;
+        CREATE UNIQUE INDEX idx_suppressed_recipients_email
+            ON suppressed_recipients (email);
+        INSERT INTO suppressed_recipients (email, reason, domain_id)
+            VALUES ('legacy-unscoped@example.com', 'bounced', NULL);
+        "#,
+    )
+    .await?;
+
+    Migrator::up(&db, None).await?;
+
+    let nullable = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_nullable FROM information_schema.columns \
+             WHERE table_schema = current_schema() \
+               AND table_name = 'suppressed_recipients' \
+               AND column_name = 'domain_id'"
+                .to_string(),
+        ))
+        .await?
+        .expect("domain_id schema row");
+    let is_nullable: String = nullable.try_get("", "is_nullable")?;
+    assert_eq!(is_nullable, "NO");
+
+    let legacy_count = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM suppressed_recipients \
+             WHERE domain_id IS NULL"
+                .to_string(),
+        ))
+        .await?
+        .expect("legacy suppression count");
+    let count: i32 = legacy_count.try_get("", "count")?;
+    assert_eq!(count, 0, "unscoped suppressions must gain domain ownership");
+
+    let expanded_count = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM suppressed_recipients \
+             WHERE email = 'legacy-unscoped@example.com'"
+                .to_string(),
+        ))
+        .await?
+        .expect("expanded legacy suppression count");
+    let count: i32 = expanded_count.try_get("", "count")?;
+    assert_eq!(
+        count, 2,
+        "legacy global suppression must cover every existing domain"
+    );
+
+    let index = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT indexdef FROM pg_indexes \
+             WHERE schemaname = current_schema() \
+               AND indexname = 'idx_suppressed_recipients_domain_email'"
+                .to_string(),
+        ))
+        .await?
+        .expect("domain-scoped unique index");
+    let indexdef: String = index.try_get("", "indexdef")?;
+    assert!(indexdef.contains("UNIQUE"));
+    assert!(indexdef.contains("domain_id, email"));
+
+    // The legacy global unique index must be gone: the same recipient can be
+    // suppressed independently for two sending domains.
+    db.execute_unprepared(
+        r#"
+        INSERT INTO email_providers (name, provider_type, region, credentials)
+            VALUES ('migration-test', 'ses', 'us-east-1', 'test');
+        INSERT INTO email_domains (provider_id, domain)
+            SELECT id, domain
+            FROM email_providers
+            CROSS JOIN (VALUES ('one.example'), ('two.example')) AS domains(domain)
+            WHERE name = 'migration-test';
+        INSERT INTO suppressed_recipients (email, reason, domain_id)
+            SELECT 'shared@example.com', 'bounced', id
+            FROM email_domains
+            WHERE domain IN ('one.example', 'two.example');
+
+        WITH inserted_email AS (
+            INSERT INTO emails (
+                domain_id, from_address, to_addresses, subject,
+                provider_message_id
+            )
+            SELECT id, 'sender@one.example', '["shared@example.com"]'::jsonb,
+                   'migration rollback test', 'ses-message-id'
+            FROM email_domains
+            WHERE domain = 'one.example'
+            RETURNING id
+        )
+        INSERT INTO email_events (
+            email_id, event_type, provider_message_id, recipient,
+            idempotency_key
+        )
+        SELECT id, 'bounced', 'ses-message-id', recipient, idempotency_key
+        FROM inserted_email
+        CROSS JOIN (VALUES
+            ('first@example.com', repeat('a', 64)),
+            ('second@example.com', repeat('b', 64))
+        ) AS events(recipient, idempotency_key);
+        "#,
+    )
+    .await?;
+
+    let scoped_count = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM suppressed_recipients \
+             WHERE email = 'shared@example.com'"
+                .to_string(),
+        ))
+        .await?
+        .expect("domain-scoped suppression count");
+    let count: i32 = scoped_count.try_get("", "count")?;
+    assert_eq!(count, 2);
+
+    // Roll back exactly through the secure-sns migration, wherever it sits
+    // in the chain. A hardcoded step count breaks every time a newer
+    // migration lands after it (versions sort lexicographically ==
+    // chronologically under the mYYYYMMDD naming scheme).
+    let after = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS n FROM seaql_migrations \
+             WHERE version > 'm20260714_000001_secure_sns_email_events'"
+                .to_string(),
+        ))
+        .await?
+        .expect("seaql_migrations count");
+    let steps_after: i32 = after.try_get("", "n")?;
+    Migrator::down(&db, Some(steps_after as u32 + 1)).await?;
+
+    let rollback_counts = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT \
+                (SELECT count(*)::int FROM suppressed_recipients \
+                 WHERE email = 'shared@example.com') AS suppressions, \
+                (SELECT count(*)::int FROM email_events \
+                 WHERE provider_message_id = 'ses-message-id') AS correlated_events, \
+                (SELECT count(*)::int FROM email_events \
+                 WHERE provider_message_id IS NULL) AS uncorrelated_events"
+                .to_string(),
+        ))
+        .await?
+        .expect("rollback compatibility counts");
+    let suppressions: i32 = rollback_counts.try_get("", "suppressions")?;
+    let correlated_events: i32 = rollback_counts.try_get("", "correlated_events")?;
+    let uncorrelated_events: i32 = rollback_counts.try_get("", "uncorrelated_events")?;
+    assert_eq!(
+        suppressions, 1,
+        "legacy global suppression must be restored"
+    );
+    assert_eq!(correlated_events, 1, "legacy correlation must stay unique");
+    assert_eq!(
+        uncorrelated_events, 1,
+        "duplicate event rows must be retained"
+    );
+
+    Ok(())
+}
+
 /// Test that migrations can be rolled back successfully
 #[tokio::test]
 async fn test_migration_down() -> anyhow::Result<()> {
     // Skip this test if TEMPS_TEST_DATABASE_URL is set
     // (running down migrations would destroy data in external database)
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!(
             "⏭️  Skipping test_migration_down: using external database via TEMPS_TEST_DATABASE_URL"
         );
@@ -93,6 +435,18 @@ async fn test_migration_down() -> anyhow::Result<()> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -156,7 +510,7 @@ async fn test_migration_down() -> anyhow::Result<()> {
 async fn test_migration_status() -> anyhow::Result<()> {
     // Skip this test if TEMPS_TEST_DATABASE_URL is set
     // (external databases may already have migrations applied)
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!("⏭️  Skipping test_migration_status: using external database via TEMPS_TEST_DATABASE_URL");
         return Ok(());
     }
@@ -167,6 +521,18 @@ async fn test_migration_status() -> anyhow::Result<()> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -231,6 +597,18 @@ async fn test_pgvector_extension() -> anyhow::Result<()> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -330,7 +708,7 @@ async fn test_pgvector_extension() -> anyhow::Result<()> {
 async fn test_table_constraints() -> anyhow::Result<()> {
     // Skip this test if TEMPS_TEST_DATABASE_URL is set
     // (external databases may already have migrations applied)
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!("⏭️  Skipping test_table_constraints: using external database via TEMPS_TEST_DATABASE_URL");
         return Ok(());
     }
@@ -341,6 +719,18 @@ async fn test_table_constraints() -> anyhow::Result<()> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -403,8 +793,6 @@ async fn verify_tables_exist(db: &DatabaseConnection) -> anyhow::Result<()> {
         "error_groups",
         "error_events",
         "project_dsns",
-        "error_attachments",
-        "error_user_feedback",
         // m20260427_000001_add_compute_network
         "network_config",
         // m20260427_000002_add_dns_service_endpoints
@@ -436,8 +824,6 @@ async fn verify_tables_exist(db: &DatabaseConnection) -> anyhow::Result<()> {
 
 async fn verify_tables_dropped(db: &DatabaseConnection) -> anyhow::Result<()> {
     let tables = vec![
-        "error_user_feedback",
-        "error_attachments",
         "project_dsns",
         "error_events",
         "error_groups",
@@ -508,9 +894,12 @@ async fn verify_foreign_keys(db: &DatabaseConnection) -> anyhow::Result<()> {
 
 async fn verify_indexes(db: &DatabaseConnection) -> anyhow::Result<()> {
     // Check some key indexes exist
+    // error_events is a hypertable: the migration replaces its simple
+    // single-column indexes with composite time-series indexes, so those
+    // are the ones that must exist post-migration.
     let indexes = vec![
-        "idx_error_events_project_id",
-        "idx_error_events_timestamp",
+        "idx_error_events_project_timestamp",
+        "idx_error_events_group_timestamp",
         "idx_error_groups_project_id",
         "idx_project_dsns_public_key",
     ];
@@ -568,7 +957,7 @@ async fn verify_unique_constraints(db: &DatabaseConnection) -> anyhow::Result<()
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_compute_network_migration() -> anyhow::Result<()> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!("⏭️  Skipping test_compute_network_migration: external database in use");
         return Ok(());
     }
@@ -578,6 +967,18 @@ async fn test_compute_network_migration() -> anyhow::Result<()> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -700,7 +1101,7 @@ async fn test_compute_network_migration() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_dns_service_endpoints_migration() -> anyhow::Result<()> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!("⏭️  Skipping test_dns_service_endpoints_migration: external database in use");
         return Ok(());
     }
@@ -710,6 +1111,18 @@ async fn test_dns_service_endpoints_migration() -> anyhow::Result<()> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -962,7 +1375,7 @@ async fn test_dns_service_endpoints_migration() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_visitor_dedup_migration_repoints_session_replay_sessions() -> anyhow::Result<()> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!(
             "⏭️  Skipping test_visitor_dedup_migration_repoints_session_replay_sessions: \
              external database in use"
@@ -975,6 +1388,18 @@ async fn test_visitor_dedup_migration_repoints_session_replay_sessions() -> anyh
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -1246,7 +1671,7 @@ async fn connect_with_retries(db_url: &str) -> anyhow::Result<DatabaseConnection
 // the ALTERs, then restores the policy. This test pins that contract.
 #[tokio::test]
 async fn test_observe_correlation_migration_handles_compressed_proxy_logs() -> anyhow::Result<()> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!(
             "⏭️  Skipping test_observe_correlation_migration_handles_compressed_proxy_logs: \
              external database in use"
@@ -1259,6 +1684,18 @@ async fn test_observe_correlation_migration_handles_compressed_proxy_logs() -> a
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -1390,11 +1827,13 @@ async fn test_observe_correlation_migration_handles_compressed_proxy_logs() -> a
         assert!(present, "index {} must exist after migration", index);
     }
 
-    // ── 6. The migration must have decompressed every chunk (not just
-    //       relied on TimescaleDB's lenient mode for ALTER on compressed
-    //       chunks). Older Timescale versions in prod don't support that
-    //       lenient path; this assertion pins the contract that the
-    //       migration is doing the explicit decompress dance. ──────────────
+    // ── 6. The current migration relies on hypertable-atomic
+    //       `ADD COLUMN IF NOT EXISTS` instead of the old per-chunk
+    //       decompress dance (see m20260502's header for why that was
+    //       abandoned after the orphan-chunk incident). Pin that contract:
+    //       compressed chunks must have survived the migration untouched —
+    //       if this ever starts decompressing again, that's a regression
+    //       back toward the v1 approach and needs a deliberate decision.
     let post = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -1405,10 +1844,12 @@ async fn test_observe_correlation_migration_handles_compressed_proxy_logs() -> a
         .await?
         .expect("post chunk count");
     let compressed_after: i64 = post.try_get("", "compressed")?;
-    assert_eq!(
-        compressed_after, 0,
-        "migration must decompress every chunk before ALTER (got {} still compressed)",
-        compressed_after
+    assert!(
+        compressed_after > 0,
+        "expected compressed proxy_logs chunks to survive the migration \
+         (the ALTER path must not decompress); got {} compressed after, {} before",
+        compressed_after,
+        compressed_before
     );
 
     // ── 7. Compression policy must be restored. ────────────────────────────
@@ -1454,7 +1895,7 @@ async fn test_observe_correlation_migration_handles_compressed_proxy_logs() -> a
 /// someone replaces an `IF NOT EXISTS` with a plain ALTER.
 #[tokio::test]
 async fn test_observe_correlation_migration_is_idempotent() -> anyhow::Result<()> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!(
             "⏭️  Skipping test_observe_correlation_migration_is_idempotent: \
              external database in use"
@@ -1467,6 +1908,18 @@ async fn test_observe_correlation_migration_is_idempotent() -> anyhow::Result<()
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -1508,7 +1961,7 @@ async fn test_observe_correlation_migration_is_idempotent() -> anyhow::Result<()
 // `alter_job(scheduled => false)` with a no-op — the test must then fail.
 #[tokio::test]
 async fn test_observe_correlation_migration_survives_concurrent_retention() -> anyhow::Result<()> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!(
             "⏭️  Skipping test_observe_correlation_migration_survives_concurrent_retention: \
              external database in use"
@@ -1521,6 +1974,18 @@ async fn test_observe_correlation_migration_survives_concurrent_retention() -> a
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -1681,7 +2146,7 @@ async fn test_observe_correlation_migration_survives_concurrent_retention() -> a
 #[tokio::test]
 async fn test_mfa_pending_migration_revokes_ambiguous_sessions_and_defaults_closed(
 ) -> anyhow::Result<()> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+    if external_db_configured() {
         println!("⏭️  Skipping MFA session migration test: external database in use");
         return Ok(());
     }
@@ -1691,6 +2156,18 @@ async fn test_mfa_pending_migration_revokes_ambiguous_sessions_and_defaults_clos
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        // Same fix as TestDatabase (#196) and CI's shared container: the
+        // TimescaleDB background-worker launcher polls independently of the
+        // test and can compress/drop chunks mid-test ("chunk not found").
+        // Disabling background workers kills that scheduler race; tests
+        // that deliberately race jobs (concurrent-retention) still work,
+        // because `CALL run_job(...)` executes in-session, not via the
+        // launcher.
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
         .start()
         .await
     {
@@ -1790,4 +2267,123 @@ async fn test_mfa_pending_migration_revokes_ambiguous_sessions_and_defaults_clos
     .await?;
 
     Ok(())
+}
+
+/// The feature-flag migration must be reversible: `down` drops the child table
+/// before the parent, and a re-`up` must rebuild the exact schema.
+///
+/// Worth a dedicated test because the two tables are linked by a foreign key,
+/// so dropping them in the wrong order fails, and because a half-applied
+/// rollback would leave an operator unable to migrate forward again.
+#[tokio::test]
+async fn test_feature_flags_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping feature-flag migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    let db = connect_with_retries(&db_url).await?;
+
+    Migrator::up(&db, None).await?;
+    assert_eq!(
+        feature_flag_table_count(&db).await?,
+        2,
+        "both feature-flag tables must exist after `up`"
+    );
+
+    // Roll back exactly through the feature-flag migration, wherever it sits
+    // in the chain — a hardcoded step count breaks the moment a newer
+    // migration lands after it.
+    let target = "m20260802_000002_create_feature_flags";
+    let after = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT count(*)::int AS n FROM seaql_migrations WHERE version > '{target}'"),
+        ))
+        .await?
+        .expect("seaql_migrations count");
+    let steps_after: i32 = after.try_get("", "n")?;
+
+    Migrator::down(&db, Some(steps_after as u32 + 1)).await?;
+    assert_eq!(
+        feature_flag_table_count(&db).await?,
+        0,
+        "`down` must drop both tables, child before parent"
+    );
+
+    // Forward again: an operator who rolled back must be able to upgrade.
+    Migrator::up(&db, None).await?;
+    assert_eq!(
+        feature_flag_table_count(&db).await?,
+        2,
+        "re-running `up` after a rollback must rebuild both tables"
+    );
+
+    // `last_evaluated_at` belongs on `feature_flags` (the row always exists and
+    // the question is per-flag), NOT on `feature_flag_environments`. Assert
+    // both directions: a positive check so the follow-up migration cannot be
+    // silently dropped from `mod.rs` and still pass, and a negative one so it
+    // does not drift back onto the environments table.
+    let placement = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT \
+                (SELECT count(*)::int FROM information_schema.columns \
+                  WHERE table_name = 'feature_flags' \
+                    AND column_name = 'last_evaluated_at') AS on_flags, \
+                (SELECT count(*)::int FROM information_schema.columns \
+                  WHERE table_name = 'feature_flag_environments' \
+                    AND column_name = 'last_evaluated_at') AS on_environments"
+                .to_string(),
+        ))
+        .await?
+        .expect("column placement");
+    let on_flags: i32 = placement.try_get("", "on_flags")?;
+    let on_environments: i32 = placement.try_get("", "on_environments")?;
+    assert_eq!(
+        on_flags, 1,
+        "feature_flags.last_evaluated_at must exist — is m20260803_000001 registered?"
+    );
+    assert_eq!(
+        on_environments, 0,
+        "last_evaluated_at must not be on feature_flag_environments"
+    );
+
+    Ok(())
+}
+
+async fn feature_flag_table_count(db: &DatabaseConnection) -> anyhow::Result<i32> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS n FROM information_schema.tables \
+             WHERE table_schema = 'public' \
+               AND table_name IN ('feature_flags', 'feature_flag_environments')"
+                .to_string(),
+        ))
+        .await?
+        .expect("table count");
+    Ok(row.try_get("", "n")?)
 }

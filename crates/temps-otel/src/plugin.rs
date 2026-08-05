@@ -59,6 +59,10 @@ pub struct OtelConfig {
     // Background tasks
     pub enable_health_compute: bool,
     pub enable_anomaly_detection: bool,
+
+    // Ingest backpressure. Process-wide operational tuning knob (not
+    // per-tenant config) — see `crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS`.
+    pub max_concurrent_ingest_requests: usize,
 }
 
 impl Default for OtelConfig {
@@ -77,6 +81,8 @@ impl Default for OtelConfig {
             quota_bytes_per_project: None, // quota disabled unless configured
             enable_health_compute: true,
             enable_anomaly_detection: true,
+            max_concurrent_ingest_requests:
+                crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
         }
     }
 }
@@ -138,6 +144,17 @@ impl OtelConfig {
         if let Ok(v) = std::env::var("TEMPS_OTEL_ENABLE_ANOMALY_DETECTION") {
             config.enable_anomaly_detection = v != "0" && v != "false";
         }
+        if let Ok(v) = std::env::var("TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS") {
+            match parse_max_concurrent_ingest_requests(&v) {
+                Some(limit) => config.max_concurrent_ingest_requests = limit,
+                None => warn!(
+                    value = %v,
+                    "TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS is set but is not a positive \
+                     integer within the supported range; keeping the default ingest \
+                     concurrency ceiling"
+                ),
+            }
+        }
 
         config
     }
@@ -149,6 +166,19 @@ impl OtelConfig {
             && self.s3_secret_key.is_some()
             && self.s3_bucket.is_some()
     }
+}
+
+/// Parses `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS`. Returns `None` (caller
+/// keeps the default) for anything that isn't a positive integer within
+/// `Semaphore::MAX_PERMITS` — `Semaphore::new` asserts on that bound and would
+/// otherwise panic the process at startup on a mistyped value.
+///
+/// A free function (rather than inline in `from_env`) so this parsing/bounds
+/// logic is unit-testable without mutating process-global environment
+/// variables, which the other `TEMPS_OTEL_*` fields in this file don't do.
+fn parse_max_concurrent_ingest_requests(v: &str) -> Option<usize> {
+    let limit = v.parse::<usize>().ok()?;
+    (limit > 0 && limit <= tokio::sync::Semaphore::MAX_PERMITS).then_some(limit)
 }
 
 // ── OpenAPI Schema ──────────────────────────────────────────────────
@@ -433,8 +463,11 @@ impl TempsPlugin for OtelPlugin {
             };
             context.register_service(storage.clone());
 
-            // Create auth service
+            // Create auth service. Also registered in the context so
+            // `configure_routes` can inject the ADR-028 ProjectAccessChecker
+            // (registered by a later plugin) into the `tk_`-key ingest path.
             let auth_service = Arc::new(OtelAuthService::new(db.clone()));
+            context.register_service(auth_service.clone());
 
             // Create rate limiter
             let rate_limiter = Arc::new(RateLimiter::new(
@@ -447,6 +480,7 @@ impl TempsPlugin for OtelPlugin {
                 storage.clone(),
                 auth_service,
                 rate_limiter,
+                config.max_concurrent_ingest_requests,
             ));
             context.register_service(otel_service.clone());
             // Also expose the same service behind the storage-agnostic read
@@ -474,11 +508,13 @@ impl TempsPlugin for OtelPlugin {
             // ── ADR-027 Phase 0: Cross-project trace hint pipeline ───────────
             //
             // A bounded mpsc channel (capacity 1,000) decouples span ingest
-            // latency from the Postgres hint write.  When the channel is full,
+            // latency from the hint write.  When the channel is full,
             // `do_ingest_traces` drops the hint (non-blocking try_send) and
             // warns.  The background consumer below drains the channel and
-            // calls `record_hint`, which issues a single multi-row
-            // `INSERT … ON CONFLICT DO NOTHING`.
+            // calls `record_hint`, which routes through the active storage
+            // backend: a multi-row `INSERT … ON CONFLICT DO NOTHING` into the
+            // Postgres control table, or a batched insert into the compressed
+            // ClickHouse `cross_project_trace_refs` table when CH is enabled.
             let (trace_hint_tx, mut trace_hint_rx) =
                 tokio::sync::mpsc::channel::<TraceHintMsg>(1000);
 
@@ -624,8 +660,13 @@ impl TempsPlugin for OtelPlugin {
                 });
             }
 
-            // 1d. ADR-027 Phase 0: daily prune of cross_project_trace_refs rows
-            //     older than 90 days (matching the OTel span TTL on both backends).
+            // 1d. ADR-027 Phase 0: daily prune of POSTGRES cross_project_trace_refs
+            //     rows older than 90 days (matching the OTel span TTL on both
+            //     backends). Runs unconditionally: on the TimescaleDB backend it
+            //     is the retention mechanism; on the ClickHouse backend (where
+            //     new refs expire via native per-row TTL) it drains the legacy
+            //     Postgres rows written before the cutover and becomes a no-op
+            //     after one retention window.
             //
             // Deliberately uses a periodic tokio::spawn loop rather than a
             // Job enum variant to keep the scheduler dependency minimal.
@@ -726,6 +767,14 @@ impl TempsPlugin for OtelPlugin {
         app_state.project_access_checker =
             context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
+        // Same checker feeds the `tk_`-key ingest auth path, so team-based
+        // project access is enforced on writes exactly as on reads.
+        if let Some(checker) = app_state.project_access_checker.clone() {
+            context
+                .require_service::<OtelAuthService>()
+                .set_project_access_checker(checker);
+        }
+
         let router = handlers::configure_routes().with_state(app_state);
 
         Some(PluginRoutes::new(router))
@@ -804,6 +853,41 @@ mod tests {
         assert!(!config.has_s3_config());
         assert!(config.enable_health_compute);
         assert!(config.enable_anomaly_detection);
+        assert_eq!(
+            config.max_concurrent_ingest_requests,
+            crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS
+        );
+    }
+
+    #[test]
+    fn test_parse_max_concurrent_ingest_requests_accepts_positive_integers() {
+        assert_eq!(parse_max_concurrent_ingest_requests("1"), Some(1));
+        assert_eq!(parse_max_concurrent_ingest_requests("128"), Some(128));
+    }
+
+    #[test]
+    fn test_parse_max_concurrent_ingest_requests_rejects_zero_and_garbage() {
+        assert_eq!(parse_max_concurrent_ingest_requests("0"), None);
+        assert_eq!(parse_max_concurrent_ingest_requests("-1"), None);
+        assert_eq!(parse_max_concurrent_ingest_requests("not-a-number"), None);
+        assert_eq!(parse_max_concurrent_ingest_requests(""), None);
+    }
+
+    #[test]
+    fn test_parse_max_concurrent_ingest_requests_rejects_values_above_semaphore_max() {
+        // A value that parses as `usize` but exceeds `Semaphore::MAX_PERMITS`
+        // must fall back to the default rather than panicking `Semaphore::new`
+        // at startup — the regression this fix targets.
+        let too_large = (tokio::sync::Semaphore::MAX_PERMITS as u128 + 1).to_string();
+        assert_eq!(parse_max_concurrent_ingest_requests(&too_large), None);
+        assert_eq!(
+            parse_max_concurrent_ingest_requests(&usize::MAX.to_string()),
+            None
+        );
+        assert_eq!(
+            parse_max_concurrent_ingest_requests(&tokio::sync::Semaphore::MAX_PERMITS.to_string()),
+            Some(tokio::sync::Semaphore::MAX_PERMITS)
+        );
     }
 
     #[test]

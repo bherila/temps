@@ -29,6 +29,11 @@ use temps_otel::types::{
     AggregationTemporality, MetricAggregation, MetricPoint, MetricQuery, MetricType, ResourceInfo,
 };
 
+#[derive(::clickhouse::Row, serde::Deserialize)]
+struct ChTypeNameRow {
+    type_name: String,
+}
+
 /// Container handle + a connected `ClickHouseOtelStorage`. Returns `None` when
 /// Docker is unavailable so the test can skip without failing CI.
 async fn setup() -> Option<(ClickHouseOtelStorage, Box<dyn std::any::Any + Send>)> {
@@ -38,7 +43,11 @@ async fn setup() -> Option<(ClickHouseOtelStorage, Box<dyn std::any::Any + Send>
         GenericImage, ImageExt,
     };
 
-    let image = GenericImage::new("clickhouse/clickhouse-server", "24.8")
+    // This storage suite exercises the production-generation ClickHouse used
+    // by the schema benchmarks. decode_to_store_test remains pinned to 24.8,
+    // so together they cover both ends of the supported server range. Newer
+    // ClickHouse versions expose bare empty arrays as Array(Nothing).
+    let image = GenericImage::new("clickhouse/clickhouse-server", "26.2.5")
         .with_exposed_port(ContainerPort::Tcp(8123))
         // The clickhouse-server image writes "Ready for connections" only to its
         // in-container log file — never to stdout/stderr — so a log-message wait
@@ -52,7 +61,7 @@ async fn setup() -> Option<(ClickHouseOtelStorage, Box<dyn std::any::Any + Send>
         .with_env_var("CLICKHOUSE_DB", "temps_otel_test")
         // Do NOT set CLICKHOUSE_USER=default (the image's user-init then rejects
         // the pre-existing default user) and do NOT use an empty password (an
-        // empty CLICKHOUSE_PASSWORD leaves `default` unauthenticatable in 24.8).
+        // empty CLICKHOUSE_PASSWORD leaves `default` unauthenticatable).
         .with_env_var("CLICKHOUSE_PASSWORD", "test");
 
     let container = match image.start().await {
@@ -100,6 +109,16 @@ async fn setup() -> Option<(ClickHouseOtelStorage, Box<dyn std::any::Any + Send>
         return None;
     }
 
+    // Prove this test server exposes the production failure mode. A regression
+    // to a bare [] projection will therefore fail when the clickhouse client
+    // parses the Array(Nothing) response header into a typed Vec<T> field.
+    let empty_array_type = probe
+        .query("SELECT toTypeName([]) AS type_name")
+        .fetch_one::<ChTypeNameRow>()
+        .await
+        .expect("query empty-array ClickHouse type");
+    assert_eq!(empty_array_type.type_name, "Array(Nothing)");
+
     // Apply OTel CH migrations (spans + metrics). This MUST succeed — it is the
     // entire reason for the test. Assert loudly on failure.
     temps_otel::storage::clickhouse::migrations::apply_migrations(&probe, "temps_otel_test")
@@ -108,7 +127,14 @@ async fn setup() -> Option<(ClickHouseOtelStorage, Box<dyn std::any::Any + Send>
 
     // The inner Timescale storage is never exercised by the metric methods under
     // test; a MockDatabase satisfies the constructor without a Postgres server.
-    let mock_db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+    // The trace-refs test IS an exception: `get_trace_ref_projects` unions the
+    // ClickHouse rows with the inner Postgres table, so a stack of empty query
+    // results is queued for those lookups (unused results are harmless to the
+    // metric tests, which never touch the mock).
+    let empty_pg_result = || Vec::<std::collections::BTreeMap<String, sea_orm::Value>>::new();
+    let mock_db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results(std::iter::repeat_with(empty_pg_result).take(8))
+        .into_connection();
     let inner = Arc::new(TimescaleDbStorage::new(Arc::new(mock_db), None));
 
     let storage =
@@ -664,4 +690,60 @@ async fn query_metrics_cumulative_histogram_uses_latest_not_sum() {
         vec![32, 32, 16],
         "per-series latest buckets summed across series"
     );
+}
+
+/// Round-trip for the ADR-027 cross-project trace ref index on the ClickHouse
+/// backend (`0006_trace_refs.sql`): record refs, re-record the same pair
+/// (must dedupe, not duplicate), and look them up per trace_id. The lookup
+/// unions with the inner Postgres storage — the queued-empty MockDatabase in
+/// `setup()` stands in for a drained legacy table.
+#[tokio::test]
+async fn trace_refs_roundtrip_record_and_lookup() {
+    let Some((storage, _container)) = setup().await else {
+        return; // Docker unavailable — skip gracefully.
+    };
+
+    let t1 = "4bf92f3577b34da6a3ce929d0e0e4736".to_string();
+    let t2 = "abcdef1234567890abcdef1234567890".to_string();
+
+    storage
+        .record_trace_refs(&[t1.clone(), t2.clone()], 1)
+        .await
+        .expect("record refs for project 1");
+    // Re-recording an existing (trace_id, project_id) pair must be a no-op
+    // at read time (GROUP BY + ReplacingMergeTree dedup).
+    storage
+        .record_trace_refs(std::slice::from_ref(&t1), 1)
+        .await
+        .expect("re-record same pair");
+    storage
+        .record_trace_refs(std::slice::from_ref(&t1), 2)
+        .await
+        .expect("record ref for project 2");
+
+    let refs = storage
+        .get_trace_ref_projects(&t1)
+        .await
+        .expect("lookup shared trace");
+    let mut projects: Vec<i32> = refs.iter().map(|r| r.project_id).collect();
+    projects.sort_unstable();
+    assert_eq!(projects, vec![1, 2], "one entry per project, no duplicates");
+    for r in &refs {
+        // Sanity: first_seen decoded from DateTime64(3) into a real timestamp.
+        assert!(r.first_seen.timestamp() > 1_500_000_000);
+    }
+
+    let refs_t2 = storage
+        .get_trace_ref_projects(&t2)
+        .await
+        .expect("lookup single-project trace");
+    assert_eq!(refs_t2.len(), 1);
+    assert_eq!(refs_t2[0].project_id, 1);
+
+    // Unknown trace_id resolves to an empty list, never an error.
+    let none = storage
+        .get_trace_ref_projects("00000000000000000000000000000000")
+        .await
+        .expect("lookup unknown trace");
+    assert!(none.is_empty());
 }

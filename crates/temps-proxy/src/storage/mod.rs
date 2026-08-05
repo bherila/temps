@@ -84,6 +84,21 @@ pub trait ProxyLogStorage: Send + Sync {
         page_size: u64,
     ) -> Result<(Vec<proxy_logs::Model>, u64), ProxyLogServiceError>;
 
+    /// Newest-first page of proxy logs WITHOUT the pagination total.
+    ///
+    /// The unified Observe feed fetches a merged page on every load/poll and
+    /// never renders a total; `list_with_filters`' COUNT (exact on the
+    /// TimescaleDB hypertable, `FINAL` merge-on-read on ClickHouse) would be
+    /// pure waste there — and unbounded when the caller sends no time range.
+    /// Mirrors `ProxyLogService::list_page`.
+    async fn list_page(
+        &self,
+        start_date: Option<UtcDateTime>,
+        end_date: Option<UtcDateTime>,
+        filters: ProxyLogsQuery,
+        limit: u64,
+    ) -> Result<Vec<proxy_logs::Model>, ProxyLogServiceError>;
+
     /// Fetch a single proxy log by its serial id.
     ///
     /// `timestamp` is the row's known event time (the list endpoint returns it
@@ -97,9 +112,15 @@ pub trait ProxyLogStorage: Send + Sync {
     ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError>;
 
     /// Fetch a single proxy log by its (unique) request id, for tracing joins.
+    ///
+    /// `timestamp` is the row's known event time (the list endpoint returns it
+    /// per row). It bounds the lookup the same way as [`Self::get_by_id`]:
+    /// chunk exclusion on the TimescaleDB hypertable, partition pruning on the
+    /// ClickHouse table.
     async fn get_by_request_id(
         &self,
         request_id: &str,
+        timestamp: Option<UtcDateTime>,
     ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError>;
 
     /// `stats/today` — total request count since UTC midnight.

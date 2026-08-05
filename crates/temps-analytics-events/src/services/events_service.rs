@@ -981,6 +981,7 @@ WHERE project_id = $1
                       AND timestamp >= $2::timestamp
                       AND timestamp <= $3::timestamp
                       AND visitor_id IS NOT NULL
+                      AND is_crawler = false
                       AND ($4::int IS NULL OR environment_id = $4)
                       AND ($5::int IS NULL OR deployment_id = $5)
                 )
@@ -1030,15 +1031,21 @@ WHERE project_id = $1
             "visitors" => {
                 "COUNT(DISTINCT visitor_id) FILTER (WHERE visitor_id IS NOT NULL)::bigint"
             }
-            "page_views" | "paths" => "COUNT(*) FILTER (WHERE event_type = 'page_view')::bigint",
+            "page_views" => "COUNT(*) FILTER (WHERE event_type = 'page_view')::bigint",
+            "paths" => {
+                "COUNT(DISTINCT page_path) FILTER (WHERE event_type = 'page_view')::bigint"
+            }
             _ => {
                 return Err(EventsError::Validation(format!(
-                    "Invalid metric '{}'. Valid options: sessions, visitors, returning_visitors, page_views",
+                    "Invalid metric '{}'. Valid options: sessions, visitors, returning_visitors, page_views, paths",
                     metric
                 )))
             }
         };
 
+        // Crawler traffic is excluded so these headline counts agree with the
+        // per-page analytics queries, which already filter is_crawler; bot
+        // activity has its own dedicated AI-crawler views.
         let query = format!(
             r#"
             SELECT
@@ -1047,6 +1054,7 @@ WHERE project_id = $1
             WHERE project_id = $1
               AND timestamp >= $2::timestamp
               AND timestamp <= $3::timestamp
+              AND is_crawler = false
               AND ($4::int IS NULL OR environment_id = $4)
               AND ($5::int IS NULL OR deployment_id = $5)
             "#,
@@ -2290,54 +2298,18 @@ mod tests {
     #[tokio::test]
     async fn test_ip_geolocation_integration() {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use temps_database::test_utils::TestDatabase;
         use temps_entities::ip_geolocations;
         use temps_geo::{GeoIpService, IpAddressService};
 
-        // Setup PostgreSQL test container
-        use testcontainers::{
-            core::{ContainerPort, WaitFor},
-            runners::AsyncRunner,
-            GenericImage, ImageExt,
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("Skipping IP geolocation integration test: {error}");
+                return;
+            }
         };
-
-        // Use TimescaleDB with pgvector support
-        let postgres_image = GenericImage::new("timescale/timescaledb-ha", "pg18")
-            .with_exposed_port(ContainerPort::Tcp(5432))
-            .with_wait_for(WaitFor::message_on_stderr(
-                "database system is ready to accept connections",
-            ))
-            .with_env_var("POSTGRES_PASSWORD", "postgres")
-            .with_env_var("POSTGRES_USER", "postgres")
-            .with_env_var("POSTGRES_DB", "postgres");
-
-        let node = postgres_image
-            .start()
-            .await
-            .expect("Failed to start PostgreSQL container");
-        let port = node
-            .get_host_port_ipv4(5432)
-            .await
-            .expect("Failed to get port");
-
-        let database_url = format!(
-            "postgresql://postgres:postgres@localhost:{}/postgres?sslmode=disable",
-            port
-        );
-
-        // Wait a bit for PostgreSQL to be fully ready
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-        // Create database connection
-        let db = sea_orm::Database::connect(&database_url)
-            .await
-            .expect("Failed to connect to database");
-        let db = Arc::new(db);
-
-        // Run migrations to create tables
-        use temps_migrations::{Migrator, MigratorTrait};
-        Migrator::up(&*db, None)
-            .await
-            .expect("Failed to run migrations");
+        let db = test_db.connection_arc();
 
         // Create mock GeoIP service
         let geoip_service = Arc::new(GeoIpService::Mock(temps_geo::MockGeoIpService::new()));
@@ -2683,49 +2655,17 @@ mod tests {
     #[tokio::test]
     async fn test_hourly_visits_gap_filling() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        use temps_database::test_utils::TestDatabase;
         use temps_entities::{deployments, environments, events, projects, visitor};
-        use testcontainers::{
-            core::{ContainerPort, WaitFor},
-            runners::AsyncRunner,
-            GenericImage, ImageExt,
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("Skipping hourly visits gap-filling test: {error}");
+                return;
+            }
         };
-
-        // Setup PostgreSQL test container with TimescaleDB
-        let postgres_image = GenericImage::new("timescale/timescaledb-ha", "pg18")
-            .with_exposed_port(ContainerPort::Tcp(5432))
-            .with_wait_for(WaitFor::message_on_stderr(
-                "database system is ready to accept connections",
-            ))
-            .with_env_var("POSTGRES_PASSWORD", "postgres")
-            .with_env_var("POSTGRES_USER", "postgres")
-            .with_env_var("POSTGRES_DB", "postgres");
-
-        let node = postgres_image
-            .start()
-            .await
-            .expect("Failed to start PostgreSQL container");
-        let port = node
-            .get_host_port_ipv4(5432)
-            .await
-            .expect("Failed to get port");
-
-        let database_url = format!(
-            "postgresql://postgres:postgres@localhost:{}/postgres?sslmode=disable",
-            port
-        );
-
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-        let db = sea_orm::Database::connect(&database_url)
-            .await
-            .expect("Failed to connect to database");
-        let db = Arc::new(db);
-
-        // Run migrations
-        use temps_migrations::{Migrator, MigratorTrait};
-        Migrator::up(&*db, None)
-            .await
-            .expect("Failed to run migrations");
+        let db = test_db.connection_arc();
 
         // Create test project, environment, and deployment
         let base_time = Utc.with_ymd_and_hms(2025, 10, 6, 10, 0, 0).unwrap();
@@ -2964,6 +2904,8 @@ mod tests {
             git_url: Set(None),
             git_provider_connection_id: Set(None),
             attack_mode: Set(false),
+            error_source_context_enabled: Set(false),
+            error_source_root: Set(None),
             enable_preview_environments: Set(false),
             source_type: Set(SourceType::Git),
             created_at: Set(chrono::Utc::now()),
@@ -3154,6 +3096,8 @@ mod tests {
             git_url: Set(None),
             git_provider_connection_id: Set(None),
             attack_mode: Set(false),
+            error_source_context_enabled: Set(false),
+            error_source_root: Set(None),
             enable_preview_environments: Set(false),
             source_type: Set(SourceType::Git),
             created_at: Set(chrono::Utc::now()),
@@ -3377,6 +3321,8 @@ mod tests {
             git_url: Set(None),
             git_provider_connection_id: Set(None),
             attack_mode: Set(false),
+            error_source_context_enabled: Set(false),
+            error_source_root: Set(None),
             enable_preview_environments: Set(false),
             source_type: Set(SourceType::Git),
             created_at: Set(chrono::Utc::now()),
@@ -3960,6 +3906,8 @@ mod tests {
             git_url: Set(None),
             git_provider_connection_id: Set(None),
             attack_mode: Set(false),
+            error_source_context_enabled: Set(false),
+            error_source_root: Set(None),
             enable_preview_environments: Set(false),
             source_type: Set(SourceType::Git),
             created_at: Set(chrono::Utc::now()),

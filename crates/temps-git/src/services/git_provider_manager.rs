@@ -1557,6 +1557,7 @@ impl GitProviderManager {
     /// Get connections for a user with pagination and sorting
     pub async fn get_user_connections_paginated(
         &self,
+        caller_user_id: i32,
         page: u64,
         per_page: u64,
         sort: &str,
@@ -1565,7 +1566,8 @@ impl GitProviderManager {
         use sea_orm::QueryOrder;
 
         let mut query = git_provider_connections::Entity::find()
-            .filter(git_provider_connections::Column::IsActive.eq(true));
+            .filter(git_provider_connections::Column::IsActive.eq(true))
+            .filter(git_provider_connections::Column::UserId.eq(Some(caller_user_id)));
 
         // Apply sorting - default to created_at desc
         query = match (sort, direction) {
@@ -1835,6 +1837,36 @@ impl GitProviderManager {
                 }
             }
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Classify a failed provider HTTP response into a typed error.
+    ///
+    /// Provider 401/403 responses MUST become
+    /// [`GitProviderError::AuthenticationFailed`] rather than a generic
+    /// `ApiError`, for two reasons:
+    ///
+    /// 1. [`Self::is_authentication_error`] drives the token
+    ///    force-refresh-and-retry path. A 401 flattened into `ApiError`
+    ///    silently skips that retry, so an expired-but-refreshable token
+    ///    hard-fails instead of recovering.
+    /// 2. The HTTP layer maps `AuthenticationFailed` to a distinct problem
+    ///    type, so clients can tell "reconnect this git account" apart from
+    ///    "the provider is having a bad day" and say so to the user.
+    ///
+    /// `operation` names what was being fetched, so the message stays
+    /// greppable and specific (e.g. "get tree for owner/repo@main").
+    fn classify_provider_response_error(
+        status: reqwest::StatusCode,
+        operation: &str,
+    ) -> GitProviderError {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            GitProviderError::AuthenticationFailed(format!(
+                "provider rejected the stored credential while trying to {}: HTTP {}",
+                operation, status
+            ))
+        } else {
+            GitProviderError::ApiError(format!("Failed to {}: HTTP {}", operation, status))
         }
     }
 
@@ -3121,7 +3153,7 @@ impl GitProviderManager {
         owner: &str,
         repo: &str,
         branch: &str,
-    ) -> Result<Vec<String>, GitProviderManagerError> {
+    ) -> Result<Vec<String>, GitProviderError> {
         // For GitHub, we can use the tree API to get file list
         // For other providers, we may need different approaches
 
@@ -3145,35 +3177,23 @@ impl GitProviderManager {
                     .send()
                     .await
                     .map_err(|e| {
-                        GitProviderManagerError::ProviderError(GitProviderError::ApiError(format!(
-                            "Failed to get tree: {}",
-                            e
-                        )))
+                        GitProviderError::ApiError(format!("Failed to get tree: {}", e))
                     })?;
 
                 if !response.status().is_success() {
-                    return Err(GitProviderManagerError::ProviderError(
-                        GitProviderError::ApiError(format!(
-                            "Failed to get tree: HTTP {}",
-                            response.status()
-                        )),
+                    return Err(Self::classify_provider_response_error(
+                        response.status(),
+                        &format!("get tree for {}/{}@{}", owner, repo, branch),
                     ));
                 }
 
                 let tree_data: serde_json::Value = response.json().await.map_err(|e| {
-                    GitProviderManagerError::ProviderError(GitProviderError::ApiError(format!(
-                        "Failed to parse tree response: {}",
-                        e
-                    )))
+                    GitProviderError::ApiError(format!("Failed to parse tree response: {}", e))
                 })?;
 
                 let files = tree_data["tree"]
                     .as_array()
-                    .ok_or_else(|| {
-                        GitProviderManagerError::ProviderError(GitProviderError::ApiError(
-                            "No tree in response".to_string(),
-                        ))
-                    })?
+                    .ok_or_else(|| GitProviderError::ApiError("No tree in response".to_string()))?
                     .iter()
                     .filter_map(|item| {
                         if item["type"].as_str() == Some("blob") {
@@ -3200,26 +3220,18 @@ impl GitProviderManager {
                     .send()
                     .await
                     .map_err(|e| {
-                        GitProviderManagerError::ProviderError(GitProviderError::ApiError(format!(
-                            "Failed to get tree: {}",
-                            e
-                        )))
+                        GitProviderError::ApiError(format!("Failed to get tree: {}", e))
                     })?;
 
                 if !response.status().is_success() {
-                    return Err(GitProviderManagerError::ProviderError(
-                        GitProviderError::ApiError(format!(
-                            "Failed to get tree: HTTP {}",
-                            response.status()
-                        )),
+                    return Err(Self::classify_provider_response_error(
+                        response.status(),
+                        &format!("get tree for {}/{}@{}", owner, repo, branch),
                     ));
                 }
 
                 let tree_data: Vec<serde_json::Value> = response.json().await.map_err(|e| {
-                    GitProviderManagerError::ProviderError(GitProviderError::ApiError(format!(
-                        "Failed to parse tree response: {}",
-                        e
-                    )))
+                    GitProviderError::ApiError(format!("Failed to parse tree response: {}", e))
                 })?;
 
                 let files = tree_data
@@ -3301,31 +3313,41 @@ impl GitProviderManager {
         // Repository always has a git provider connection (required field)
         let connection_id = repository.git_provider_connection_id;
 
-        // Get the git provider connection
-        let connection = self.get_connection(connection_id).await?;
-        let provider_service = self.get_provider_service(connection.provider_id).await?;
-
-        // Decrypt access token
-        let access_token = if let Some(ref encrypted) = connection.access_token {
-            self.decrypt_string(encrypted).await?
-        } else {
-            return Err(GitProviderManagerError::InvalidConfiguration(
-                "Git provider connection has no access token configured".to_string(),
-            ));
+        let provider_service = {
+            let connection = self.get_connection(connection_id).await?;
+            self.get_provider_service(connection.provider_id).await?
         };
 
         // Use provided branch or fall back to repository's default branch
         let target_branch = branch.unwrap_or_else(|| repository.default_branch.clone());
 
-        // Get all files in the repository
+        // Get all files in the repository.
+        //
+        // Routed through `execute_with_refresh` so an expired-but-refreshable
+        // access token is refreshed and retried instead of surfacing a 401 to
+        // the user. This previously decrypted the token inline and called
+        // directly, so preset detection was the one provider path that never
+        // got the refresh treatment — and because a provider 401 was also
+        // flattened into a generic `ApiError`, the retry could not have fired
+        // even if it had been wrapped (see
+        // `classify_provider_response_error`).
         let files = self
-            .get_repository_files(
-                &provider_service,
-                &access_token,
-                &repository.owner,
-                &repository.name,
-                &target_branch,
-            )
+            .execute_with_refresh(connection_id, |access_token| {
+                let provider_service = provider_service.clone();
+                let owner = repository.owner.clone();
+                let name = repository.name.clone();
+                let target_branch = target_branch.clone();
+                async move {
+                    self.get_repository_files(
+                        &provider_service,
+                        &access_token,
+                        &owner,
+                        &name,
+                        &target_branch,
+                    )
+                    .await
+                }
+            })
             .await?;
 
         // Detect presets in root and subdirectories
@@ -3397,22 +3419,30 @@ impl GitProviderManager {
         detected_presets
             .into_iter()
             .map(|preset| {
-                // Parse preset slug to get metadata from entity enum
-                let preset_enum = preset.slug.parse::<temps_entities::preset::Preset>().ok();
-
-                let exposed_port = preset_enum
+                let runtime_preset = temps_presets::get_preset_by_slug(&preset.slug);
+                let preset_enum = runtime_preset
                     .as_ref()
-                    .and_then(|p| p.exposed_port())
-                    .or(preset.exposed_port);
+                    .and_then(|preset| preset.stored_preset());
 
-                let icon_url = preset_enum
-                    .as_ref()
-                    .and_then(|p| p.icon_url())
-                    .map(|s| s.to_string());
+                // Prefer temps-presets metadata (covers nixpacks-* UI slugs); fall back to entity.
+                let exposed_port = preset
+                    .exposed_port
+                    .or_else(|| preset_enum.as_ref().and_then(|p| p.exposed_port()));
 
-                let project_type = preset_enum
+                let icon_url = runtime_preset
                     .as_ref()
-                    .map(|p| p.project_type().to_string())
+                    .map(|preset| preset.icon_url())
+                    .or_else(|| {
+                        preset_enum
+                            .as_ref()
+                            .and_then(|p| p.icon_url())
+                            .map(|s| s.to_string())
+                    });
+
+                let project_type = runtime_preset
+                    .as_ref()
+                    .map(|preset| preset.project_type().to_string())
+                    .or_else(|| preset_enum.as_ref().map(|p| p.project_type().to_string()))
                     .unwrap_or_else(|| "unknown".to_string());
 
                 ProjectPresetDomain {
@@ -3856,7 +3886,27 @@ impl GitProviderManager {
         )))
     }
 
-    /// Get all connections for a specific provider
+    /// Get every connection for a provider, regardless of owner or active state.
+    ///
+    /// Deletion checks must use this rather than [`Self::get_provider_connections`]:
+    /// a deactivated connection (or one owned by another user) still holds rows
+    /// that block or get cascaded by a provider delete, and counting only the
+    /// active ones produced errors referencing connections the caller could not
+    /// see anywhere in the UI.
+    pub async fn get_all_provider_connections(
+        &self,
+        provider_id: i32,
+    ) -> Result<Vec<git_provider_connections::Model>, GitProviderManagerError> {
+        let connections = git_provider_connections::Entity::find()
+            .filter(git_provider_connections::Column::ProviderId.eq(provider_id))
+            .order_by_desc(git_provider_connections::Column::CreatedAt)
+            .all(self.db.as_ref())
+            .await?;
+
+        Ok(connections)
+    }
+
+    /// Get the active connections for a specific provider
     pub async fn get_provider_connections(
         &self,
         provider_id: i32,
@@ -4106,30 +4156,16 @@ impl GitProviderManager {
         Ok(())
     }
 
-    /// Permanently delete a git provider (hard delete)
+    /// Permanently delete a git provider (hard delete).
+    ///
+    /// A provider is only blocked by *projects* that still depend on one of its
+    /// connections — never by the mere existence of a connection row. Connections
+    /// are listed per-user in the UI, so refusing on connection count made
+    /// providers permanently undeletable whenever the connection belonged to
+    /// another user, had no owner, or was deactivated: the error named a
+    /// connection the caller had no way to find or remove.
     pub async fn delete_provider(&self, provider_id: i32) -> Result<(), GitProviderManagerError> {
-        // Check if provider exists
-        let provider = self.get_provider(provider_id).await?;
-
-        // Check if any connections exist for this provider
-        let connections = self.get_provider_connections(provider_id).await?;
-        if !connections.is_empty() {
-            return Err(GitProviderManagerError::InvalidConfiguration(format!(
-                "Cannot delete provider {} because it has {} connection(s)",
-                provider.name,
-                connections.len()
-            )));
-        }
-
-        // Delete the provider
-        git_providers::Entity::delete_by_id(provider_id)
-            .exec(self.db.as_ref())
-            .await?;
-
-        // Remove from cache
-        self.providers_cache.write().await.remove(&provider_id);
-
-        Ok(())
+        self.delete_provider_safely(provider_id).await
     }
 
     /// Check if a provider can be safely deleted and return detailed usage information
@@ -4141,7 +4177,7 @@ impl GitProviderManager {
         let provider = self.get_provider(provider_id).await?;
 
         // Get all connections for this provider
-        let connections = self.get_provider_connections(provider_id).await?;
+        let connections = self.get_all_provider_connections(provider_id).await?;
 
         if connections.is_empty() {
             return Ok(ProviderDeletionCheck {
@@ -4158,21 +4194,29 @@ impl GitProviderManager {
 
         // Check each connection for project usage
         for connection in &connections {
-            let projects: Vec<temps_entities::projects::Model> =
-                temps_entities::projects::Entity::find()
-                    .filter(
-                        temps_entities::projects::Column::GitProviderConnectionId
-                            .eq(Some(connection.id)),
-                    )
-                    .order_by_desc(temps_entities::projects::Column::CreatedAt)
-                    .all(self.db.as_ref())
-                    .await?;
+            // id/name/slug only — see delete_connection: deserializing full
+            // project models turns "used by project X" into an opaque
+            // "Database Error: unexpected value for Preset enum" the moment one
+            // blocking project has a column value this build can't decode.
+            let projects: Vec<(i32, String, String)> = temps_entities::projects::Entity::find()
+                .select_only()
+                .column(temps_entities::projects::Column::Id)
+                .column(temps_entities::projects::Column::Name)
+                .column(temps_entities::projects::Column::Slug)
+                .filter(
+                    temps_entities::projects::Column::GitProviderConnectionId
+                        .eq(Some(connection.id)),
+                )
+                .order_by_desc(temps_entities::projects::Column::CreatedAt)
+                .into_tuple()
+                .all(self.db.as_ref())
+                .await?;
 
-            for project in projects {
+            for (id, name, slug) in projects {
                 projects_in_use.push(ProjectUsageInfo {
-                    id: project.id,
-                    name: project.name,
-                    slug: project.slug,
+                    id,
+                    name,
+                    slug,
                     connection_id: connection.id,
                     connection_name: connection.account_name.clone(),
                 });
@@ -4221,7 +4265,7 @@ impl GitProviderManager {
         let provider = self.get_provider(provider_id).await?;
 
         // Get all connections to delete them along with the provider
-        let connections = self.get_provider_connections(provider_id).await?;
+        let connections = self.get_all_provider_connections(provider_id).await?;
 
         // Delete all repositories associated with these connections
         for connection in &connections {
@@ -4263,18 +4307,35 @@ impl GitProviderManager {
         // Check if connection exists
         self.get_connection(connection_id).await?;
 
-        // Check if connection is in use by any projects
-        let project_count = temps_entities::projects::Entity::find()
+        // Check if connection is in use by any projects. Name them — "used by 2
+        // project(s)" leaves the user hunting through every project to work out
+        // which ones to disconnect first.
+        // Select id + name only. Loading whole project models makes the check
+        // fail with an opaque "Database Error: unexpected value for Preset
+        // enum" if any blocking project carries a column value this build's
+        // enums don't know — and the user loses the real reason they can't
+        // delete, which is the whole point of this branch.
+        let projects: Vec<(i32, String)> = temps_entities::projects::Entity::find()
+            .select_only()
+            .column(temps_entities::projects::Column::Id)
+            .column(temps_entities::projects::Column::Name)
             .filter(
                 temps_entities::projects::Column::GitProviderConnectionId.eq(Some(connection_id)),
             )
-            .count(self.db.as_ref())
+            .into_tuple()
+            .all(self.db.as_ref())
             .await?;
 
-        if project_count > 0 {
+        if !projects.is_empty() {
+            let project_names: Vec<String> = projects
+                .iter()
+                .map(|(id, name)| format!("'{}' (ID: {})", name, id))
+                .collect();
             return Err(GitProviderManagerError::InvalidConfiguration(format!(
-                "Cannot delete connection {} because it is used by {} project(s)",
-                connection_id, project_count
+                "Cannot delete connection {} because it is used by {} project(s): {}. Change the git source of those projects (or delete them) first.",
+                connection_id,
+                projects.len(),
+                project_names.join(", ")
             )));
         }
 
@@ -5353,6 +5414,84 @@ impl GitProviderManagerTrait for GitProviderManager {
 }
 
 #[cfg(test)]
+mod classify_provider_response_error_tests {
+    use super::*;
+
+    /// A provider 401 MUST become `AuthenticationFailed`, not `ApiError`.
+    /// `is_authentication_error` keys off this variant to drive the token
+    /// force-refresh-and-retry, and the HTTP layer maps it to 401 +
+    /// `errors/authentication_failed` so clients can say "reconnect this
+    /// account" instead of "the provider is down".
+    #[test]
+    fn unauthorized_is_classified_as_authentication_failure() {
+        let err = GitProviderManager::classify_provider_response_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "get tree for owner/repo@main",
+        );
+        assert!(
+            matches!(err, GitProviderError::AuthenticationFailed(_)),
+            "401 must map to AuthenticationFailed, got {err:?}"
+        );
+    }
+
+    /// 403 is the other shape a revoked/insufficient credential takes
+    /// (GitHub returns it for token scope problems and some rate limits).
+    #[test]
+    fn forbidden_is_classified_as_authentication_failure() {
+        let err = GitProviderManager::classify_provider_response_error(
+            reqwest::StatusCode::FORBIDDEN,
+            "get tree for owner/repo@main",
+        );
+        assert!(
+            matches!(err, GitProviderError::AuthenticationFailed(_)),
+            "403 must map to AuthenticationFailed, got {err:?}"
+        );
+    }
+
+    /// Everything else stays a generic API error — a provider outage is not
+    /// a credential problem and must not tell the user to reconnect.
+    #[test]
+    fn server_error_stays_a_generic_api_error() {
+        let err = GitProviderManager::classify_provider_response_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "get tree for owner/repo@main",
+        );
+        assert!(
+            matches!(err, GitProviderError::ApiError(_)),
+            "500 must stay ApiError, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn not_found_stays_a_generic_api_error() {
+        let err = GitProviderManager::classify_provider_response_error(
+            reqwest::StatusCode::NOT_FOUND,
+            "get tree for owner/repo@main",
+        );
+        assert!(matches!(err, GitProviderError::ApiError(_)));
+    }
+
+    /// The operation and status must survive into the message — these errors
+    /// are the only breadcrumb when a self-hosted user debugs alone.
+    #[test]
+    fn message_names_the_operation_and_status() {
+        let err = GitProviderManager::classify_provider_response_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "get tree for gotempsh/temps-examples@main",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gotempsh/temps-examples@main"),
+            "message should name the operation: {msg}"
+        );
+        assert!(
+            msg.contains("401"),
+            "message should carry the status: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
@@ -5567,6 +5706,99 @@ mod tests {
 
         // Verify connection and provider were deactivated
         // (actual verification would require querying the database)
+    }
+
+    /// Regression: a provider whose only connection belongs to another user (or
+    /// to nobody, or is deactivated) used to be permanently undeletable — the
+    /// UI lists connections per-user, so the "it has 1 connection(s)" error
+    /// pointed at a row the caller could not see or remove anywhere. Only
+    /// projects actually deploying from the provider may block the delete.
+    #[tokio::test]
+    async fn delete_provider_removes_connections_the_caller_cannot_see() {
+        use chrono::Utc;
+
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+
+        let provider = git_providers::ActiveModel {
+            name: Set("GitLab".to_string()),
+            provider_type: Set("gitlab".to_string()),
+            base_url: Set(None),
+            api_url: Set(None),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Two rows the caller can never see: an active but ownerless one
+        // (user_id = NULL — invisible to the per-user list yet counted by the
+        // old guard) and a deactivated one (invisible to the active-only list
+        // but still cascaded on delete).
+        let now = Utc::now();
+        for (account, active) in [("orphan-account", true), ("stale-account", false)] {
+            git_provider_connections::ActiveModel {
+                provider_id: Set(provider.id),
+                user_id: Set(None),
+                account_name: Set(account.to_string()),
+                account_type: Set("User".to_string()),
+                access_token: Set(None),
+                refresh_token: Set(None),
+                token_expires_at: Set(None),
+                refresh_token_expires_at: Set(None),
+                installation_id: Set(None),
+                metadata: Set(None),
+                is_active: Set(active),
+                is_expired: Set(false),
+                syncing: Set(false),
+                last_synced_at: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        }
+
+        let manager = GitProviderManager::new(
+            db.clone(),
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            ),
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db.clone()),
+        );
+
+        manager
+            .delete_provider(provider.id)
+            .await
+            .expect("provider with no project usage should delete");
+
+        assert!(
+            git_providers::Entity::find_by_id(provider.id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .is_none(),
+            "provider row should be gone"
+        );
+        assert!(
+            manager
+                .get_all_provider_connections(provider.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the hidden connection should have been cascaded away"
+        );
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@
 
 use axum::http::StatusCode;
 use chrono::Utc;
-use rand::Rng;
+use rand::RngExt;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
 };
@@ -737,12 +737,12 @@ impl DeploymentTokenService {
     /// Generate a deployment token with prefix "dt_" (deployment token)
     fn generate_token(&self) -> String {
         const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         let prefix = "dt_";
         let random_part: String = (0..40)
             .map(|_| {
-                let idx = rng.gen_range(0..CHARSET.len());
+                let idx = rng.random_range(0..CHARSET.len());
                 CHARSET[idx] as char
             })
             .collect();
@@ -1314,6 +1314,7 @@ mod tests {
             DeploymentTokenPermission::AnalyticsRead,
             DeploymentTokenPermission::EventsWrite,
             DeploymentTokenPermission::ErrorsRead,
+            DeploymentTokenPermission::FlagsRead,
             DeploymentTokenPermission::FullAccess,
         ];
 
@@ -1330,15 +1331,21 @@ mod tests {
     }
 
     /// Test DeploymentTokenPermission::all() returns all variants
+    ///
+    /// The length assertion is deliberate: adding a variant without listing it
+    /// here means it silently misses `all()`, and `all()` is what the UI offers
+    /// when scoping a token. Update both when adding a permission.
     #[test]
     fn test_permission_all() {
         let all = DeploymentTokenPermission::all();
-        assert_eq!(all.len(), 6);
+        assert_eq!(all.len(), 8);
         assert!(all.contains(&DeploymentTokenPermission::VisitorsEnrich));
         assert!(all.contains(&DeploymentTokenPermission::EmailsSend));
         assert!(all.contains(&DeploymentTokenPermission::AnalyticsRead));
         assert!(all.contains(&DeploymentTokenPermission::EventsWrite));
         assert!(all.contains(&DeploymentTokenPermission::ErrorsRead));
+        assert!(all.contains(&DeploymentTokenPermission::AiGatewayExecute));
+        assert!(all.contains(&DeploymentTokenPermission::FlagsRead));
         assert!(all.contains(&DeploymentTokenPermission::FullAccess));
     }
 
@@ -1566,6 +1573,7 @@ mod tests {
             "analytics:read",
             "events:write",
             "errors:read",
+            "ai_gateway:execute",
             "*",
         ];
 

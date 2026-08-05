@@ -58,7 +58,12 @@ pub struct SandboxAppState {
         sandboxes::mkdir,
         sandboxes::domain,
         sandboxes::set_preview_password,
+        sandboxes::create_preview_link,
         sandboxes::clear_preview_password,
+        sandboxes::resize_sandbox,
+        sandboxes::list_events,
+        sandboxes::rootfs_report,
+        sandboxes::rootfs_gc,
     ),
     components(schemas(
         sandboxes::CreateSandboxBody,
@@ -85,7 +90,16 @@ pub struct SandboxAppState {
         sandboxes::StatResponse,
         sandboxes::SandboxDomainResponse,
         sandboxes::SetPreviewPasswordBody,
+        sandboxes::PreviewShareLinkBody,
+        sandboxes::PreviewShareLinkResponse,
         sandboxes::SetPreviewPasswordResponse,
+        sandboxes::ResizeSandboxBody,
+        sandboxes::SandboxEvent,
+        sandboxes::SandboxEventsResponse,
+        temps_agents::sandbox::RootfsReport,
+        temps_agents::sandbox::RootfsCacheEntry,
+        temps_agents::sandbox::RootfsVmEntry,
+        temps_agents::sandbox::RootfsGcReport,
     )),
     tags(
         (name = "Sandboxes", description = "Standalone sandbox API (`/v1/sandboxes/*`) for running isolated containers.")
@@ -139,6 +153,11 @@ mod tests {
             "/v1/sandboxes/{id}/fs/mkdir",
             "/v1/sandboxes/{id}/domain",
             "/v1/sandboxes/{id}/preview-password",
+            "/v1/sandboxes/{id}/preview-link",
+            "/v1/sandboxes/{id}/events",
+            "/v1/sandboxes/{id}/resize",
+            "/v1/sandboxes/rootfs",
+            "/v1/sandboxes/rootfs/gc",
         ] {
             assert!(
                 paths.contains_key(expected),
@@ -164,5 +183,17 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn preview_link_openapi_contract_is_domain_prefixed_and_documents_conflict() {
+        let api = serde_json::to_value(SandboxApiDoc::openapi()).expect("serialize OpenAPI");
+        let operation = &api["paths"]["/v1/sandboxes/{id}/preview-link"]["post"];
+        assert_eq!(
+            operation["operationId"],
+            serde_json::json!("sandbox_create_preview_link")
+        );
+        assert!(operation["responses"].get("409").is_some());
+        assert!(operation["responses"].get("500").is_some());
     }
 }

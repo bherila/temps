@@ -9,7 +9,7 @@ use chrono;
 use colored::Colorize;
 use futures::FutureExt;
 use include_dir::{include_dir, Dir};
-use rand::Rng;
+use rand::RngExt;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -41,6 +41,7 @@ use temps_email::EmailPlugin;
 use temps_entities::users;
 use temps_environments::EnvironmentsPlugin;
 use temps_error_tracking::ErrorTrackingPlugin;
+use temps_flags::FlagsPlugin;
 use temps_geo::GeoPlugin;
 use temps_git::GitPlugin;
 use temps_import::ImportPlugin;
@@ -64,6 +65,7 @@ use temps_sandbox::plugin::SandboxPlugin;
 use temps_screenshots::ScreenshotsPlugin;
 use temps_static_files::StaticFilesPlugin;
 use temps_status_page::StatusPagePlugin;
+use temps_teams::TeamsPlugin;
 use temps_vulnerability_scanner::VulnerabilityScannerPlugin;
 use temps_webhooks::WebhooksPlugin;
 use tokio::net::TcpListener;
@@ -246,6 +248,105 @@ fn spawn_heartbeat_task(
     });
 }
 
+/// Interval between anonymous `error_summary` flushes. Shorter than the daily
+/// heartbeat so shorter-lived instances still report, but coarse enough that
+/// even a melting-down instance costs at most 4 small POSTs per day.
+const ERROR_SUMMARY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Spawn a detached task that drains the process-global error counters (see
+/// `temps_core::error_metrics`) every [`ERROR_SUMMARY_INTERVAL`] and reports
+/// one aggregated `error_summary` event. Emits nothing when no errors were
+/// recorded, so healthy instances stay silent. Best-effort and opt-out aware
+/// like every other telemetry emission.
+fn spawn_error_summary_task(
+    reporter: std::sync::Arc<dyn temps_core::telemetry::TelemetryReporter>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(ERROR_SUMMARY_INTERVAL);
+        // Skip the immediate first tick: nothing meaningful has accumulated
+        // at boot, and instance_started already covers "alive today".
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let Some(summary) = temps_core::error_metrics::global().drain() else {
+                continue;
+            };
+            reporter.report(build_error_summary_event(&summary));
+            tracing::debug!("emitted anonymous error_summary telemetry event");
+        }
+    });
+}
+
+/// Build the `error_summary` telemetry event from a drained counter snapshot.
+///
+/// Every value is a count or a compile-time identifier of our own code
+/// (tracing target, route template, crate-relative source location) — see the
+/// privacy contract in `temps_core::error_metrics`. `overflow` is included
+/// only when non-zero so truncation by the key cap is never silent.
+fn build_error_summary_event(
+    summary: &temps_core::error_metrics::ErrorSummary,
+) -> temps_core::telemetry::TelemetryEvent {
+    use temps_core::telemetry::{TelemetryEvent, TelemetryEventKind};
+
+    let mut event = TelemetryEvent::new(TelemetryEventKind::ErrorSummary)
+        .with(
+            "window_hours",
+            (ERROR_SUMMARY_INTERVAL.as_secs() / 3600) as i64,
+        )
+        .with("total", summary.total as i64)
+        .with_opt(
+            "overflow",
+            (summary.overflow > 0).then_some(summary.overflow as i64),
+        );
+    for (category, count) in &summary.category_totals {
+        event = event.with(format!("{category}_total"), *count as i64);
+    }
+    let top: Vec<serde_json::Value> = summary
+        .top
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "category": entry.category,
+                "key": entry.key,
+                "count": entry.count,
+            })
+        })
+        .collect();
+    event.with("top", serde_json::Value::Array(top))
+}
+
+/// Middleware counting console-API 5xx responses for the anonymous
+/// `error_summary` telemetry event.
+///
+/// Records only the method, the route TEMPLATE (axum's `MatchedPath`, e.g.
+/// `/api/projects/{id}` — never the concrete URL, query, or body), and the
+/// status code. Unmatched requests (e.g. the SPA fallback) are recorded under
+/// the fixed label `unmatched` so a 500 storm there is still visible without
+/// capturing raw paths. Runs only on the console listeners — proxied user-app
+/// traffic never passes through this router, so user requests are never
+/// counted. Cost outside the 5xx case is one extension lookup and two short
+/// string allocations per request (fine for the control plane; this
+/// middleware must never be mounted on the proxy data path).
+async fn track_server_errors(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|matched| matched.as_str().to_owned());
+    let method = req.method().as_str().to_owned();
+    let response = next.run(req).await;
+    if response.status().is_server_error() {
+        temps_core::error_metrics::record_http_5xx(
+            &method,
+            route.as_deref().unwrap_or("unmatched"),
+            response.status().as_u16(),
+        );
+    }
+    response
+}
+
 /// This user is referenced by webhook-created resources (e.g., GitHub App installations)
 /// that don't have an authenticated user context.
 async fn ensure_system_user(db: &sea_orm::DatabaseConnection) -> anyhow::Result<()> {
@@ -267,6 +368,7 @@ async fn ensure_system_user(db: &sea_orm::DatabaseConnection) -> anyhow::Result<
             email_verification_expires: Set(None),
             password_reset_token: Set(None),
             password_reset_expires: Set(None),
+            must_change_password: Set(false),
             deleted_at: Set(None),
             mfa_enabled: Set(false),
             mfa_secret: Set(None),
@@ -290,10 +392,10 @@ async fn ensure_system_user(db: &sea_orm::DatabaseConnection) -> anyhow::Result<
 fn generate_secure_password() -> String {
     const CHARSET: &[u8] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..16)
         .map(|_| {
-            let idx = rng.gen_range(0..CHARSET.len());
+            let idx = rng.random_range(0..CHARSET.len());
             CHARSET[idx] as char
         })
         .collect()
@@ -1106,6 +1208,13 @@ pub struct ConsoleApiParams {
     /// connection handling. Any future object shared this same way requires an
     /// explicit security review before being added here.
     pub retention_resolver_slot: Arc<temps_core::RetentionResolverSlot>,
+    /// Shared "a newer release exists" slot. Owned by the caller
+    /// (`commands/serve/mod.rs`), which spawns the background update
+    /// notifier that writes into it; registered into the service registry
+    /// below so the settings API can serve it to the web console's upgrade
+    /// banner (`GET /settings/update-status`). Advisory read-only metadata —
+    /// it never influences routing, auth, or connection handling.
+    pub update_status: Arc<temps_core::UpdateStatusSlot>,
 }
 
 /// Build a ClickHouse-backed metrics store from the server config, or `None`
@@ -1305,6 +1414,11 @@ fn ai_read_allowlist() -> Vec<String> {
         "list_error_groups",
         "list_alert_rules",
         "get_alert_rule",
+        // ── Metric alert rules (OTel) — the rules themselves, so the AI can
+        //    see what is already alerted on before proposing anything new.
+        //    Without these it proposes duplicates of rules that exist.
+        "list_alerts",
+        "get_alert",
         // ── Service status / health / types (NOT params/env) ──
         "get_service_health_status",
         "list_service_health_statuses",
@@ -1499,6 +1613,123 @@ fn ai_read_allowlist() -> Vec<String> {
     .collect()
 }
 
+/// Mutating operations the AI may PROPOSE, for a human to confirm.
+///
+/// The AI never executes these — calling `temps_write` only stages a `proposed`
+/// `ai_pending_actions` row; a human confirm endpoint replays the mutation
+/// through the same router (`permission_guard!` + audit). The tool is also
+/// gated per-project behind `projects.ai_write_actions_enabled` (default OFF).
+///
+/// Conservative by design: high-value, mostly-reversible lifecycle + config
+/// operations. Adding an entry is a product + security decision — what may the
+/// AI propose for a human to run.
+///
+/// Extracted into its own function (rather than an inline literal at the call
+/// site) so tests can assert it stays disjoint from `ai_read_safe_posts()`,
+/// which is the one rule holding up the read-only-POST mechanism.
+fn ai_write_allowlist() -> Vec<String> {
+    [
+        // ── Deployment lifecycle (reversible / safe) ──
+        // Redeploy the project from its configured branch —
+        // what a "redeploy main" request maps to
+        // (promote/rollback are NOT redeploys).
+        "trigger_project_pipeline",
+        "rollback_to_deployment",
+        "promote_deployment",
+        "pause_deployment",
+        "resume_deployment",
+        "cancel_deployment",
+        // ── Manual image deploy (no git build) ──
+        // Deploy a prebuilt Docker image by `image_ref` (a
+        // pullable registry ref) or a registered
+        // `external_image_id`, to a specific environment_id.
+        // Static-bundle deploys are intentionally NOT here: the
+        // AI can't perform the multipart file upload, so the
+        // whole static flow (upload + deploy) lives in the
+        // frontend.
+        "deploy_from_image",
+        // ── Container runtime control (reversible) ──
+        "restart_container",
+        "stop_container",
+        "start_container",
+        // ── Environment wake/sleep (reversible) ──
+        "wake_environment",
+        "sleep_environment",
+        // ── Environment settings (resource limits, replicas,
+        //    branch) — what "raise memory to 512 MB" /
+        //    "give it more CPU" / "scale to 2 replicas" map to.
+        //    Values are microcores (1_000_000 = 1 core) and MB.
+        //    Reversible: it's a config change, re-applicable.
+        "update_environment_settings",
+        // ── Environment variables (set / change) ──
+        "create_environment_variable",
+        "update_environment_variable",
+        "delete_environment_variable",
+        // ── Domains (attach / detach at the environment level only;
+        //    account-global domain create/delete excluded) ──
+        "add_environment_domain",
+        "delete_environment_domain",
+        // ── Managed external services (databases, caches, etc.) —
+        //    provisioning a new container and linking an existing
+        //    one to a project. Both reversible (a service can be
+        //    unlinked / left running unused; nothing is deleted).
+        "create_service",
+        "link_service_to_project",
+        // ── Metric alert rules (OTel) ──
+        // Create/update an alert rule. Reversible (a rule
+        // can be disabled or deleted) and non-destructive:
+        // creating one changes no running workload, it only
+        // starts evaluating a metric. This is what lets the
+        // assistant turn "your p95 has no alert on it" into
+        // a concrete rule the human confirms.
+        //
+        // `delete_alert` is deliberately excluded: deleting
+        // an alert silently removes monitoring, which is the
+        // kind of change that is only noticed when the
+        // incident it would have caught happens.
+        "create_alert",
+        "update_alert",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Vetted **read-only `POST`** operations for the AI read tool.
+///
+/// HTTP method is this codebase's structural proxy for "does this mutate?", and
+/// `ai_read_allowlist` above is GET-only for exactly that reason. This is the
+/// narrow, separately-reviewed exception: operations that are genuinely
+/// side-effect-free but are `POST` because their input is a structured document
+/// rather than a handful of query params.
+///
+/// **The rule for adding an entry: the operation must write nothing.** Not a
+/// row, not a file, not a queued job. If it mutates anything at all it belongs
+/// in the propose-then-confirm write allowlist instead, never here. Keeping this
+/// list separate from the GET allowlist is what makes each addition a conscious
+/// decision rather than a line lost in a 200-entry list.
+///
+/// Deliberately NOT here: anything that creates, updates, deletes, triggers, or
+/// enqueues — including the metric-alert CRUD operations that live next to
+/// `preview_alert` in the same handler module.
+fn ai_read_safe_posts() -> Vec<String> {
+    [
+        // Backtest a metric-alert detector over historical data: replays the
+        // metric against the band the evaluator would use and returns which
+        // points would have fired. Explicitly documented read-only, guarded by
+        // OtelRead + project_access_guard!, and persists nothing. It is a POST
+        // only because the request body is a whole detector config.
+        //
+        // This is what lets the assistant check "would this rule actually have
+        // fired?" *before* proposing it, so a suggested alert arrives with
+        // evidence attached instead of a guessed threshold.
+        "preview_alert",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 /// Initialize and start the console API server
 pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let ConsoleApiParams {
@@ -1515,7 +1746,22 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         admin_gate_service: provided_admin_gate_service,
         admin_gate_handle: provided_admin_gate_handle,
         retention_resolver_slot,
+        update_status,
     } = params;
+
+    // Count panics for the anonymous `error_summary` telemetry event. Only
+    // the sanitized source location (crate-relative file:line) is recorded —
+    // never the panic message, which can embed user data. Chains to the
+    // previous hook so normal backtrace printing is unaffected. Task panics
+    // don't kill the process, so they are flushed by the summary task below;
+    // a fatal main-thread panic may be lost, which is acceptable for v1.
+    {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            temps_core::error_metrics::record_panic(panic_info.location());
+            previous_hook(panic_info);
+        }));
+    }
 
     // Readiness flag for the `/readyz` probe. Starts `false` (not ready) and is
     // flipped to `true` at the same point the legacy `ready_signal` fires —
@@ -1600,6 +1846,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // slot instance instead of creating its own — see the field doc on
     // `ConsoleApiParams::retention_resolver_slot`.
     service_context.register_service(retention_resolver_slot.clone());
+    // Update-notifier slot: the background loop in serve/mod.rs writes into
+    // it; ConfigPlugin's `GET /settings/update-status` reads it so the web
+    // console can render the upgrade banner.
+    service_context.register_service(update_status.clone());
 
     // Register the shared route table (created in serve/mod.rs)
     // This is used by analytics-events and other plugins that need to resolve hosts
@@ -1648,10 +1898,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // (depends only on ServerConfig for the data dir). Registered early so
     // every later plugin can require the Arc<dyn TelemetryReporter>.
     debug!("Registering TelemetryPlugin");
-    let telemetry_plugin = Box::new(TelemetryPlugin::new(
-        config.clone(),
-        env!("CARGO_PKG_VERSION"),
-    ));
+    // TEMPS_VERSION (git-describe, set by build.rs) is used instead of
+    // CARGO_PKG_VERSION so nightly/beta builds report a version telemetry
+    // can actually distinguish from a tagged release -- CARGO_PKG_VERSION
+    // is the static Cargo.toml version and is identical across all of them.
+    let telemetry_plugin = Box::new(TelemetryPlugin::new(config.clone(), env!("TEMPS_VERSION")));
     plugin_manager.register_plugin(telemetry_plugin);
 
     // 2. QueuePlugin - registers the pre-created job queue into the service context
@@ -1705,6 +1956,18 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let audit_plugin = Box::new(AuditPlugin::new());
     plugin_manager.register_plugin(audit_plugin);
 
+    // 5.5. TeamsPlugin - teams + project-scoped RBAC (depends on database
+    // and AuditLogger, hence after AuditPlugin).
+    //
+    // This registers the `ProjectAccessChecker` that every project-scoped
+    // plugin resolves in its own `configure_routes`. Registration order
+    // between plugins doesn't matter for that — all `register_services`
+    // calls complete before any `configure_routes` runs — but it must come
+    // after AuditPlugin, whose `AuditLogger` it requires.
+    debug!("Registering TeamsPlugin");
+    let teams_plugin = Box::new(TeamsPlugin::new());
+    plugin_manager.register_plugin(teams_plugin);
+
     // 6. GitPlugin - provides git functionality (depends on other services)
     debug!("Registering GitPlugin");
     let git_plugin = Box::new(GitPlugin::new());
@@ -1731,6 +1994,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let email_plugin = Box::new(EmailPlugin::new());
     plugin_manager.register_plugin(email_plugin);
 
+    // Must follow EmailPlugin: tracking uses the email schema/services for
+    // recipient correlation and domain-scoped bounce suppression.
+    let email_tracking_plugin = Box::new(temps_email_tracking::EmailTrackingPlugin::new());
+    plugin_manager.register_plugin(email_tracking_plugin);
+
     // 7.5. WebhooksPlugin - provides webhook delivery and management (depends on database and encryption)
     debug!("Registering WebhooksPlugin");
     let webhooks_plugin = Box::new(WebhooksPlugin::new());
@@ -1750,6 +2018,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Registering BlobPlugin");
     let blob_plugin = Box::new(BlobPlugin::new());
     plugin_manager.register_plugin(blob_plugin);
+
+    // 5.3. FlagsPlugin - provides feature flags (depends on database only:
+    // flags are control-plane rows, no container and no background task)
+    debug!("Registering FlagsPlugin");
+    let flags_plugin = Box::new(FlagsPlugin::new());
+    plugin_manager.register_plugin(flags_plugin);
 
     // 5.5. EnvironmentsPlugin - provides environment management (depends on config)
     debug!("Registering EnvironmentsPlugin");
@@ -1966,6 +2240,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             // instance still checks in even when it isn't deploying. No-op when
             // telemetry is disabled (guarded above + report() no-ops anyway).
             spawn_heartbeat_task(reporter.clone(), db.clone());
+            // Periodic aggregated error_summary flush (ERROR logs / console
+            // 5xx / panics — counts only, never messages). Only spawned when
+            // telemetry is enabled; the counters themselves are just bounded
+            // in-process memory either way.
+            spawn_error_summary_task(reporter.clone());
         }
     }
     if let Some(user_service) = service_context.get_service::<temps_auth::UserService>() {
@@ -2313,14 +2592,25 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         use temps_providers::health_monitor::{
             ExternalServiceHealthConfig, ExternalServiceHealthMonitor,
         };
-        let health_monitor = Arc::new(ExternalServiceHealthMonitor::new(
+        let mut health_monitor = ExternalServiceHealthMonitor::new(
             db.clone(),
             external_service_manager,
             notification_service,
             ExternalServiceHealthConfig::default(),
             docker.clone(),
             service_context.require_service::<temps_core::EncryptionService>(),
-        ));
+        );
+
+        // Attach the shared metrics store (registered by the MetricsScraper
+        // block above) so the monitor records container CPU/memory history
+        // for services with metrics enabled.
+        if let Some(metrics_store) =
+            service_context.get_service::<dyn temps_metrics::MetricsStore>()
+        {
+            health_monitor = health_monitor.with_metrics_store(metrics_store);
+        }
+
+        let health_monitor = Arc::new(health_monitor);
 
         // Register so the providers plugin can pick it up and expose a
         // manual-trigger endpoint that reuses the monitor's check logic.
@@ -2366,6 +2656,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(db.clone())),
         notification_service: service_context
             .get_service::<dyn temps_core::notifications::NotificationService>(),
+        audit_service: service_context.require_service::<dyn temps_core::AuditLogger>(),
     });
     let node_routes =
         temps_deployments::handlers::nodes::configure_routes().with_state(node_app_state);
@@ -2484,11 +2775,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     // `ai_read_allowlist()` below for the full curated list and
                     // the security rationale behind what is/isn't included.
                     let allowlist: Vec<String> = ai_read_allowlist();
-                    let caller = temps_ai_api_tools::InternalApiCaller::new_allowlisted(
-                        split.admin.clone(),
-                        &openapi,
-                        allowlist.clone(),
-                    );
+                    // Plus the narrow, separately-vetted set of read-only POSTs
+                    // — see `ai_read_safe_posts()` for the rule governing it.
+                    let safe_posts: Vec<String> = ai_read_safe_posts();
+                    let caller =
+                        temps_ai_api_tools::InternalApiCaller::new_allowlisted_with_safe_posts(
+                            split.admin.clone(),
+                            &openapi,
+                            allowlist.clone(),
+                            safe_posts.clone(),
+                        );
                     // Diagnostic: report which allowlist entries actually
                     // resolved to a real operation in the OpenAPI doc, and
                     // loudly flag any that did not (a typo or a wrong
@@ -2498,11 +2794,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     let resolved = caller.indexed_operation_ids();
                     let unresolved: Vec<&String> = allowlist
                         .iter()
+                        .chain(safe_posts.iter())
                         .filter(|id| !resolved.contains(id))
                         .collect();
                     info!(
                         resolved_count = resolved.len(),
-                        allowlist_count = allowlist.len(),
+                        allowlist_count = allowlist.len() + safe_posts.len(),
                         "AI read tool: indexed read operations"
                     );
                     if !unresolved.is_empty() {
@@ -2529,57 +2826,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     if let Some(write_handle) =
                         service_context.get_service::<temps_ai_api_tools::WriteApiToolsHandle>()
                     {
-                        let write_allowlist: Vec<String> = [
-                            // ── Deployment lifecycle (reversible / safe) ──
-                            // Redeploy the project from its configured branch —
-                            // what a "redeploy main" request maps to
-                            // (promote/rollback are NOT redeploys).
-                            "trigger_project_pipeline",
-                            "rollback_to_deployment",
-                            "promote_deployment",
-                            "pause_deployment",
-                            "resume_deployment",
-                            "cancel_deployment",
-                            // ── Manual image deploy (no git build) ──
-                            // Deploy a prebuilt Docker image by `image_ref` (a
-                            // pullable registry ref) or a registered
-                            // `external_image_id`, to a specific environment_id.
-                            // Static-bundle deploys are intentionally NOT here: the
-                            // AI can't perform the multipart file upload, so the
-                            // whole static flow (upload + deploy) lives in the
-                            // frontend.
-                            "deploy_from_image",
-                            // ── Container runtime control (reversible) ──
-                            "restart_container",
-                            "stop_container",
-                            "start_container",
-                            // ── Environment wake/sleep (reversible) ──
-                            "wake_environment",
-                            "sleep_environment",
-                            // ── Environment settings (resource limits, replicas,
-                            //    branch) — what "raise memory to 512 MB" /
-                            //    "give it more CPU" / "scale to 2 replicas" map to.
-                            //    Values are microcores (1_000_000 = 1 core) and MB.
-                            //    Reversible: it's a config change, re-applicable.
-                            "update_environment_settings",
-                            // ── Environment variables (set / change) ──
-                            "create_environment_variable",
-                            "update_environment_variable",
-                            "delete_environment_variable",
-                            // ── Domains (attach / detach at the environment level only;
-                            //    account-global domain create/delete excluded) ──
-                            "add_environment_domain",
-                            "delete_environment_domain",
-                            // ── Managed external services (databases, caches, etc.) —
-                            //    provisioning a new container and linking an existing
-                            //    one to a project. Both reversible (a service can be
-                            //    unlinked / left running unused; nothing is deleted).
-                            "create_service",
-                            "link_service_to_project",
-                        ]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect();
+                        let write_allowlist: Vec<String> = ai_write_allowlist();
                         let write_caller =
                             temps_ai_api_tools::InternalApiCaller::new_write_allowlisted(
                                 split.admin.clone(),
@@ -2678,7 +2925,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // regardless of `console_admin_address`.
     let public_app = Router::new()
         .merge(health_router(ready_flag.clone()))
-        .nest("/api", public_router);
+        .nest("/api", public_router)
+        .layer(axum::middleware::from_fn(track_server_errors));
 
     // Platform-console listener: when an embedding binary overrode the root
     // bundle AND configured an address, serve the ORIGINAL console (same
@@ -2692,7 +2940,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
     let admin_app = Router::new()
         .nest("/api", admin_router)
-        .fallback(serve_static_file);
+        .fallback(serve_static_file)
+        .layer(axum::middleware::from_fn(track_server_errors));
 
     // Defense-in-depth: the Pingora proxy is now the primary enforcer (it
     // 404s gated requests before they ever reach this listener). The axum
@@ -2710,6 +2959,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         let platform_app = Router::new()
             .nest("/api", router)
             .fallback(serve_original_console)
+            .layer(axum::middleware::from_fn(track_server_errors))
             .layer(axum::middleware::from_fn_with_state(
                 admin_gate_handle.clone(),
                 super::admin_gate::admin_gate,
@@ -3044,6 +3294,7 @@ mod initial_admin_tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -3092,6 +3343,207 @@ mod ai_tool_allowlist_tests {
     use temps_ai_api_tools::ReadOnlyApiIndex;
     use temps_providers::handlers::metrics_handlers::MetricsApiDoc;
     use utoipa::OpenApi;
+
+    /// A throwaway admin auth context for the prepare-path tests (no request is
+    /// executed, so it only has to satisfy the advisory permission filter).
+    fn admin_auth() -> temps_auth::AuthContext {
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::Model {
+            id: 1,
+            name: "tester".to_string(),
+            email: "tester@internal".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        temps_auth::AuthContext::new_session(user, temps_auth::permissions::Role::Admin)
+    }
+
+    /// End-to-end against the REAL `OtelApiDoc`: a `create_alert` proposal with
+    /// a malformed `detection_config` must be rejected while the model can
+    /// still fix it, not after a human has approved it.
+    ///
+    /// This is the exact payload a live model produced three runs running
+    /// (`{"type": "threshold"}` instead of `{"kind": "static", …}`). Before the
+    /// shape check it validated cleanly, was staged as a pending action, and
+    /// failed with a 422 only once the user clicked Confirm — the one person in
+    /// the loop who had no way to know it was wrong.
+    #[tokio::test]
+    async fn malformed_detection_config_is_rejected_before_a_human_sees_it() {
+        use temps_ai_api_tools::{ApiCallScope, InternalApiCaller, WritePrepareOutcome};
+        use utoipa::OpenApi;
+
+        let openapi = temps_otel::plugin::OtelApiDoc::openapi();
+        // No request is executed on the prepare path, so an empty router is fine.
+        let caller = InternalApiCaller::new_write_allowlisted(
+            axum::Router::new(),
+            &openapi,
+            vec!["create_alert".to_string()],
+        );
+        let scope = ApiCallScope {
+            auth: admin_auth(),
+            project_ids: vec![1],
+        };
+
+        let base = "alerts create_alert --name p95 --metric_name http.server.duration \
+                    --aggregation avg --window_secs 300 --for_duration_secs 300 \
+                    --severity critical --enabled true";
+
+        // 1. The model's actual mistake: no `kind` discriminator.
+        let outcome = caller.prepare_write_cli(
+            &format!("{base} --detection_config '{{\"type\": \"threshold\", \"threshold\": 500}}'"),
+            &scope,
+        );
+        let WritePrepareOutcome::Invalid(msg) = outcome else {
+            panic!("a payload the API rejects with 422 must not be staged for approval");
+        };
+        assert!(msg.contains("kind"), "must name the discriminator: {msg}");
+        assert!(
+            msg.contains("static"),
+            "must show the accepted variants — the model does not run --help: {msg}"
+        );
+
+        // 2. A quoted number and a natural-but-wrong comparator: both present,
+        //    both fatal, both used to reach the human before failing.
+        let outcome = caller.prepare_write_cli(
+            &format!(
+                "{base} --detection_config \
+                 '{{\"kind\": \"static\", \"comparator\": \">\", \"threshold\": \"0.5\"}}'"
+            ),
+            &scope,
+        );
+        let WritePrepareOutcome::Invalid(msg) = outcome else {
+            panic!("a payload the API rejects with 422 must not be staged for approval");
+        };
+        assert!(
+            msg.contains("gt") && msg.contains("lte"),
+            "the real Comparator enum must be listed: {msg}"
+        );
+
+        // 3. The correct payload still validates and is staged.
+        let outcome = caller.prepare_write_cli(
+            &format!(
+                "{base} --detection_config \
+                 '{{\"kind\": \"static\", \"comparator\": \"gt\", \"threshold\": 500}}'"
+            ),
+            &scope,
+        );
+        assert!(
+            matches!(outcome, WritePrepareOutcome::Prepared(_)),
+            "a well-formed static detector must still be proposable"
+        );
+    }
+
+    /// `preview_alert` must be reachable from the read CLI, and its help must
+    /// describe a backtest the model can actually run.
+    ///
+    /// Allowlisted is not the same as usable. It was discoverable all along —
+    /// the reason it was never called is that it rejected every detector kind
+    /// except `anomaly`, while every rule the model proposes is a static
+    /// threshold. It also advertised its optional RFC 3339 timestamps as
+    /// `<array>`, because a nullable type union was being read as an array.
+    #[tokio::test]
+    async fn preview_alert_is_usable_from_the_read_cli() {
+        use temps_ai_api_tools::{ApiCallScope, InternalApiCaller};
+        use utoipa::OpenApi;
+
+        let openapi = temps_otel::plugin::OtelApiDoc::openapi();
+        let caller = InternalApiCaller::new_allowlisted_with_safe_posts(
+            axum::Router::new(),
+            &openapi,
+            ai_read_allowlist(),
+            ai_read_safe_posts(),
+        );
+        let auth = admin_auth();
+        let scope = ApiCallScope {
+            auth: auth.clone(),
+            project_ids: vec![1],
+        };
+
+        // Discoverable by browsing, which is how the model finds anything.
+        let section = caller.run_cli("alerts --help", &scope).await;
+        assert!(
+            section.contains("preview_alert"),
+            "must be listed in its section: {section}"
+        );
+
+        let help = caller.run_cli("alerts preview_alert --help", &scope).await;
+
+        // The static variant has to be offered, or the backtest is impossible
+        // for the rules this flow actually proposes.
+        assert!(
+            help.contains("\"kind\": \"static\""),
+            "static detectors must be backtestable: {help}"
+        );
+        assert!(
+            help.contains("comparator") && help.contains("gt|gte|lt|lte"),
+            "the static variant's fields must be spelled out: {help}"
+        );
+
+        // Optional timestamps are strings, not lists.
+        assert!(
+            help.contains("--start_time <string>"),
+            "an Option<String> must not advertise itself as an array: {help}"
+        );
+        assert!(
+            !help.contains("--end_time <array>"),
+            "nullable != array: {help}"
+        );
+    }
+
+    /// The read-only-POST list and the write allowlist must stay disjoint.
+    ///
+    /// This is the one rule holding up the safe-POST mechanism, and until now it
+    /// existed only as prose in a doc comment. `create_alert` and
+    /// `preview_alert` are neighbours in the same handler module under the same
+    /// OpenAPI tag, so a future `preview_and_save_alert` added by pattern-match
+    /// would execute unconfirmed writes with the chat user's auth and no confirm
+    /// card. Turn the rule into a build failure.
+    #[test]
+    fn safe_post_and_write_allowlists_are_disjoint() {
+        let safe: std::collections::HashSet<String> = ai_read_safe_posts().into_iter().collect();
+        let writes: std::collections::HashSet<String> = ai_write_allowlist().into_iter().collect();
+
+        let both: Vec<&String> = safe.intersection(&writes).collect();
+        assert!(
+            both.is_empty(),
+            "an operation cannot be both a side-effect-free read and a vetted write: {both:?}"
+        );
+    }
+
+    /// Every safe-POST entry must resolve to a real operation, or it silently
+    /// does nothing — the same failure mode the read-allowlist test guards.
+    #[test]
+    fn safe_posts_resolve_against_the_real_openapi() {
+        use temps_ai_api_tools::ReadOnlyApiIndex;
+        use utoipa::OpenApi;
+
+        let openapi = temps_otel::plugin::OtelApiDoc::openapi();
+        let safe = ai_read_safe_posts();
+        let safe_refs: Vec<&str> = safe.iter().map(String::as_str).collect();
+        let index =
+            ReadOnlyApiIndex::from_openapi_allowlist_with_safe_posts(&openapi, &[], &safe_refs);
+
+        for op in &safe {
+            assert!(
+                index.get(op).is_some(),
+                "`{op}` is allowlisted as a read-only POST but does not resolve — \
+                 check for a typo or a renamed handler"
+            );
+        }
+    }
 
     /// The AI read allowlist must never contain duplicate entries — a repeat
     /// is dead weight in the model's tool catalogue and a signal something
@@ -3159,5 +3611,204 @@ mod ai_tool_allowlist_tests {
             "DeploymentMetricsToggle is a write (PATCH) operation and must never be \
              resolvable via the read-only AI tool allowlist"
         );
+    }
+
+    /// `describe_api` only ever surfaces an operation's `summary`/`description`
+    /// to the model — never response-body field docs — so a span's
+    /// `duration_ms` vs. unlabeled `attributes` units can only be explained via
+    /// the operation description itself. This proves the unit-guidance text
+    /// added to the trace/GenAI-trace handler doc comments actually survives
+    /// into the real compiled `OtelApiDoc` and would reach the model through
+    /// `describe_api`, rather than just existing as a comment nobody reads.
+    #[test]
+    fn trace_tool_descriptions_warn_about_unlabeled_attribute_units() {
+        let openapi = temps_otel::plugin::OtelApiDoc::openapi();
+        let index = ReadOnlyApiIndex::from_openapi(&openapi, &[]);
+
+        for operation_id in [
+            "get_trace",
+            "query_traces",
+            "query_genai_traces",
+            "get_genai_trace",
+        ] {
+            let op = index
+                .get(operation_id)
+                .unwrap_or_else(|| panic!("{operation_id} missing from OtelApiDoc"));
+            let description = op.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("duration_ms") && description.contains("milliseconds"),
+                "{operation_id}'s OpenAPI description must warn the model that only \
+                 `duration_ms` is guaranteed to be milliseconds and other numeric \
+                 fields carry unlabeled/different units — got: {description:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_telemetry_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use temps_core::error_metrics::{self, CATEGORY_HTTP_5XX};
+    use tower::ServiceExt;
+
+    async fn failing_handler() -> axum::response::Response {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "it broke, with details that must never reach telemetry",
+        )
+            .into_response()
+    }
+
+    async fn ok_handler() -> &'static str {
+        "ok"
+    }
+
+    fn get_request(uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .expect("valid test request")
+    }
+
+    /// The middleware must count 5xx responses under the route TEMPLATE (the
+    /// compile-time string from our route table), never the concrete request
+    /// path, and must not count non-5xx responses at all. Route names are
+    /// unique to this test so parallel tests can't interfere via the global
+    /// counter store.
+    #[tokio::test]
+    async fn track_server_errors_counts_5xx_by_route_template_only() {
+        let app = Router::new()
+            .route("/error-telemetry-test/{id}", get(failing_handler))
+            .route("/error-telemetry-test-ok", get(ok_handler))
+            .layer(axum::middleware::from_fn(track_server_errors));
+
+        let response = app
+            .clone()
+            .oneshot(get_request("/error-telemetry-test/12345"))
+            .await
+            .expect("request succeeds");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let response = app
+            .oneshot(get_request("/error-telemetry-test-ok"))
+            .await
+            .expect("request succeeds");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let counters = error_metrics::global();
+        assert_eq!(
+            counters.count_for(CATEGORY_HTTP_5XX, "GET /error-telemetry-test/{id} 500"),
+            1,
+            "5xx must be recorded under the route template"
+        );
+        assert_eq!(
+            counters.count_for(CATEGORY_HTTP_5XX, "GET /error-telemetry-test/12345 500"),
+            0,
+            "the concrete request path must never be recorded"
+        );
+        assert_eq!(
+            counters.count_for(CATEGORY_HTTP_5XX, "GET /error-telemetry-test-ok 200"),
+            0,
+            "non-5xx responses must not be recorded"
+        );
+    }
+
+    /// Requests that don't match any route (SPA fallback and friends) are
+    /// recorded under the fixed `unmatched` label — visible, but without
+    /// capturing the raw path.
+    #[tokio::test]
+    async fn track_server_errors_uses_unmatched_label_for_fallback() {
+        async fn failing_fallback() -> axum::response::Response {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+        }
+
+        let app = Router::new()
+            .fallback(failing_fallback)
+            .layer(axum::middleware::from_fn(track_server_errors));
+
+        let before = error_metrics::global().count_for(CATEGORY_HTTP_5XX, "GET unmatched 500");
+        let response = app
+            .oneshot(get_request("/error-telemetry-secret-user-path"))
+            .await
+            .expect("request succeeds");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let counters = error_metrics::global();
+        assert_eq!(
+            counters.count_for(CATEGORY_HTTP_5XX, "GET unmatched 500"),
+            before + 1
+        );
+        assert_eq!(
+            counters.count_for(
+                CATEGORY_HTTP_5XX,
+                "GET /error-telemetry-secret-user-path 500"
+            ),
+            0,
+            "unmatched raw paths must never be recorded"
+        );
+    }
+
+    /// The error_summary event must carry only counts and identifier keys —
+    /// with per-category totals, a capped top list, and overflow present only
+    /// when keys were actually dropped.
+    #[test]
+    fn build_error_summary_event_shape() {
+        use temps_core::error_metrics::{ErrorCount, ErrorSummary};
+
+        let summary = ErrorSummary {
+            total: 7,
+            overflow: 0,
+            category_totals: vec![("http_5xx", 2), ("log_error", 5)],
+            top: vec![
+                ErrorCount {
+                    category: "log_error",
+                    key: "temps_backup::service".to_string(),
+                    count: 5,
+                },
+                ErrorCount {
+                    category: "http_5xx",
+                    key: "GET /api/projects/{id} 500".to_string(),
+                    count: 2,
+                },
+            ],
+        };
+
+        let event = build_error_summary_event(&summary);
+        assert_eq!(event.event_type, "error_summary");
+        assert_eq!(event.properties["total"], serde_json::json!(7));
+        assert_eq!(event.properties["log_error_total"], serde_json::json!(5));
+        assert_eq!(event.properties["http_5xx_total"], serde_json::json!(2));
+        assert!(
+            !event.properties.contains_key("overflow"),
+            "overflow must be omitted when zero"
+        );
+
+        let top = event.properties["top"].as_array().expect("top is an array");
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0]["key"], serde_json::json!("temps_backup::service"));
+        assert_eq!(top[0]["count"], serde_json::json!(5));
+    }
+
+    #[test]
+    fn build_error_summary_event_reports_overflow_when_capped() {
+        use temps_core::error_metrics::ErrorSummary;
+
+        let summary = ErrorSummary {
+            total: 10,
+            overflow: 3,
+            category_totals: vec![("log_error", 7)],
+            top: vec![],
+        };
+
+        let event = build_error_summary_event(&summary);
+        assert_eq!(event.properties["overflow"], serde_json::json!(3));
     }
 }

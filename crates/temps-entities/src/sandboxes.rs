@@ -22,7 +22,15 @@ pub struct Model {
 
     /// Owner of the sandbox. All sandbox operations require the
     /// authenticated user to match this column (or have admin override).
-    pub user_id: i32,
+    /// `None` for agent-run sandboxes with no attributable user (e.g. a
+    /// workflow run triggered by a git webhook).
+    pub user_id: Option<i32>,
+
+    /// When set, this sandbox executes the linked `agent_runs` row
+    /// (autofixer / workflow agent). Its lifecycle is owned by the agent
+    /// run — the expiration sweeper skips these rows. NULL for standalone
+    /// API sandboxes.
+    pub agent_run_id: Option<i32>,
 
     /// Container name used by the sandbox provider.
     pub name: String,
@@ -49,6 +57,12 @@ pub struct Model {
     /// provider defaults.
     #[sea_orm(column_type = "JsonBinary")]
     pub metadata: Option<serde_json::Value>,
+
+    /// Isolation backend the sandbox actually runs on: "docker" or
+    /// "firecracker". Recorded at create time from the effective backend
+    /// the provider chose (which may be the host default when the request
+    /// omitted one). `None` on rows created before this column existed.
+    pub backend: Option<String>,
 
     pub created_at: DBDateTime,
     pub last_activity_at: DBDateTime,

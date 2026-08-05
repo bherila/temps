@@ -17,8 +17,47 @@ use super::types::{
 };
 use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::UpdateDeploymentConfigRequest;
-use temps_presets::get_preset_by_slug;
 // Placeholder functions - these should be implemented properly or imported from other services
+
+/// Whether changing `repo_owner`/`repo_name` would leave `git_url` pointing at
+/// a different repository.
+///
+/// Returns `Some((old, new))` — both as `owner/name` — only when the stored URL
+/// demonstrably identifies the *current* repo and the requested change moves
+/// away from it. A URL that doesn't carry a recognisable `owner/name` tail
+/// (self-hosted layouts, ssh remotes with unusual paths) returns `None`: we
+/// can't prove a desync, so we don't block the operator.
+fn would_desync_git_url(
+    git_url: &Option<String>,
+    current: (&str, &str),
+    requested: (Option<&str>, Option<&str>),
+) -> Option<(String, String)> {
+    let (new_owner, new_name) = (
+        requested.0.unwrap_or(current.0),
+        requested.1.unwrap_or(current.1),
+    );
+    let old_pair = format!("{}/{}", current.0, current.1);
+    let new_pair = format!("{}/{}", new_owner, new_name);
+    if old_pair == new_pair {
+        return None;
+    }
+
+    let url = git_url.as_deref()?;
+    // Compare on the `owner/name` tail, ignoring a `.git` suffix and any
+    // trailing slash, so https/ssh and with/without `.git` all match.
+    let tail = url
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .rsplit(['/', ':'])
+        .take(2)
+        .collect::<Vec<_>>();
+    if tail.len() < 2 {
+        return None;
+    }
+    let url_pair = format!("{}/{}", tail[1], tail[0]);
+
+    (url_pair.eq_ignore_ascii_case(&old_pair)).then_some((url_pair, new_pair))
+}
 
 fn slugify(name: &str) -> String {
     name.to_lowercase()
@@ -71,6 +110,155 @@ pub const DEFAULT_MEMORY_LIMIT: i32 = 512; // 512 MB (small hosted website profi
 // Add these constants at the top of the file proper key management
 pub const NONCE_LENGTH: usize = 12;
 
+/// Resolve an API/UI catalog slug to its canonical persisted preset and config.
+fn resolve_preset_slug(
+    slug: &str,
+    config: Option<temps_entities::preset::PresetConfig>,
+) -> Result<temps_presets::StoredPreset, ProjectError> {
+    temps_presets::resolve_preset_slug(slug, config)
+        .map_err(|error| ProjectError::InvalidInput(format!("Invalid preset: {}", error)))
+}
+
+/// Apply a canonical preset selection to a project update.
+fn apply_resolved_preset(
+    active: &mut projects::ActiveModel,
+    resolved: temps_presets::StoredPreset,
+) {
+    active.preset = Set(resolved.preset);
+    active.preset_config = Set(resolved.config);
+}
+
+/// Preserve discriminator-like fields when a partial config patch omits them.
+///
+/// An explicit empty Nixpacks provider list still resets to auto, and an
+/// explicit Dockerfile variant is still honored. Catalog preset selection is
+/// normalized separately by the selected preset's resolver.
+fn merge_preset_config(
+    existing: Option<&temps_entities::preset::PresetConfig>,
+    parsed: temps_entities::preset::PresetConfig,
+    config_value: &serde_json::Value,
+    preserve_omitted_providers: bool,
+) -> temps_entities::preset::PresetConfig {
+    use temps_entities::preset::PresetConfig;
+
+    let omits_providers = config_value
+        .as_object()
+        .map(|map| !map.contains_key("providers"))
+        .unwrap_or(true);
+    let omits_dockerfile_variant = config_value
+        .as_object()
+        .map(|map| !map.contains_key("variant"))
+        .unwrap_or(true);
+
+    match (existing, parsed) {
+        (Some(PresetConfig::Nixpacks(existing_cfg)), PresetConfig::Nixpacks(mut parsed_cfg)) => {
+            if preserve_omitted_providers
+                && omits_providers
+                && parsed_cfg.providers.is_empty()
+                && !existing_cfg.providers.is_empty()
+            {
+                parsed_cfg.providers = existing_cfg.providers.clone();
+            }
+            PresetConfig::Nixpacks(parsed_cfg)
+        }
+        (
+            Some(PresetConfig::Dockerfile(existing_cfg)),
+            PresetConfig::Dockerfile(mut parsed_cfg),
+        ) => {
+            if omits_dockerfile_variant {
+                parsed_cfg.variant = existing_cfg.variant;
+            }
+            PresetConfig::Dockerfile(parsed_cfg)
+        }
+        (_, other) => other,
+    }
+}
+
+fn validate_preset_config(
+    preset: temps_entities::preset::Preset,
+    config: temps_entities::preset::PresetConfig,
+) -> Result<temps_entities::preset::PresetConfig, ProjectError> {
+    temps_presets::validate_preset_config(preset, &config)
+        .map_err(|error| ProjectError::InvalidInput(format!("Invalid preset config: {}", error)))?;
+    Ok(config)
+}
+
+fn normalize_project_directory(directory: &str) -> Result<String, ProjectError> {
+    let normalized = directory
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_string();
+    if normalized.is_empty() || normalized == "." {
+        return Ok(".".to_string());
+    }
+    let path = std::path::Path::new(&normalized);
+    let has_windows_drive_prefix = normalized.as_bytes().get(1) == Some(&b':');
+    if has_windows_drive_prefix
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ProjectError::InvalidInput(format!(
+            "Project directory '{directory}' must be a relative path inside the source root"
+        )));
+    }
+    Ok(normalized.trim_start_matches("./").to_string())
+}
+
+/// Resolve an explicit catalog selection for create/update.
+///
+/// Existing config is retained when it belongs to the same canonical preset.
+/// Selecting base `nixpacks` is authoritative: omitted providers reset to
+/// auto-detection while other Nixpacks settings remain intact.
+fn resolve_preset_selection(
+    slug: &str,
+    config_value: Option<&serde_json::Value>,
+    existing: Option<&temps_entities::preset::PresetConfig>,
+) -> Result<temps_presets::StoredPreset, ProjectError> {
+    use temps_entities::preset::PresetConfig;
+
+    let base_selection = resolve_preset_slug(slug, None)?;
+    let compatible_existing =
+        existing.filter(|config| config.preset_type() == base_selection.preset);
+
+    let config = match config_value {
+        Some(value) => {
+            let parsed =
+                PresetConfig::parse_for_preset(&base_selection.preset, value).map_err(|error| {
+                    ProjectError::InvalidInput(format!("Invalid preset config: {}", error))
+                })?;
+            Some(merge_preset_config(
+                compatible_existing,
+                parsed,
+                value,
+                slug != "nixpacks",
+            ))
+        }
+        None => {
+            let mut config = compatible_existing.cloned();
+            if slug == "nixpacks" {
+                if let Some(PresetConfig::Nixpacks(nixpacks)) = config.as_mut() {
+                    nixpacks.providers.clear();
+                }
+            }
+            config
+        }
+    };
+
+    if config.is_some() {
+        resolve_preset_slug(slug, config)
+    } else {
+        Ok(base_selection)
+    }
+}
+
 #[derive(Clone)]
 pub struct ProjectService {
     pub db: Arc<temps_database::DbConnection>,
@@ -111,6 +299,15 @@ impl ProjectService {
         &self,
         request: CreateProjectRequest,
     ) -> Result<Project, ProjectError> {
+        if request.template_slug.as_deref().is_some_and(|slug| {
+            slug.chars().count() > temps_core::templates::MAX_TEMPLATE_SLUG_CHARS
+        }) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Template slug cannot exceed {} characters",
+                temps_core::templates::MAX_TEMPLATE_SLUG_CHARS
+            )));
+        }
+
         // Verify storage service IDs exist if provided
         if !request.storage_service_ids.is_empty() {
             use temps_entities::external_services;
@@ -130,44 +327,16 @@ impl ProjectService {
             }
         }
 
-        // Normalize directory to ensure it's a relative path
-        let normalized_directory = if request.directory.starts_with('/') {
-            // Remove leading slash to make it relative
-            request.directory.trim_start_matches('/').to_string()
-        } else {
-            request.directory.clone()
-        };
-
-        // If directory is empty after normalization, use current directory marker
-        let normalized_directory = if normalized_directory.is_empty() {
-            ".".to_string()
-        } else {
-            normalized_directory
-        };
+        let normalized_directory = normalize_project_directory(&request.directory)?;
 
         let project_slug = self.generate_unique_project_slug(&request.name).await?;
-        // Get preset info and determine project type
-        let preset_info = get_preset_by_slug(request.preset.as_str()).ok_or_else(|| {
-            ProjectError::InvalidInput(format!("Invalid preset: {}", request.preset))
-        })?;
-
-        let _project_type_enum = preset_info.project_type();
-
-        // Parse preset string to enum
-        let preset = request
-            .preset
-            .parse::<temps_entities::preset::Preset>()
-            .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset: {}", e)))?;
-
-        // Parse preset_config from JSON if provided
-        let preset_config: Option<temps_entities::preset::PresetConfig> = request
-            .preset_config
-            .map(|json_value| {
-                serde_json::from_value(json_value).map_err(|e| {
-                    ProjectError::InvalidInput(format!("Invalid preset_config: {}", e))
-                })
-            })
-            .transpose()?;
+        let resolved = resolve_preset_selection(
+            request.preset.as_str(),
+            request.preset_config.as_ref(),
+            None,
+        )?;
+        let preset = resolved.preset;
+        let preset_config = resolved.config;
 
         // Create deployment config with resource and deployment settings.
         // New hosted websites get the conservative "small" profile by default:
@@ -210,6 +379,7 @@ impl ProjectService {
             deleted_at: Set(None),
             last_deployment: Set(None),
             source_type: Set(request.source_type),
+            template_slug: Set(request.template_slug),
             ..Default::default()
         };
 
@@ -227,7 +397,10 @@ impl ProjectService {
                 })
             }
         };
-        info!("Created project: {:?}", project_found_db);
+        info!(
+            "Created project id={} slug={} preset={}",
+            project_found_db.id, project_found_db.slug, project_found_db.preset
+        );
 
         // From here on, the project row exists. If any downstream step
         // fails, hard-delete it (CASCADE cleans up environments, env vars,
@@ -679,26 +852,13 @@ impl ProjectService {
                 project_id
             )))?;
 
-        // Normalize directory to ensure it's a relative path
-        let normalized_directory = if request.directory.starts_with('/') {
-            // Remove leading slash to make it relative
-            request.directory.trim_start_matches('/').to_string()
-        } else {
-            request.directory.clone()
-        };
+        let normalized_directory = normalize_project_directory(&request.directory)?;
 
-        // If directory is empty after normalization, use current directory marker
-        let normalized_directory = if normalized_directory.is_empty() {
-            ".".to_string()
-        } else {
-            normalized_directory
-        };
-
-        // Parse preset string to enum
-        let preset = request
-            .preset
-            .parse::<temps_entities::preset::Preset>()
-            .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset: {}", e)))?;
+        let resolved = resolve_preset_selection(
+            request.preset.as_str(),
+            request.preset_config.as_ref(),
+            project.preset_config.as_ref(),
+        )?;
 
         // Update the project
         let mut active_project: projects::ActiveModel = project.into();
@@ -708,7 +868,7 @@ impl ProjectService {
             Set(request.repo_owner.unwrap_or_else(|| "unknown".to_string()));
         active_project.directory = Set(normalized_directory);
         active_project.main_branch = Set(request.main_branch);
-        active_project.preset = Set(preset); // No longer Optional
+        apply_resolved_preset(&mut active_project, resolved);
         active_project.updated_at = Set(chrono::Utc::now());
 
         let project_found = active_project.update(self.db.as_ref()).await?;
@@ -794,6 +954,27 @@ impl ProjectService {
         Ok(updated)
     }
 
+    /// Persist deletion intent before cancelling workflows or touching Docker.
+    /// Deployment workers reject projects with this fence, closing the window
+    /// where a new container could appear after the cleanup snapshot.
+    pub async fn begin_project_deletion(&self, project_id: i32) -> Result<(), ProjectError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ProjectError::NotFound(format!("project {} not found", project_id)))?;
+        if project.is_deleted {
+            return Ok(());
+        }
+
+        let mut active: projects::ActiveModel = project.into();
+        active.is_deleted = Set(true);
+        active.deleted_at = Set(Some(chrono::Utc::now()));
+        active.updated_at = Set(chrono::Utc::now());
+        active.update(self.db.as_ref()).await?;
+        info!(project_id, "Marked project for deletion");
+        Ok(())
+    }
+
     pub async fn delete_project(
         &self,
         project_id: i32,
@@ -877,6 +1058,8 @@ impl ProjectService {
         ai_debug_chat_enabled: Option<bool>,
         ai_write_actions_enabled: Option<bool>,
         cross_project_trace_sharing: Option<bool>,
+        error_source_context_enabled: Option<bool>,
+        error_source_root: Option<String>,
     ) -> Result<Project, ProjectError> {
         // Validate preview env on-demand timeouts before touching the DB.
         // Mirrors DeploymentConfig::validate so the project-level defaults are
@@ -1012,6 +1195,8 @@ impl ProjectService {
         if ai_alert_summaries_enabled.is_some()
             || ai_debug_chat_enabled.is_some()
             || ai_write_actions_enabled.is_some()
+            || error_source_context_enabled.is_some()
+            || error_source_root.is_some()
         {
             let project = projects::Entity::find_by_id(project_id)
                 .one(self.db.as_ref())
@@ -1029,6 +1214,16 @@ impl ProjectService {
             }
             if let Some(v) = ai_write_actions_enabled {
                 active_project.ai_write_actions_enabled = Set(v);
+            }
+            // Opt-in for native error-tracking source context (non-null bool).
+            if let Some(v) = error_source_context_enabled {
+                active_project.error_source_context_enabled = Set(v);
+            }
+            // Auto-capture source root (nullable). Empty string clears it back
+            // to the build-context default.
+            if let Some(v) = error_source_root {
+                active_project.error_source_root =
+                    Set(if v.trim().is_empty() { None } else { Some(v) });
             }
             active_project.update(self.db.as_ref()).await?;
         }
@@ -1081,34 +1276,13 @@ impl ProjectService {
             active_project.update(self.db.as_ref()).await?;
         }
 
-        // Update preset_config if provided
-        if let Some(ref config_value) = preset_config {
-            // Reload project to ensure we have the latest state
-            let project = projects::Entity::find_by_id(project_id)
-                .one(self.db.as_ref())
-                .await?
-                .ok_or(ProjectError::NotFound(format!(
-                    "Project {} not found",
-                    project_id
-                )))?;
-
-            // Parse the preset config based on the project's current preset
-            let parsed_config = temps_entities::preset::PresetConfig::parse_for_preset(
-                &project.preset,
-                config_value,
-            )
-            .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset config: {}", e)))?;
-
-            let mut active_project: projects::ActiveModel = project.into();
-            active_project.preset_config = Set(Some(parsed_config));
-            active_project.update(self.db.as_ref()).await?;
-        }
-
-        // Update git-related fields if any are provided
+        // Update git-related fields and preset configuration atomically so a
+        // config submitted with a new preset is parsed against that new preset.
         let needs_git_update = main_branch.is_some()
             || repo_owner.is_some()
             || repo_name.is_some()
             || preset.is_some()
+            || preset_config.is_some()
             || directory.is_some();
 
         if needs_git_update {
@@ -1121,6 +1295,34 @@ impl ProjectService {
                     project_id
                 )))?;
 
+            // `repo_owner`/`repo_name` and `git_url` are read by different
+            // code paths — branch resolution uses the former, the clone uses
+            // the latter — and this endpoint only writes the former. Changing
+            // the repo identity here therefore used to leave a stale clone
+            // URL behind, and the next deploy resolved a commit from one repo
+            // and cloned another:
+            //
+            //   Starting repository download for owner/new-repo
+            //   Checking out ref: <commit that only exists in new-repo>
+            //   Cloning public repository from: .../old-repo.git
+            //
+            // The project could not be recovered through the API. Reject the
+            // change when it would actually desync — the git URL is owned by
+            // `POST /projects/{id}/git`, which validates it.
+            let desync = would_desync_git_url(
+                &project.git_url,
+                (&project.repo_owner, &project.repo_name),
+                (repo_owner.as_deref(), repo_name.as_deref()),
+            );
+            if let Some((old, new)) = desync {
+                return Err(ProjectError::InvalidInput(format!(
+                    "Changing the repository to '{new}' would leave the clone URL pointing at \
+                     '{old}'. Update both together with POST /projects/{project_id}/git, which \
+                     sets git_url alongside the owner and name."
+                )));
+            }
+
+            let existing_preset_config = project.preset_config.clone();
             let mut active_project: projects::ActiveModel = project.into();
 
             if let Some(branch) = main_branch {
@@ -1133,11 +1335,28 @@ impl ProjectService {
                 active_project.repo_name = Set(name);
             }
             if let Some(preset_value) = preset {
-                // Parse preset string to enum
-                let preset_enum = preset_value
-                    .parse::<temps_entities::preset::Preset>()
-                    .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset: {}", e)))?;
-                active_project.preset = Set(preset_enum);
+                let resolved = resolve_preset_selection(
+                    preset_value.as_str(),
+                    preset_config.as_ref(),
+                    existing_preset_config.as_ref(),
+                )?;
+                apply_resolved_preset(&mut active_project, resolved);
+            } else if let Some(config_value) = preset_config.as_ref() {
+                let parsed = temps_entities::preset::PresetConfig::parse_for_preset(
+                    active_project.preset.as_ref(),
+                    config_value,
+                )
+                .map_err(|error| {
+                    ProjectError::InvalidInput(format!("Invalid preset config: {}", error))
+                })?;
+                let merged = merge_preset_config(
+                    existing_preset_config.as_ref(),
+                    parsed,
+                    config_value,
+                    true,
+                );
+                let merged = validate_preset_config(*active_project.preset.as_ref(), merged)?;
+                active_project.preset_config = Set(Some(merged));
             }
             if let Some(dir) = directory {
                 active_project.directory = Set(dir);
@@ -1220,6 +1439,7 @@ impl ProjectService {
     pub async fn update_git_settings(
         &self,
         project_id: i32,
+        caller_user_id: i32,
         git_provider_connection_id: Option<i32>,
         main_branch: String,
         repo_owner: String,
@@ -1262,6 +1482,13 @@ impl ProjectService {
                         connection_id
                     )))?;
 
+                if connection.user_id != Some(caller_user_id) {
+                    return Err(ProjectError::NotFound(format!(
+                        "Git provider connection {} not found",
+                        connection_id
+                    )));
+                }
+
                 if !connection.is_active {
                     return Err(ProjectError::Other(format!(
                         "Git provider connection {} is not active",
@@ -1288,8 +1515,9 @@ impl ProjectService {
             }
         }
 
-        // Capture the current preset before converting to ActiveModel
+        // Capture the current preset/config before converting to ActiveModel
         let project_preset = project.preset;
+        let existing_preset_config = project.preset_config.clone();
 
         // Update the project
         let mut active_project: projects::ActiveModel = project.into();
@@ -1303,11 +1531,24 @@ impl ProjectService {
         active_project.source_type = Set(temps_entities::source_type::SourceType::Git);
 
         if let Some(preset_value) = preset {
-            // Parse preset string to enum
-            let preset_enum = preset_value
-                .parse::<temps_entities::preset::Preset>()
-                .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset: {}", e)))?;
-            active_project.preset = Set(preset_enum);
+            let resolved = resolve_preset_selection(
+                preset_value.as_str(),
+                preset_config.as_ref(),
+                existing_preset_config.as_ref(),
+            )?;
+            apply_resolved_preset(&mut active_project, resolved);
+        } else if let Some(config_value) = preset_config.as_ref() {
+            let parsed = temps_entities::preset::PresetConfig::parse_for_preset(
+                &project_preset,
+                config_value,
+            )
+            .map_err(|error| {
+                ProjectError::InvalidInput(format!("Invalid preset config: {}", error))
+            })?;
+            let merged =
+                merge_preset_config(existing_preset_config.as_ref(), parsed, config_value, true);
+            let merged = validate_preset_config(project_preset, merged)?;
+            active_project.preset_config = Set(Some(merged));
         }
 
         // Determine the effective new connection id and whether we need to handle
@@ -1342,24 +1583,6 @@ impl ProjectService {
 
         if let Some(is_public) = is_public_repo {
             active_project.is_public_repo = Set(is_public);
-        }
-
-        // Update preset_config if provided (e.g., Dockerfile path for Docker preset)
-        if let Some(ref config_value) = preset_config {
-            // Determine the target preset: use the newly set preset if provided, otherwise use current
-            let target_preset = if active_project.preset.is_set() {
-                *active_project.preset.as_ref()
-            } else {
-                project_preset
-            };
-
-            let parsed_config = temps_entities::preset::PresetConfig::parse_for_preset(
-                &target_preset,
-                config_value,
-            )
-            .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset config: {}", e)))?;
-
-            active_project.preset_config = Set(Some(parsed_config));
         }
 
         // ── GitLab webhook lifecycle ──────────────────────────────────────────
@@ -1671,7 +1894,8 @@ impl ProjectService {
         let webhook_url = format!("{}/api/webhook/git/gitlab/events", external_url);
 
         // Generate a random 32-byte signing token.
-        let signing_token = generate_signing_token();
+        let signing_token = generate_signing_token()
+            .map_err(|error| format!("Failed to generate GitLab webhook token: {error}"))?;
 
         let hook_id = client
             .install_webhook(owner, repo, &webhook_url, &signing_token)
@@ -1862,7 +2086,8 @@ impl ProjectService {
             .unwrap_or_else(|| "http://localhost:8080".to_string());
 
         // Generate a fresh secret-in-path delivery token.
-        let delivery_token = generate_bitbucket_webhook_token();
+        let delivery_token = generate_bitbucket_webhook_token()
+            .map_err(|error| format!("Failed to generate Bitbucket webhook token: {error}"))?;
 
         let webhook_url = format!(
             "{}/api/webhook/git/bitbucket/events/{}",
@@ -2056,7 +2281,8 @@ impl ProjectService {
             .unwrap_or_else(|| "http://localhost:8080".to_string());
 
         // Generate a fresh HMAC secret (used as the Gitea webhook secret).
-        let signing_token = generate_gitea_signing_token();
+        let signing_token = generate_gitea_signing_token()
+            .map_err(|error| format!("Failed to generate Gitea webhook token: {error}"))?;
 
         let webhook_url = format!(
             "{}/api/webhook/git/gitea/events",
@@ -2153,7 +2379,8 @@ impl ProjectService {
             return Ok(None);
         }
 
-        let token = generate_generic_webhook_token();
+        let token = generate_generic_webhook_token()
+            .map_err(|error| format!("Failed to generate Generic webhook token: {error}"))?;
 
         let encrypted_token = self
             .encryption_service
@@ -2185,14 +2412,42 @@ impl ProjectService {
         page: i64,
         per_page: i64,
     ) -> Result<(Vec<Project>, i64), ProjectError> {
+        self.get_projects_paginated_excluding(page, per_page, &[])
+            .await
+    }
+
+    /// [`Self::get_projects_paginated`], minus a caller-supplied set of
+    /// project ids.
+    ///
+    /// `hidden` comes from
+    /// [`ProjectAccessChecker::hidden_project_ids`](temps_core::ProjectAccessChecker::hidden_project_ids)
+    /// and is empty on an instance with no access grants configured, which
+    /// makes this identical to the unfiltered query in that case. The
+    /// exclusion is applied to the **count** as well as the page, so
+    /// pagination doesn't advertise rows the caller can never see.
+    pub async fn get_projects_paginated_excluding(
+        &self,
+        page: i64,
+        per_page: i64,
+        hidden: &[i32],
+    ) -> Result<(Vec<Project>, i64), ProjectError> {
         use sea_orm::PaginatorTrait;
         use sea_orm::QueryOrder;
 
         // Calculate offset
         let offset = ((page - 1) * per_page) as u64;
 
+        let filtered = || {
+            let query = projects::Entity::find();
+            if hidden.is_empty() {
+                query
+            } else {
+                query.filter(projects::Column::Id.is_not_in(hidden.iter().copied()))
+            }
+        };
+
         // Get total count
-        let total = projects::Entity::find()
+        let total = filtered()
             .count(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::DatabaseConnectionError(e.to_string()))?
@@ -2201,7 +2456,7 @@ impl ProjectService {
         // Get paginated projects. Never-deployed projects (NULL last_deployment)
         // sort last rather than first (a NULL under DESC would otherwise appear
         // as the most-recently-deployed project).
-        let projects = projects::Entity::find()
+        let projects = filtered()
             .order_by_with_nulls(
                 projects::Column::LastDeployment,
                 sea_orm::Order::Desc,
@@ -2231,10 +2486,30 @@ impl ProjectService {
     }
 
     pub async fn get_project_statistics(&self) -> Result<ProjectStatistics, ProjectError> {
+        self.get_project_statistics_excluding(&[]).await
+    }
+
+    /// [`Self::get_project_statistics`], minus a caller-supplied set of
+    /// project ids.
+    ///
+    /// The count has to honour the same exclusion as the list, or the
+    /// dashboard tells a scoped user how many projects exist on the
+    /// instance while showing them only their own — a smaller leak than
+    /// the names, but the same leak.
+    pub async fn get_project_statistics_excluding(
+        &self,
+        hidden: &[i32],
+    ) -> Result<ProjectStatistics, ProjectError> {
         use sea_orm::PaginatorTrait;
 
-        // Get total count of projects
-        let total_count = projects::Entity::find()
+        let query = projects::Entity::find();
+        let query = if hidden.is_empty() {
+            query
+        } else {
+            query.filter(projects::Column::Id.is_not_in(hidden.iter().copied()))
+        };
+
+        let total_count = query
             .count(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::DatabaseConnectionError(e.to_string()))?
@@ -2351,6 +2626,12 @@ impl ProjectService {
         if let Some(security) = config.security {
             deployment_config.security = Some(security);
         }
+        // Absent leaves it unset (disabled, and inheritable); an explicit value
+        // — including `false` — pins it for every environment that doesn't
+        // override it.
+        if let Some(cross_architecture_builds) = config.cross_architecture_builds {
+            deployment_config.cross_architecture_builds = Some(cross_architecture_builds);
+        }
 
         // Validate the deployment config
         deployment_config
@@ -2443,8 +2724,9 @@ impl ProjectService {
         // Extract deployment config fields
         let deployment_config = db_project.deployment_config.clone();
 
-        // Convert preset enum to string for backwards compatibility
-        let preset_str = format!("{:?}", db_project.preset).to_lowercase();
+        // Convert preset to the runtime/UI slug (reconstructs nixpacks-{provider})
+        let preset_str =
+            temps_presets::runtime_slug(db_project.preset, db_project.preset_config.as_ref());
 
         // Handle repo_name and repo_owner - return None for empty strings (Git-less projects)
         let repo_name = if db_project.repo_name.is_empty() {
@@ -2505,6 +2787,8 @@ impl ProjectService {
             ai_alert_summaries_enabled: db_project.ai_alert_summaries_enabled,
             ai_debug_chat_enabled: db_project.ai_debug_chat_enabled,
             ai_write_actions_enabled: db_project.ai_write_actions_enabled,
+            error_source_context_enabled: db_project.error_source_context_enabled,
+            error_source_root: db_project.error_source_root,
             enable_preview_environments: db_project.enable_preview_environments,
             preview_envs_on_demand: db_project.preview_envs_on_demand,
             preview_envs_idle_timeout_seconds: db_project.preview_envs_idle_timeout_seconds,
@@ -2839,6 +3123,74 @@ impl ProjectService {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
+
+    // ── git_url / repo identity consistency ─────────────────────────────
+
+    /// The failure this guards: the repo identity was changed through
+    /// `/settings`, the clone URL was left behind, and the next deploy
+    /// resolved a commit from the new repo while cloning the old one.
+    #[test]
+    fn test_repo_change_that_strands_git_url_is_detected() {
+        let url = Some("https://github.com/acme/old-repo.git".to_string());
+        let desync = would_desync_git_url(&url, ("acme", "old-repo"), (None, Some("new-repo")));
+
+        let (old, new) = desync.expect("changing the name strands the URL");
+        assert_eq!(old, "acme/old-repo");
+        assert_eq!(new, "acme/new-repo");
+    }
+
+    /// Changing the owner counts too.
+    #[test]
+    fn test_owner_change_is_detected() {
+        let url = Some("https://github.com/acme/app.git".to_string());
+        assert!(would_desync_git_url(&url, ("acme", "app"), (Some("other"), None)).is_some());
+    }
+
+    /// No repo change means nothing to desync, whatever the URL looks like.
+    #[test]
+    fn test_no_repo_change_is_allowed() {
+        let url = Some("https://github.com/acme/app.git".to_string());
+        assert!(would_desync_git_url(&url, ("acme", "app"), (None, None)).is_none());
+        assert!(
+            would_desync_git_url(&url, ("acme", "app"), (Some("acme"), Some("app"))).is_none(),
+            "restating the same values is not a change"
+        );
+    }
+
+    /// A URL that doesn't identify the current repo can't be proven stale, so
+    /// the operator isn't blocked — self-hosted layouts and unusual remotes
+    /// must keep working.
+    #[test]
+    fn test_unrelated_or_unparsable_url_does_not_block() {
+        // Points somewhere that isn't the current repo: not our call to make.
+        let other = Some("https://git.internal/mirrors/vendored.git".to_string());
+        assert!(would_desync_git_url(&other, ("acme", "app"), (None, Some("app2"))).is_none());
+
+        // No URL at all.
+        assert!(would_desync_git_url(&None, ("acme", "app"), (None, Some("app2"))).is_none());
+    }
+
+    /// ssh remotes and missing `.git` must match the same way https does,
+    /// or the guard would fire on projects it shouldn't.
+    #[test]
+    fn test_matching_is_scheme_and_suffix_insensitive() {
+        for url in [
+            "git@github.com:acme/app.git",
+            "https://github.com/acme/app",
+            "https://github.com/acme/app/",
+            "https://github.com/ACME/App.git",
+        ] {
+            assert!(
+                would_desync_git_url(
+                    &Some(url.to_string()),
+                    ("acme", "app"),
+                    (None, Some("app2"))
+                )
+                .is_some(),
+                "should recognise {url} as the current repo"
+            );
+        }
+    }
     use std::sync::Arc;
     use std::sync::Mutex;
     use temps_core::async_trait::async_trait;
@@ -2938,6 +3290,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn begin_project_deletion_persists_idempotent_deployment_fence() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Deleting Project".to_string()),
+            slug: Set("deleting-project".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        service.begin_project_deletion(project.id).await.unwrap();
+        service.begin_project_deletion(project.id).await.unwrap();
+
+        let fenced = temps_entities::projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project remains until container cleanup completes");
+        assert!(fenced.is_deleted);
+        assert!(fenced.deleted_at.is_some());
+    }
+
+    #[tokio::test]
     async fn test_update_project_emits_event() {
         // Setup test database
         let test_db = TestDatabase::with_migrations().await.unwrap();
@@ -2981,6 +3364,7 @@ mod tests {
             is_public_repo: None,
             storage_service_ids: vec![],
             source_type: temps_entities::source_type::SourceType::Git,
+            template_slug: None,
         };
 
         let result = project_service
@@ -3050,6 +3434,8 @@ mod tests {
                 None,
                 None,
                 None, // cross_project_trace_sharing
+                None, // error_source_context_enabled
+                None, // error_source_root
             )
             .await;
 
@@ -3113,6 +3499,7 @@ mod tests {
             git_provider_connection_id: None,
             exposed_port: None,
             source_type: temps_entities::source_type::SourceType::Git,
+            template_slug: None,
         };
 
         project_service
@@ -3163,6 +3550,7 @@ mod tests {
             is_public_repo: None,
             storage_service_ids: vec![],
             source_type: temps_entities::source_type::SourceType::Git,
+            template_slug: None,
         }
     }
 
@@ -3214,6 +3602,845 @@ mod tests {
             .deployment_config
             .expect("default environment should seed deployment_config");
         assert_eq!(env_config.memory_limit, Some(DEFAULT_MEMORY_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn test_create_project_persists_curated_template_provenance() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+        let mut request = create_request("Observability Starter");
+        request.template_slug = Some("observability-starter".to_string());
+
+        let created = project_service
+            .create_project(request)
+            .await
+            .expect("template project creation should succeed");
+        let persisted = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .expect("template project query should succeed")
+            .expect("template project should exist");
+
+        assert_eq!(
+            persisted.template_slug.as_deref(),
+            Some("observability-starter")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_project_rejects_template_slug_longer_than_schema_limit() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db, mock_queue).await;
+        let mut request = create_request("Custom Template");
+        request.template_slug =
+            Some("x".repeat(temps_core::templates::MAX_TEMPLATE_SLUG_CHARS + 1));
+
+        let error = match project_service.create_project(request).await {
+            Ok(_) => panic!("oversized template slug must be rejected before insertion"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProjectError::InvalidInput(message) if message.contains("255")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_create_project_nixpacks_node_stores_provider_and_returns_runtime_slug() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let mut request = create_request("Nixpacks Node App");
+        request.preset = "nixpacks-node".to_string();
+
+        let result = project_service
+            .create_project(request)
+            .await
+            .expect("create with nixpacks-node should succeed");
+
+        // API/UI surface reconstructs the provider-specific slug
+        assert_eq!(result.preset.as_deref(), Some("nixpacks-node"));
+
+        let row = projects::Entity::find_by_id(result.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+
+        // Persistable column stays the single Nixpacks enum variant
+        assert_eq!(row.preset, Preset::Nixpacks);
+
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(cfg)) => {
+                assert_eq!(
+                    cfg.providers,
+                    vec![temps_entities::preset::NixpacksProvider::Node]
+                );
+            }
+            other => panic!("expected Nixpacks preset_config with providers=[node], got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_project_rejects_unknown_nixpacks_provider_slug() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let mut request = create_request("Bad Nixpacks");
+        request.preset = "nixpacks-not-a-real-provider".to_string();
+
+        match project_service.create_project(request).await {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("nixpacks-not-a-real-provider"));
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("unknown nixpacks provider slug must be rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_project_leaving_nixpacks_clears_stale_preset_config() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let mut create = create_request("Leave Nixpacks");
+        create.preset = "nixpacks-node".to_string();
+        let created = project_service
+            .create_project(create)
+            .await
+            .expect("create nixpacks-node");
+
+        let mut update = create_request("Leave Nixpacks");
+        update.preset = "nextjs".to_string();
+        let updated = project_service
+            .update_project(created.id, update)
+            .await
+            .expect("switch to nextjs");
+
+        assert_eq!(updated.preset.as_deref(), Some("nextjs"));
+        assert!(
+            updated.preset_config.is_none(),
+            "stale Nixpacks preset_config must be cleared, got {:?}",
+            updated.preset_config
+        );
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        assert_eq!(row.preset, Preset::NextJs);
+        assert!(row.preset_config.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_partial_preset_config_patch_preserves_nixpacks_providers() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let mut create = create_request("Preserve Provider");
+        create.preset = "nixpacks-node".to_string();
+        let created = project_service
+            .create_project(create)
+            .await
+            .expect("create nixpacks-node");
+
+        let toml = "[start]\ncmd = \"npm start\"";
+        let updated = project_service
+            .update_project_settings(
+                created.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({ "nixpacksConfig": toml })),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("partial preset_config patch");
+
+        assert_eq!(updated.preset.as_deref(), Some("nixpacks-node"));
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(cfg)) => {
+                assert_eq!(
+                    cfg.providers,
+                    vec![temps_entities::preset::NixpacksProvider::Node]
+                );
+                assert_eq!(cfg.nixpacks_config.as_deref(), Some(toml));
+            }
+            other => panic!("expected Nixpacks config with providers=[node], got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_explicit_empty_providers_resets_nixpacks_to_auto() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let mut create = create_request("Clear Provider");
+        create.preset = "nixpacks-node".to_string();
+        let created = project_service
+            .create_project(create)
+            .await
+            .expect("create nixpacks-node");
+
+        let updated = project_service
+            .update_project_settings(
+                created.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({ "providers": [] })),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("explicit empty providers");
+
+        assert_eq!(updated.preset.as_deref(), Some("nixpacks"));
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(cfg)) => {
+                assert!(cfg.providers.is_empty());
+            }
+            other => panic!("expected Nixpacks config without providers, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_project_base_nixpacks_resets_provider_and_preserves_toml() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let toml = "[start]\ncmd = \"npm start\"";
+        let mut create = create_request("Reset Through Full Update");
+        create.preset = "nixpacks-node".to_string();
+        create.preset_config = Some(serde_json::json!({ "nixpacksConfig": toml }));
+        let created = project_service
+            .create_project(create)
+            .await
+            .expect("create nixpacks-node project");
+
+        let mut update = create_request("Reset Through Full Update");
+        update.preset = "nixpacks".to_string();
+        let updated = project_service
+            .update_project(created.id, update)
+            .await
+            .expect("select base nixpacks");
+
+        assert_eq!(updated.preset.as_deref(), Some("nixpacks"));
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(config)) => {
+                assert!(config.providers.is_empty());
+                assert_eq!(config.nixpacks_config.as_deref(), Some(toml));
+            }
+            other => panic!("expected base Nixpacks config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nixpacks_config_rejects_unknown_provider() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db, mock_queue).await;
+
+        let created = project_service
+            .create_project(create_request("Reject Invalid Provider"))
+            .await
+            .expect("create nixpacks project");
+
+        let result = project_service
+            .update_project_settings(
+                created.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({ "providers": ["not-real"] })),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        match result {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("not-real"));
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("invalid provider must be rejected"),
+        }
+
+        let row = projects::Entity::find_by_id(created.id)
+            .one(project_service.db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(config)) => {
+                assert!(config.providers.is_empty());
+            }
+            other => panic!("expected unchanged Nixpacks config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nixpacks_invalid_inline_toml_is_rejected_during_create() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db, mock_queue).await;
+
+        let mut request = create_request("Invalid Nixpacks TOML");
+        request.preset_config = Some(serde_json::json!({
+            "nixpacksConfig": "secret_token = [\"do-not-echo\""
+        }));
+        let result = project_service.create_project(request).await;
+
+        match result {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("failed to parse Nixpacks TOML"));
+                assert!(
+                    !message.contains("do-not-echo"),
+                    "validation errors must not echo inline config contents"
+                );
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("invalid Nixpacks TOML must be rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nixpacks_invalid_inline_toml_is_rejected_during_config_only_settings_update() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let created = project_service
+            .create_project(create_request("Invalid Settings TOML"))
+            .await
+            .expect("create nixpacks project");
+        let original_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config;
+
+        let result = project_service
+            .update_project_settings(
+                created.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({ "nixpacksConfig": "invalid = [" })),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        match result {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("failed to parse Nixpacks TOML"));
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("invalid Nixpacks TOML must be rejected"),
+        }
+
+        let persisted_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config;
+        assert_eq!(persisted_config, original_config);
+    }
+
+    #[tokio::test]
+    async fn test_nixpacks_invalid_inline_toml_is_rejected_during_config_only_git_update() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let created = project_service
+            .create_project(create_request("Invalid Git Settings TOML"))
+            .await
+            .expect("create nixpacks project");
+        let original_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config;
+
+        let result = project_service
+            .update_git_settings(
+                created.id,
+                1,
+                None,
+                "main".to_string(),
+                "owner".to_string(),
+                "repo".to_string(),
+                None,
+                ".".to_string(),
+                Some(serde_json::json!({ "nixpacksConfig": "invalid = [" })),
+                None,
+                None,
+            )
+            .await;
+
+        match result {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("failed to parse Nixpacks TOML"));
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("invalid Nixpacks TOML must be rejected"),
+        }
+
+        let persisted_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config;
+        assert_eq!(persisted_config, original_config);
+    }
+
+    #[tokio::test]
+    async fn test_config_only_settings_update_preserves_custom_dockerfile_variant() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let mut request = create_request("Custom Settings Variant");
+        request.preset = "custom".to_string();
+        request.preset_config = Some(serde_json::json!({
+            "dockerfilePath": "Dockerfile.custom",
+            "buildContext": "."
+        }));
+        let created = project_service
+            .create_project(request)
+            .await
+            .expect("create custom Dockerfile project");
+
+        project_service
+            .update_project_settings(
+                created.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({
+                    "dockerfilePath": "Dockerfile.updated"
+                })),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("update custom Dockerfile config");
+
+        let persisted_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config
+            .expect("preset config");
+        match &persisted_config {
+            temps_entities::preset::PresetConfig::Dockerfile(config) => {
+                assert_eq!(
+                    config.variant,
+                    temps_entities::preset::DockerfileVariant::Custom
+                );
+                assert_eq!(
+                    config.dockerfile_path.as_deref(),
+                    Some("Dockerfile.updated")
+                );
+            }
+            other => panic!("expected Dockerfile config, got {other:?}"),
+        }
+        let runtime = temps_presets::get_preset_for_storage(
+            temps_entities::preset::Preset::Dockerfile,
+            Some(&persisted_config),
+        )
+        .expect("resolve stored preset")
+        .expect("runtime preset");
+        assert_eq!(runtime.slug(), "custom");
+    }
+
+    #[tokio::test]
+    async fn test_config_only_git_update_preserves_custom_dockerfile_variant() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let mut request = create_request("Custom Git Variant");
+        request.preset = "custom".to_string();
+        request.preset_config = Some(serde_json::json!({
+            "dockerfilePath": "Dockerfile.custom",
+            "buildContext": "."
+        }));
+        let created = project_service
+            .create_project(request)
+            .await
+            .expect("create custom Dockerfile project");
+
+        project_service
+            .update_git_settings(
+                created.id,
+                1,
+                None,
+                "main".to_string(),
+                "owner".to_string(),
+                "repo".to_string(),
+                None,
+                ".".to_string(),
+                Some(serde_json::json!({
+                    "dockerfilePath": "Dockerfile.updated"
+                })),
+                None,
+                None,
+            )
+            .await
+            .expect("update custom Dockerfile Git config");
+
+        let persisted_config = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row")
+            .preset_config
+            .expect("preset config");
+        match &persisted_config {
+            temps_entities::preset::PresetConfig::Dockerfile(config) => {
+                assert_eq!(
+                    config.variant,
+                    temps_entities::preset::DockerfileVariant::Custom
+                );
+                assert_eq!(
+                    config.dockerfile_path.as_deref(),
+                    Some("Dockerfile.updated")
+                );
+            }
+            other => panic!("expected Dockerfile config, got {other:?}"),
+        }
+        let runtime = temps_presets::get_preset_for_storage(
+            temps_entities::preset::Preset::Dockerfile,
+            Some(&persisted_config),
+        )
+        .expect("resolve stored preset")
+        .expect("runtime preset");
+        assert_eq!(runtime.slug(), "custom");
+    }
+
+    #[tokio::test]
+    async fn test_nixpacks_supports_multiple_ordered_providers() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let mut request = create_request("Multiple Providers");
+        request.preset_config = Some(serde_json::json!({
+            "providers": ["...", "python"]
+        }));
+        let created = project_service
+            .create_project(request)
+            .await
+            .expect("create multi-provider Nixpacks project");
+
+        assert_eq!(created.preset.as_deref(), Some("nixpacks"));
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(config)) => {
+                assert_eq!(
+                    config.providers,
+                    vec![
+                        temps_entities::preset::NixpacksProvider::Auto,
+                        temps_entities::preset::NixpacksProvider::Python,
+                    ]
+                );
+            }
+            other => panic!("expected multi-provider Nixpacks config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_git_settings_persist_multiple_ordered_nixpacks_providers() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let created = project_service
+            .create_project(create_request("Git Settings Providers"))
+            .await
+            .expect("create project");
+        let updated = project_service
+            .update_git_settings(
+                created.id,
+                1,
+                None,
+                "main".to_string(),
+                "owner".to_string(),
+                "repo".to_string(),
+                Some("nixpacks".to_string()),
+                ".".to_string(),
+                Some(serde_json::json!({ "providers": ["...", "python"] })),
+                None,
+                None,
+            )
+            .await
+            .expect("update git settings");
+
+        assert_eq!(updated.preset.as_deref(), Some("nixpacks"));
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(config)) => {
+                assert_eq!(
+                    config.providers,
+                    vec![
+                        temps_entities::preset::NixpacksProvider::Auto,
+                        temps_entities::preset::NixpacksProvider::Python,
+                    ]
+                );
+            }
+            other => panic!("expected multi-provider Nixpacks config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_preset_and_config_update_use_effective_new_preset() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+
+        let mut request = create_request("Atomic Preset Update");
+        request.preset = "nextjs".to_string();
+        let created = project_service
+            .create_project(request)
+            .await
+            .expect("create nextjs project");
+
+        let toml = "[start]\ncmd = \"npm start\"";
+        let updated = project_service
+            .update_project_settings(
+                created.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("nixpacks-node".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({ "nixpacksConfig": toml })),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("update preset and config together");
+
+        assert_eq!(updated.preset.as_deref(), Some("nixpacks-node"));
+        let row = projects::Entity::find_by_id(created.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("project row");
+        match row.preset_config {
+            Some(temps_entities::preset::PresetConfig::Nixpacks(config)) => {
+                assert_eq!(
+                    config.providers,
+                    vec![temps_entities::preset::NixpacksProvider::Node]
+                );
+                assert_eq!(config.nixpacks_config.as_deref(), Some(toml));
+            }
+            other => panic!("expected updated Nixpacks config, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3361,5 +4588,201 @@ mod tests {
 
         let err = sea_orm::DbErr::Custom("connection refused".to_string());
         assert!(!super::super::types::is_unique_violation(&err));
+    }
+
+    // ── IDOR regression tests for update_git_settings ────────────────────────
+    //
+    // Security fix: update_git_settings must reject a git_provider_connection
+    // that belongs to a different user than the caller, returning NotFound so
+    // the caller learns nothing about the existence of someone else's connection.
+
+    #[tokio::test]
+    async fn test_update_git_settings_rejects_connection_owned_by_another_user() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        // Create two users so the FK on git_provider_connections.user_id is satisfied.
+        use temps_entities::{git_provider_connections, git_providers, users};
+        let user1 = users::ActiveModel {
+            email: Set("git-idor-user1@example.com".to_string()),
+            name: Set("IDOR User One".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let user2 = users::ActiveModel {
+            email: Set("git-idor-user2@example.com".to_string()),
+            name: Set("IDOR User Two".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Create a git provider (required FK for connections).
+        let provider = git_providers::ActiveModel {
+            name: Set("IDOR Test Provider".to_string()),
+            provider_type: Set("github".to_string()),
+            base_url: Set(None),
+            api_url: Set(None),
+            auth_method: Set("oauth".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Connection belonging to user2 — the caller will present themselves as user1.
+        let other_users_connection = git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(Some(user2.id)),
+            account_name: Set("user2-account".to_string()),
+            account_type: Set("User".to_string()),
+            access_token: Set(None),
+            refresh_token: Set(None),
+            token_expires_at: Set(None),
+            refresh_token_expires_at: Set(None),
+            installation_id: Set(None),
+            metadata: Set(None),
+            is_active: Set(true),
+            is_expired: Set(false),
+            syncing: Set(false),
+            last_synced_at: Set(None),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Create a project to operate on.
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("IDOR Test Project".to_string()),
+            slug: Set("idor-test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set(".".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Act: caller is user1 but supplies a connection owned by user2.
+        let result = project_service
+            .update_git_settings(
+                project.id,
+                user1.id, // caller_user_id
+                Some(other_users_connection.id),
+                "main".to_string(),
+                "test-owner".to_string(),
+                "test-repo".to_string(),
+                None,
+                ".".to_string(),
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        // Assert: ownership mismatch must surface as NotFound — not a server
+        // error and not a silent success that would hand the caller access to
+        // another user's git tokens.
+        assert!(
+            matches!(result, Err(ProjectError::NotFound(_))),
+            "expected NotFound for cross-user connection; ownership IDOR guard did not fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_git_settings_accepts_connection_owned_by_caller() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        // Create a project to operate on. No git_provider_connection_id is set,
+        // so the caller's connection_id will be None — the ownership guard is
+        // skipped entirely and the call must succeed.
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Caller Owner Project".to_string()),
+            slug: Set("caller-owner-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set(".".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Act: no connection_id — skips ownership guard entirely. The
+        // caller_user_id value is accepted without triggering NotFound.
+        let result = project_service
+            .update_git_settings(
+                project.id,
+                1,    // caller_user_id — arbitrary; guard never evaluates with None
+                None, // no connection_id → ownership check is bypassed
+                "main".to_string(),
+                "test-owner".to_string(), // same as inserted — repo_changed=false
+                "test-repo".to_string(),
+                None,
+                ".".to_string(),
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        // The ownership guard must NOT produce a NotFound error.  Any other
+        // result (Ok or a different error variant) is acceptable — we only care
+        // that the guard does not false-positive on a caller that hasn't even
+        // supplied a connection_id.
+        assert!(
+            !matches!(result, Err(ProjectError::NotFound(_))),
+            "caller_user_id with no connection_id must not be rejected by the ownership guard"
+        );
+    }
+
+    #[test]
+    fn project_directory_must_remain_inside_source_root() {
+        assert_eq!(normalize_project_directory("").unwrap(), ".");
+        assert_eq!(
+            normalize_project_directory("./apps/web").unwrap(),
+            "apps/web"
+        );
+        assert!(matches!(
+            normalize_project_directory("../secrets"),
+            Err(ProjectError::InvalidInput(_))
+        ));
+        assert_eq!(
+            normalize_project_directory("/apps/web").unwrap(),
+            "apps/web"
+        );
+        assert!(matches!(
+            normalize_project_directory("apps/../../etc"),
+            Err(ProjectError::InvalidInput(_))
+        ));
     }
 }

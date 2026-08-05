@@ -3,8 +3,6 @@ import {
   getErrorDashboardStatsOptions,
   getLastDeploymentOptions,
   getUniqueCountsOptions,
-  hasAnalyticsEventsOptions,
-  hasErrorGroupsOptions,
   revenueListIntegrationsOptions,
   revenueMetricsSummaryOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -15,21 +13,19 @@ import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { subDays } from 'date-fns'
 import {
-  BarChart3,
   Bug,
-  Check,
-  ChevronRight,
-  Circle,
   DollarSign,
   Minus,
+  Sparkles,
   TrendingDown,
   TrendingUp,
   Users,
 } from 'lucide-react'
-import { ReactNode, useEffect, useMemo } from 'react'
-import { Link } from 'react-router-dom'
+import { useEffect, useMemo } from 'react'
+import { Link } from 'react-router'
 import { MetricCard } from '../dashboard/MetricCard'
 import { DeploymentActivityGraph } from './DeploymentActivityGraph'
+import { PROJECT_TOUR_EVENT } from './ProjectTour'
 
 interface ProjectOverviewProps {
   project: ProjectResponse
@@ -63,18 +59,6 @@ function getChangeDisplay(change: number | undefined, inverse = false) {
     ),
     isPositive,
   }
-}
-
-type OnboardingStepId = 'analytics' | 'errors'
-
-interface OnboardingStep {
-  id: OnboardingStepId
-  title: string
-  description: string
-  href: string
-  done: boolean
-  icon: ReactNode
-  estimate: string
 }
 
 export function ProjectOverview({
@@ -117,20 +101,6 @@ export function ProjectOverview({
     enabled: !!project.id,
   })
 
-  const { data: hasAnalyticsData, isLoading: isCheckingAnalytics } = useQuery({
-    ...hasAnalyticsEventsOptions({
-      path: { project_id: project.id },
-    }),
-    enabled: !!project.id,
-  })
-
-  const { data: hasErrorsData, isLoading: isCheckingErrors } = useQuery({
-    ...hasErrorGroupsOptions({
-      path: { project_id: project.id },
-    }),
-    enabled: !!project.id,
-  })
-
   const { data: freshLastDeployment, refetch: refetchDeployment } = useQuery({
     ...getLastDeploymentOptions({
       path: {
@@ -164,123 +134,8 @@ export function ProjectOverview({
     }
   }, [project?.id, refetchDeployment])
 
-  const isLoadingOnboarding = isCheckingAnalytics || isCheckingErrors
-  const hasAnalytics = !!hasAnalyticsData?.has_events
-  const hasErrors = !!hasErrorsData?.has_error_groups
-
-  const steps: OnboardingStep[] = [
-    {
-      id: 'analytics',
-      title: 'Install analytics SDK',
-      description:
-        'Send your first pageview to unlock visitors, pages, and funnels.',
-      href: `/projects/${project.slug}/analytics/setup`,
-      done: hasAnalytics,
-      icon: <BarChart3 className="size-4" />,
-      estimate: '3 min',
-    },
-    {
-      id: 'errors',
-      title: 'Install error tracking SDK',
-      description:
-        'Capture your first exception to unlock stack traces, alerts, and autofix.',
-      href: `/projects/${project.slug}/errors/setup`,
-      done: hasErrors,
-      icon: <Bug className="size-4" />,
-      estimate: '3 min',
-    },
-  ]
-
-  const doneCount = steps.filter((s) => s.done).length
-  const totalCount = steps.length
-  const percent = Math.round((doneCount / totalCount) * 100)
-  const allDone = doneCount === totalCount
-
   return (
     <>
-      {!isLoadingOnboarding && !allDone && (
-        <section className="mb-4 overflow-hidden rounded-xl border bg-card sm:mb-6">
-          <div className="flex flex-col gap-3 border-b p-4 sm:flex-row sm:items-center sm:justify-between sm:gap-4 sm:p-5">
-            <div className="min-w-0 flex-1">
-              <div className="flex flex-wrap items-center gap-2">
-                <h2 className="text-base font-semibold tracking-tight">
-                  Finish setting up {project.slug}
-                </h2>
-                <Badge variant="secondary" className="tabular-nums">
-                  {doneCount} / {totalCount}
-                </Badge>
-              </div>
-              <p className="mt-1 text-sm text-muted-foreground">
-                Wire up observability so Temps can start capturing data from
-                your app.
-              </p>
-            </div>
-            <div className="flex items-center gap-3 sm:w-64 sm:shrink-0">
-              <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
-                <div
-                  className="h-full bg-primary [transition-duration:400ms] transition-all"
-                  style={{ width: `${percent}%` }}
-                />
-              </div>
-              <span className="text-sm font-medium tabular-nums text-muted-foreground">
-                {percent}%
-              </span>
-            </div>
-          </div>
-          <ul role="list" className="divide-y">
-            {steps.map((step) => (
-              <li key={step.id}>
-                <Link
-                  to={step.href}
-                  className={cn(
-                    'group flex items-center gap-3 px-4 py-3 transition-colors hover:bg-muted/50 sm:gap-4 sm:px-5 sm:py-4',
-                    step.done && 'opacity-60'
-                  )}
-                >
-                  <span
-                    className={cn(
-                      'flex size-7 shrink-0 items-center justify-center rounded-full border',
-                      step.done
-                        ? 'border-emerald-500 bg-emerald-500 text-white'
-                        : 'border-muted-foreground/30 text-muted-foreground'
-                    )}
-                  >
-                    {step.done ? (
-                      <Check className="size-4" strokeWidth={3} />
-                    ) : (
-                      <Circle className="size-4" />
-                    )}
-                  </span>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                      <p
-                        className={cn(
-                          'text-sm font-medium',
-                          step.done && 'line-through'
-                        )}
-                      >
-                        {step.title}
-                      </p>
-                      {!step.done && (
-                        <span className="text-xs text-muted-foreground tabular-nums">
-                          · {step.estimate}
-                        </span>
-                      )}
-                    </div>
-                    <p className="mt-0.5 text-sm text-muted-foreground">
-                      {step.description}
-                    </p>
-                  </div>
-                  {!step.done && (
-                    <ChevronRight className="size-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
-                  )}
-                </Link>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
-
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4 lg:grid-cols-3 lg:gap-6">
         {isLoadingVisitors ? (
           <Skeleton className="h-24" />
@@ -316,7 +171,6 @@ export function ProjectOverview({
 
         <RevenueMetric project={project} />
 
-
         <Link to={`/projects/${project.slug}/errors`} className="h-full w-full">
           <MetricCard
             change={''}
@@ -338,6 +192,17 @@ export function ProjectOverview({
 
       <div className="mt-4 sm:mt-6">
         <DeploymentActivityGraph projectId={project.id} />
+      </div>
+
+      <div className="mt-4 flex justify-center sm:mt-6">
+        <button
+          type="button"
+          onClick={() => window.dispatchEvent(new Event(PROJECT_TOUR_EVENT))}
+          className="inline-flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <Sparkles className="size-3.5" />
+          Take a tour of your project
+        </button>
       </div>
     </>
   )

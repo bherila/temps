@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_core::{
+    JobResult, WorkflowCancellationProvider, WorkflowContext, WorkflowError, WorkflowTask,
+};
 use temps_deployer::compose::{ComposeDeployRequest, ComposeExecutor};
 use temps_logs::LogService;
 use tracing::debug;
@@ -41,6 +43,9 @@ pub struct DeployComposeJob {
     /// Inline compose content (used when no git repo, e.g. manual project)
     compose_content: Option<String>,
     environment_vars: HashMap<String, String>,
+    /// Platform-owned build arguments. These are passed only to
+    /// `docker compose build`, never to service runtime environments.
+    build_args: HashMap<String, String>,
     /// User-provided docker-compose override YAML
     compose_override: Option<String>,
     /// Job ID of the download_repo job (to read repo_dir from context)
@@ -60,6 +65,7 @@ pub struct DeployComposeJobBuilder {
     compose_content: Option<String>,
     compose_override: Option<String>,
     environment_vars: HashMap<String, String>,
+    build_args: HashMap<String, String>,
     download_job_id: Option<String>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
@@ -84,6 +90,7 @@ impl DeployComposeJobBuilder {
             compose_content: None,
             compose_override: None,
             environment_vars: HashMap::new(),
+            build_args: HashMap::new(),
             download_job_id: None,
             log_id: None,
             log_service: None,
@@ -134,6 +141,10 @@ impl DeployComposeJobBuilder {
         self.environment_vars = vars;
         self
     }
+    pub fn build_args(mut self, args: HashMap<String, String>) -> Self {
+        self.build_args = args;
+        self
+    }
     pub fn log_id(mut self, id: Option<String>) -> Self {
         self.log_id = id;
         self
@@ -165,6 +176,7 @@ impl DeployComposeJobBuilder {
             compose_content: self.compose_content,
             compose_override: self.compose_override,
             environment_vars: self.environment_vars,
+            build_args: self.build_args,
             download_job_id: self
                 .download_job_id
                 .unwrap_or_else(|| "download_repo".to_string()),
@@ -359,7 +371,12 @@ impl WorkflowTask for DeployComposeJob {
         }
         if let Err(e) = self
             .compose_executor
-            .teardown_for_redeploy(&project_name)
+            .teardown_at(
+                &project_name,
+                repo_path.as_deref(),
+                Some(compose_file_name),
+                &self.environment_vars,
+            )
             .await
         {
             debug!(
@@ -376,8 +393,9 @@ impl WorkflowTask for DeployComposeJob {
             work_dir: PathBuf::from("/tmp"),
             compose_path: self.compose_path.clone(),
             environment_vars: self.environment_vars.clone(),
+            build_args: self.build_args.clone(),
             labels,
-            repo_dir: repo_path,
+            repo_dir: repo_path.clone(),
             compose_override: self.compose_override.clone(),
         };
 
@@ -385,6 +403,16 @@ impl WorkflowTask for DeployComposeJob {
         let services = match self.compose_executor.deploy(request).await {
             Ok(s) => s,
             Err(e) => {
+                let cleanup_error = self
+                    .compose_executor
+                    .teardown_at(
+                        &project_name,
+                        repo_path.as_deref(),
+                        Some(compose_file_name),
+                        &self.environment_vars,
+                    )
+                    .await
+                    .err();
                 let error_msg = format!("Compose deploy failed: {}", e);
                 tracing::error!(error = %error_msg, "Docker Compose deployment failed");
                 if let Some(ref log_id) = self.log_id {
@@ -392,11 +420,23 @@ impl WorkflowTask for DeployComposeJob {
                         tracing::error!("Failed to write error to log stream: {}", log_err);
                     }
                 }
+                if let Some(cleanup_error) = cleanup_error {
+                    tracing::error!(project = %project_name, error = %cleanup_error, "Compose compensation cleanup failed");
+                }
                 return Err(WorkflowError::JobExecutionFailed(error_msg));
             }
         };
 
         if services.is_empty() {
+            let _ = self
+                .compose_executor
+                .teardown_at(
+                    &project_name,
+                    repo_path.as_deref(),
+                    Some(compose_file_name),
+                    &self.environment_vars,
+                )
+                .await;
             let error_msg = "No containers found after docker compose up".to_string();
             tracing::error!(error = %error_msg, "Docker Compose deployment produced no containers");
             if let Some(ref log_id) = self.log_id {
@@ -503,6 +543,61 @@ impl WorkflowTask for DeployComposeJob {
 
         Ok(JobResult::success(context))
     }
+
+    async fn execute_with_cancellation(
+        &self,
+        context: WorkflowContext,
+        cancellation_provider: &dyn WorkflowCancellationProvider,
+    ) -> Result<JobResult, WorkflowError> {
+        let workflow_run_id = context.workflow_run_id.clone();
+        let project_name = format!("temps-{}-{}", self.project_id, self.environment_id);
+        let compose_file_name = self.compose_path.as_deref().unwrap_or("docker-compose.yml");
+        validate_relative_path(compose_file_name, "compose_path")?;
+        validate_relative_path(&self.directory, "directory")?;
+        let cleanup_repo_path = if self.compose_content.is_none() {
+            let repo_dir: Option<String> = context
+                .get_output(&self.download_job_id, "repo_dir")
+                .map_err(|error| WorkflowError::JobExecutionFailed(error.to_string()))?;
+            repo_dir
+                .map(|repo_dir| {
+                    canonicalize_confined_repo_path(
+                        Path::new(&repo_dir),
+                        Path::new(&self.directory),
+                        "directory",
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let cancellation_check = async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                match cancellation_provider.is_cancelled(&workflow_run_id).await {
+                    Ok(false) => continue,
+                    Ok(true) | Err(_) => return,
+                }
+            }
+        };
+
+        tokio::select! {
+            result = self.execute(context) => result,
+            _ = cancellation_check => {
+                self.compose_executor
+                    .teardown_at(
+                        &project_name,
+                        cleanup_repo_path.as_deref(),
+                        Some(compose_file_name),
+                        &self.environment_vars,
+                    )
+                    .await
+                    .map_err(|error| WorkflowError::JobExecutionFailed(format!(
+                        "Compose deployment was cancelled, but stack cleanup failed for {project_name}: {error}"
+                    )))?;
+                Err(WorkflowError::WorkflowCancelled)
+            }
+        }
+    }
 }
 
 /// Confine a user-supplied path (`compose_path`, `directory`) to the repo
@@ -534,7 +629,7 @@ fn validate_relative_path(path: &str, field: &str) -> Result<(), WorkflowError> 
 /// supplied base directory. This is the filesystem half of
 /// `validate_relative_path`: Git preserves symlinks, so lexical confinement is
 /// not sufficient by itself.
-fn canonicalize_confined_repo_path(
+pub(crate) fn canonicalize_confined_repo_path(
     base_dir: &Path,
     relative_path: &Path,
     field: &str,

@@ -2,10 +2,19 @@
 set -euo pipefail
 
 project="temps-compose-security-${GITHUB_RUN_ID:-local}-$$"
-config_compose=(docker compose --project-name "$project" --file docker-compose.yml)
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+config_compose=(docker compose --project-name "$project" --file docker-compose.yml
+  --file "$script_dir/compose-security.harness.yml")
 compose=("${config_compose[@]}")
 if [[ -n "${COMPOSE_SECURITY_OVERRIDE:-}" ]]; then
   compose+=(--file "$COMPOSE_SECURITY_OVERRIDE")
+fi
+# CI pre-builds the temps image with layer caching and points the compose
+# `temps` service at it via COMPOSE_SECURITY_OVERRIDE. In that case skip the
+# uncached in-compose rebuild; locally we still build from source.
+build_flag=(--build)
+if [[ -n "${COMPOSE_SECURITY_PREBUILT:-}" ]]; then
+  build_flag=()
 fi
 safe_postgres="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 safe_redis="abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
@@ -195,7 +204,7 @@ fi
 # first application start. This models an upgrade where an existing volume
 # masks /app/data and verifies immutable runtime assets remain available.
 POSTGRES_PASSWORD="$safe_postgres" REDIS_PASSWORD="$safe_redis" \
-  "${compose[@]}" run --rm --no-deps --build --entrypoint /bin/sh temps \
+  "${compose[@]}" run --rm --no-deps ${build_flag[@]+"${build_flag[@]}"} --entrypoint /bin/sh temps \
   -ec 'touch /app/data/.preexisting-volume' >/dev/null
 POSTGRES_PASSWORD="$safe_postgres" REDIS_PASSWORD="$safe_redis" \
   "${compose[@]}" up --detach temps >/dev/null
@@ -226,6 +235,15 @@ docker exec --env PGPASSWORD="$safe_postgres" temps-postgres \
   psql -h 127.0.0.1 -U temps -d temps -tAc \
   "SELECT count(*) FROM users u JOIN user_roles ur ON ur.user_id = u.id JOIN roles r ON r.id = ur.role_id WHERE u.email = 'admin@example.test' AND u.deleted_at IS NULL AND r.name = 'admin'" \
   | grep -qx 1
+# The harness must never report product telemetry (see
+# compose-security.harness.yml). Assert on the container env, not on logs:
+# the ENABLED/DISABLED notice is emitted during plugin registration, before
+# the tracing subscriber is initialized, so it never reaches `docker logs`.
+if ! docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' temps-app \
+  | grep -qx 'TEMPS_TELEMETRY=0'; then
+  echo "product telemetry is not disabled inside the compose security harness" >&2
+  exit 1
+fi
 if [[ "$(docker logs temps-app 2>&1 | grep -c 'Initial admin created from TEMPS_ADMIN_EMAIL and password secret file')" != "1" ]]; then
   echo "expected exactly one unattended initial-admin creation notice" >&2
   exit 1

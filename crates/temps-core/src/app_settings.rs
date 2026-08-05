@@ -61,6 +61,13 @@ pub struct AppSettings {
     // AI configuration settings (global config repo for skills, MCP servers, etc.)
     pub ai_config: AiConfigSettings,
 
+    /// Limits on a single AI chat turn. Operator-tunable because the right
+    /// value depends on the model: a turn against a slow self-hosted model can
+    /// legitimately take ten minutes, while a hosted one finishes in seconds
+    /// and a shorter ceiling keeps costs predictable.
+    #[serde(default)]
+    pub ai_chat_limits: AiChatLimitsSettings,
+
     /// Skip TLS certificate verification on outbound HTTP clients built by the
     /// server (deployer, agent, remote service client). Strictly opt-in for
     /// operators running self-signed control plane / worker certs on a trusted
@@ -84,6 +91,14 @@ pub struct AppSettings {
     /// Metrics observability settings. Controls the MetricsStore backend,
     /// scrape interval, and tiered retention windows.
     pub monitoring: MonitoringSettings,
+
+    /// TimescaleDB compression delays for immutable observability data.
+    /// Changes are applied at runtime by the Settings API.
+    pub observability_compression: ObservabilityCompressionSettings,
+
+    /// Retention windows for raw proxy and OpenTelemetry telemetry.
+    /// TimescaleDB policies are updated at runtime by the Settings API.
+    pub observability_retention: ObservabilityRetentionSettings,
 
     /// Set to `true` by `temps setup` (all modes) once initial configuration
     /// has been applied. The web onboarding wizard reads this from the server
@@ -152,6 +167,63 @@ pub struct ClusterDnsSettings {
     /// `*.temps.local` FQDNs resolve inside containers.
     #[schema(example = false)]
     pub enabled: bool,
+}
+
+/// Bounds on one AI chat turn.
+///
+/// A turn is bounded by TIME rather than by a number of steps. A step count
+/// says nothing about cost or about how long someone has been watching a
+/// spinner, and it cuts short exactly the long, productive turns the chat
+/// exists for. The user can already see each tool call and press Stop; the
+/// deadline is what guarantees an *unattended* turn still ends.
+///
+/// The right value is a property of the model, which is why it is configurable
+/// rather than compiled in: a full alert-suggestion turn takes ~10 minutes
+/// against a slow local model and seconds against a hosted one.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct AiChatLimitsSettings {
+    /// How long one turn may run before it is stopped and the partial answer
+    /// returned, in seconds. The user is told the turn was cut short.
+    ///
+    /// Checked between steps, not mid-call: a model round already in flight
+    /// finishes, so a turn can overrun by up to one round. Against a slow
+    /// self-hosted model that is a minute or two. Aborting mid-stream would cut
+    /// the answer off in the middle of a sentence and throw away work already
+    /// paid for, which is worse than a late stop.
+    #[schema(minimum = 30, maximum = 3600, example = 900)]
+    pub turn_timeout_secs: u32,
+}
+
+impl Default for AiChatLimitsSettings {
+    fn default() -> Self {
+        Self {
+            // Generous against a full alert-suggestion turn on a slow local
+            // model (~10 min) while capping what a single message can cost.
+            turn_timeout_secs: 15 * 60,
+        }
+    }
+}
+
+impl AiChatLimitsSettings {
+    /// Lower bound: below this a turn cannot complete even simple tool work,
+    /// so accepting it would just look like the chat is broken.
+    pub const MIN_TURN_TIMEOUT_SECS: u32 = 30;
+    /// Upper bound: an hour of provider calls from one message is already far
+    /// past anything useful, and the value is a cost ceiling.
+    pub const MAX_TURN_TIMEOUT_SECS: u32 = 3600;
+
+    /// The configured timeout, clamped to the supported range.
+    ///
+    /// Clamped rather than trusted: the settings row is JSON that predates this
+    /// field and can be written by any admin, and a zero would otherwise mean
+    /// "every turn times out instantly".
+    pub fn turn_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.turn_timeout_secs
+                .clamp(Self::MIN_TURN_TIMEOUT_SECS, Self::MAX_TURN_TIMEOUT_SECS) as u64,
+        )
+    }
 }
 
 /// Control-plane build resource limits.
@@ -258,6 +330,20 @@ pub struct ProviderConfig {
     /// settings). Intentionally untyped so new providers don't require
     /// schema changes.
     pub extra: serde_json::Value,
+    /// Default max agent turns for the autofixer *analysis* phase when this
+    /// provider runs it. `None` = built-in default (10). Only enforced for
+    /// CLIs that support a turn cap (Claude Code's `--max-turns`); Codex and
+    /// OpenCode run to completion regardless.
+    #[serde(default)]
+    pub max_turns_analysis: Option<i32>,
+    /// Default max agent turns for the autofixer *fix* phase.
+    /// `None` = built-in default (20).
+    #[serde(default)]
+    pub max_turns_fix: Option<i32>,
+    /// Default max agent turns for autofixer *feedback/re-analyze* rounds.
+    /// `None` = built-in default (10).
+    #[serde(default)]
+    pub max_turns_feedback: Option<i32>,
 }
 
 /// Global agent sandbox settings. Controls whether agent runs are isolated
@@ -306,6 +392,13 @@ pub struct AgentSandboxSettings {
     /// Network access level: "full" (unrestricted), "restricted" (Temps network only), "none" (no network)
     #[schema(example = "full")]
     pub network_mode: String,
+    /// Default isolation backend for sandboxes: "docker" (default) or
+    /// "firecracker" (ADR-029; requires `temps firecracker setup`). Only
+    /// consulted when the Firecracker backend probes available — otherwise
+    /// Docker is used regardless.
+    #[serde(default)]
+    #[schema(example = "docker")]
+    pub sandbox_backend: Option<String>,
 }
 
 /// Global AI configuration settings. Controls the default config repo
@@ -353,6 +446,7 @@ impl Default for AgentSandboxSettings {
             cpu_limit: 4.0,
             memory_limit_mb: 8192,
             network_mode: "full".to_string(),
+            sandbox_backend: None,
         }
     }
 }
@@ -386,6 +480,9 @@ impl AgentSandboxSettings {
                 credentials_encrypted: self.api_key_encrypted.clone(),
                 default_model: None,
                 extra: serde_json::Value::Null,
+                max_turns_analysis: None,
+                max_turns_fix: None,
+                max_turns_feedback: None,
             };
         }
         ProviderConfig::default()
@@ -658,7 +755,10 @@ impl Default for OnDemandTlsSettings {
 pub enum MetricsStoreKind {
     /// Default: TimescaleDB (same PostgreSQL instance used by the control plane).
     TimescaleDb,
-    /// Optional: ClickHouse cluster — requires `clickhouse_url` to be set.
+    /// Optional: ClickHouse cluster. The runtime store is built from the
+    /// `TEMPS_CLICKHOUSE_*` server env configuration; selecting this without
+    /// that configuration falls back to TimescaleDB (reported via
+    /// `effective_metrics_store`).
     ClickHouse,
 }
 
@@ -692,12 +792,73 @@ pub struct MonitoringSettings {
     pub retention_hourly_days: u32,
 
     /// How many years of daily-aggregate data to keep (converted to days internally).
-    #[schema(minimum = 1, example = 2)]
+    #[schema(minimum = 1, maximum = 10, example = 2)]
     pub retention_daily_years: u32,
 
-    /// ClickHouse DSN, required only when `store = "click_house"`.
+    /// ClickHouse DSN (legacy, optional). The runtime metrics store is built
+    /// from the `TEMPS_CLICKHOUSE_*` env vars, never from this field; it is
+    /// retained for compatibility and operator reference only.
     /// Example: `"http://localhost:8123"`.
     pub clickhouse_url: Option<String>,
+}
+
+/// TimescaleDB compression policy configuration for append-only observability
+/// tables. Values are expressed in hours so operators can choose sub-day
+/// windows while keeping the API representation unambiguous.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ObservabilityCompressionSettings {
+    /// Compress proxy-log chunks after this many hours. Defaults to 24 hours.
+    #[schema(minimum = 1, maximum = 720, example = 24)]
+    pub proxy_logs_after_hours: u32,
+
+    /// Compress OpenTelemetry span chunks after this many hours. Defaults to
+    /// 24 hours.
+    #[schema(minimum = 1, maximum = 2160, example = 24)]
+    pub otel_spans_after_hours: u32,
+}
+
+impl Default for ObservabilityCompressionSettings {
+    fn default() -> Self {
+        Self {
+            proxy_logs_after_hours: 24,
+            otel_spans_after_hours: 24,
+        }
+    }
+}
+
+/// Retention policy configuration for raw observability tables. Values are in
+/// days. The Settings API applies them to TimescaleDB; ClickHouse-backed proxy
+/// logs and spans retain their storage-level per-row TTL behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ObservabilityRetentionSettings {
+    /// Retain proxy request logs for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 30)]
+    pub proxy_logs_days: u32,
+
+    /// Retain OpenTelemetry spans (traces) for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_spans_days: u32,
+
+    /// Retain OpenTelemetry log events for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_logs_days: u32,
+
+    /// Retain OpenTelemetry metric points for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_metrics_days: u32,
+}
+
+impl Default for ObservabilityRetentionSettings {
+    fn default() -> Self {
+        Self {
+            proxy_logs_days: 30,
+            otel_spans_days: 90,
+            otel_logs_days: 90,
+            otel_metrics_days: 90,
+        }
+    }
 }
 
 impl Default for MonitoringSettings {
@@ -736,9 +897,12 @@ impl Default for AppSettings {
             on_demand_tls: OnDemandTlsSettings::default(),
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
+            ai_chat_limits: AiChatLimitsSettings::default(),
             build_limits: BuildLimitsSettings::default(),
             cluster_dns: ClusterDnsSettings::default(),
             monitoring: MonitoringSettings::default(),
+            observability_compression: ObservabilityCompressionSettings::default(),
+            observability_retention: ObservabilityRetentionSettings::default(),
             setup_complete: false,
             require_mfa_for_admins: false,
             console_version: None,
@@ -922,11 +1086,112 @@ impl AppSettings {
             .unwrap_or_else(|| format!("http://host.docker.internal:{console_port}"));
         raw.trim_end_matches('/').to_string()
     }
+
+    /// Hostname the Temps console is served on, derived from `external_url`.
+    ///
+    /// Returns `None` when `external_url` is unset or unparsable (installs
+    /// reached by raw IP), in which case there is no console hostname to
+    /// protect.
+    pub fn console_hostname(&self) -> Option<String> {
+        let raw = self.external_url.as_ref()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        // Tolerate a bare host ("console.example.com") as well as a full URL.
+        let candidate = if raw.contains("://") {
+            raw.to_string()
+        } else {
+            format!("https://{raw}")
+        };
+        url::Url::parse(&candidate)
+            .ok()?
+            .host_str()
+            .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+    }
+
+    /// True when `host` is owned by the platform itself and must never be
+    /// claimed by a project domain.
+    ///
+    /// Reserved hosts are the console hostname (`external_url`) and the
+    /// preview domain apex — routing either of them at a project makes the
+    /// console or every generated preview URL unreachable, and recovering
+    /// requires shell/IP access to the box (issue #478).
+    pub fn is_reserved_hostname(&self, host: &str) -> bool {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            return false;
+        }
+        if self.console_hostname().as_deref() == Some(host.as_str()) {
+            return true;
+        }
+        let preview = self
+            .preview_domain
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        !preview.is_empty() && preview == host
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Issue #478: a project domain must never be allowed to claim the
+    // console hostname — doing so locks the operator out of the console and
+    // recovery requires the raw public IP.
+    #[test]
+    fn console_hostname_parses_url_and_bare_host() {
+        let with_external_url = |raw: Option<&str>| AppSettings {
+            external_url: raw.map(str::to_string),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            with_external_url(Some("https://Console.Example.com:8443/"))
+                .console_hostname()
+                .as_deref(),
+            Some("console.example.com")
+        );
+        assert_eq!(
+            with_external_url(Some("console.example.com"))
+                .console_hostname()
+                .as_deref(),
+            Some("console.example.com")
+        );
+        assert_eq!(with_external_url(Some("   ")).console_hostname(), None);
+        assert_eq!(with_external_url(None).console_hostname(), None);
+    }
+
+    #[test]
+    fn reserved_hostname_covers_console_and_preview_apex() {
+        let s = AppSettings {
+            external_url: Some("https://console.example.com".to_string()),
+            preview_domain: "apps.example.com".to_string(),
+            ..Default::default()
+        };
+
+        assert!(s.is_reserved_hostname("console.example.com"));
+        // Case and trailing-dot variants are the same host.
+        assert!(s.is_reserved_hostname("CONSOLE.example.com."));
+        assert!(s.is_reserved_hostname("apps.example.com"));
+
+        // Ordinary project domains, including subdomains of the preview
+        // domain, stay assignable.
+        assert!(!s.is_reserved_hostname("shop.example.com"));
+        assert!(!s.is_reserved_hostname("my-app.apps.example.com"));
+        assert!(!s.is_reserved_hostname(""));
+    }
+
+    #[test]
+    fn reserved_hostname_is_inert_without_external_url() {
+        let s = AppSettings {
+            external_url: None,
+            preview_domain: String::new(),
+            ..Default::default()
+        };
+        assert!(!s.is_reserved_hostname("anything.example.com"));
+    }
 
     // ADR-024: cluster-DNS injection is experimental/beta and defaults OFF
     // to avoid the DNS-timeout-cascade failure mode (22-27 s TCP delays when
@@ -975,6 +1240,37 @@ mod tests {
         assert!(
             !parsed.cluster_dns.enabled,
             "cluster_dns must default to disabled when deserializing a legacy settings row"
+        );
+    }
+
+    #[test]
+    fn legacy_settings_json_uses_observability_retention_defaults() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        }));
+
+        assert_eq!(
+            parsed.observability_retention,
+            ObservabilityRetentionSettings::default()
+        );
+        assert_eq!(parsed.observability_retention.proxy_logs_days, 30);
+        assert_eq!(parsed.observability_retention.otel_spans_days, 90);
+    }
+
+    #[test]
+    fn observability_retention_round_trips_through_json() {
+        let mut settings = AppSettings::default();
+        settings.observability_retention.proxy_logs_days = 14;
+        settings.observability_retention.otel_spans_days = 60;
+        settings.observability_retention.otel_logs_days = 45;
+        settings.observability_retention.otel_metrics_days = 30;
+
+        let parsed = AppSettings::from_json(settings.to_json());
+
+        assert_eq!(
+            parsed.observability_retention,
+            settings.observability_retention
         );
     }
 
@@ -1065,5 +1361,34 @@ mod tests {
         let json = s.to_json();
         let back = AppSettings::from_json(json);
         assert!(back.require_mfa_for_admins);
+    }
+
+    #[test]
+    fn observability_compression_defaults_to_24_hours() {
+        let compression = ObservabilityCompressionSettings::default();
+        assert_eq!(compression.proxy_logs_after_hours, 24);
+        assert_eq!(compression.otel_spans_after_hours, 24);
+    }
+
+    #[test]
+    fn legacy_settings_get_24_hour_observability_compression_defaults() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        }));
+
+        assert_eq!(parsed.observability_compression.proxy_logs_after_hours, 24);
+        assert_eq!(parsed.observability_compression.otel_spans_after_hours, 24);
+    }
+
+    #[test]
+    fn observability_compression_round_trips_through_json() {
+        let mut settings = AppSettings::default();
+        settings.observability_compression.proxy_logs_after_hours = 12;
+        settings.observability_compression.otel_spans_after_hours = 48;
+
+        let parsed = AppSettings::from_json(settings.to_json());
+        assert_eq!(parsed.observability_compression.proxy_logs_after_hours, 12);
+        assert_eq!(parsed.observability_compression.otel_spans_after_hours, 48);
     }
 }

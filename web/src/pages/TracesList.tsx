@@ -23,6 +23,11 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { Input } from '@/components/ui/input'
 import { useDebounce } from '@/hooks/useDebounce'
 import {
+  computeTracesTimeWindow,
+  tracesListTimeBounds,
+  type TracesTimeRange,
+} from '@/lib/traces-time-window'
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -68,13 +73,11 @@ import {
   useMemo,
   useState,
 } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 
 interface TracesListProps {
   project: ProjectResponse
 }
-
-type TimeRange = '1h' | '6h' | '24h' | '7d' | '30d'
 
 function statusBadge(status: SpanStatusCode) {
   switch (status) {
@@ -615,8 +618,8 @@ export default function TracesList({ project }: TracesListProps) {
   usePageTitle(`Traces - ${project.name}`)
 
   // State from URL params
-  const [timeRange, setTimeRange] = useState<TimeRange>(
-    () => (searchParams.get('range') as TimeRange) || '24h'
+  const [timeRange, setTimeRange] = useState<TracesTimeRange>(
+    () => (searchParams.get('range') as TracesTimeRange) || '24h'
   )
   const [serviceName, setServiceName] = useState(
     () => searchParams.get('service') || ''
@@ -653,30 +656,17 @@ export default function TracesList({ project }: TracesListProps) {
     searchParams.get('dir') === 'asc' ? 'asc' : 'desc',
   )
   const [showSetup, setShowSetup] = useState(false)
+  // Bumped by Refresh so relative ranges recompute against "now". Without
+  // this, start/end freeze at mount (or last range change) and newly ingested
+  // traces that land after that frozen end_time stay invisible until a full
+  // page reload — including exact trace-id searches that still AND the window.
+  const [refreshKey, setRefreshKey] = useState(0)
 
-  // Compute time window
-  const { startTime, endTime } = useMemo(() => {
-    const now = new Date()
-    const start = new Date()
-    switch (timeRange) {
-      case '1h':
-        start.setHours(start.getHours() - 1)
-        break
-      case '6h':
-        start.setHours(start.getHours() - 6)
-        break
-      case '24h':
-        start.setDate(start.getDate() - 1)
-        break
-      case '7d':
-        start.setDate(start.getDate() - 7)
-        break
-      case '30d':
-        start.setDate(start.getDate() - 30)
-        break
-    }
-    return { startTime: start.toISOString(), endTime: now.toISOString() }
-  }, [timeRange])
+  // Compute time window (refreshKey forces a fresh "now" on Refresh)
+  const { startTime, endTime } = useMemo(
+    () => computeTracesTimeWindow(timeRange),
+    [timeRange, refreshKey],
+  )
 
   // Fetch environments for the filter dropdown
   const { data: environments } = useQuery({
@@ -748,13 +738,18 @@ export default function TracesList({ project }: TracesListProps) {
     ])
   }, [project.name, project.slug, setBreadcrumbs])
 
+  const timeBounds = tracesListTimeBounds(debouncedSearch || undefined, {
+    startTime,
+    endTime,
+  })
+
   // Fetch trace summaries (one row per trace, server-side aggregation)
   const { data, isLoading, isFetching, refetch } = useQuery({
     ...queryTraceSummariesOptions({
       query: {
         project_id: project.id,
-        start_time: startTime,
-        end_time: endTime,
+        start_time: timeBounds.start_time,
+        end_time: timeBounds.end_time,
         service_name: serviceName || undefined,
         status: status !== 'all' ? status : undefined,
         trace_id: debouncedSearch || undefined,
@@ -765,6 +760,10 @@ export default function TracesList({ project }: TracesListProps) {
           deploymentId !== 'all' ? Number(deploymentId) : undefined,
         sort_by: sortBy ?? undefined,
         sort_order: sortBy ? sortOrder : undefined,
+        // Explicit: this list renders "Showing X–Y of Z" and a page count, so
+        // it genuinely needs the total. Stating it makes the `?? 0` below safe
+        // by construction rather than by relying on the server default.
+        include_total: true,
         limit: PAGE_SIZE,
         offset: (page - 1) * PAGE_SIZE,
       },
@@ -782,13 +781,27 @@ export default function TracesList({ project }: TracesListProps) {
   // "set up OpenTelemetry" to a project with millions of historical traces just
   // because nothing landed in the last 24h. This probe answers the real
   // question the onboarding screen is for.
-  const { data: anyTraceData, isLoading: isProbeLoading } = useQuery({
+  //
+  // `include_total: false` matters here. The probe only needs to know whether
+  // ANY trace exists, but `total` is a second aggregation over the project's
+  // whole retention — with no time filter to narrow it, that is the single most
+  // expensive query on this page (measured at ~10s on an 860M-span project).
+  // Asking for one row and checking whether we got it answers the same question
+  // without computing a count nobody reads.
+  const {
+    data: anyTraceData,
+    isLoading: isProbeLoading,
+    refetch: refetchProbe,
+  } = useQuery({
     ...queryTraceSummariesOptions({
-      query: { project_id: project.id, limit: 1 },
+      query: { project_id: project.id, limit: 1, include_total: false },
     }),
     enabled: !!project.id,
   })
-  const hasEverReceivedTraces = (anyTraceData?.total ?? 0) > 0
+  // Deliberately NOT `total`: with include_total=false the server omits it, and
+  // `total ?? 0` would read "not computed" as "no traces" and show the setup
+  // onboarding to a project that has millions of them.
+  const hasEverReceivedTraces = (anyTraceData?.data?.length ?? 0) > 0
 
   const hasActiveFilters =
     !!search ||
@@ -821,7 +834,7 @@ export default function TracesList({ project }: TracesListProps) {
 
   const handleTimeRangeChange = useCallback(
     (v: string) => {
-      setTimeRange(v as TimeRange)
+      setTimeRange(v as TracesTimeRange)
       setPage(1)
     },
     []
@@ -870,7 +883,15 @@ export default function TracesList({ project }: TracesListProps) {
           <Button
             variant="ghost"
             size="icon"
-            onClick={() => refetch()}
+            onClick={() => {
+              // Advance the relative window so list queries recompute against
+              // "now". Trace-id searches omit the window, so their query key
+              // does not change — refetch those explicitly. Also re-check the
+              // unwindowed "ever received a trace" probe.
+              setRefreshKey((k) => k + 1)
+              if (debouncedSearch) void refetch()
+              void refetchProbe()
+            }}
             disabled={isFetching}
           >
             <RefreshCw className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`} />

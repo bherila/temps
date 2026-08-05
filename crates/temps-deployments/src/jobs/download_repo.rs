@@ -172,13 +172,15 @@ impl DownloadRepoJob {
 
     /// Get the branch/ref to checkout based on priority
     fn get_checkout_ref(&self, context: &WorkflowContext) -> String {
-        // Priority: tag_ref > commit_sha > branch_ref > context branch > "main"
-        if let Some(ref tag) = self.tag_ref {
-            return tag.clone();
-        }
-
+        // A tag may move after it is resolved. When both the human-readable
+        // tag and its verified commit are present, checkout must use the
+        // immutable commit while retaining the tag as deployment metadata.
         if let Some(ref commit) = self.commit_sha {
             return commit.clone();
+        }
+
+        if let Some(ref tag) = self.tag_ref {
+            return tag.clone();
         }
 
         if let Some(ref branch) = self.branch_ref {
@@ -225,12 +227,9 @@ impl DownloadRepoJob {
         )
         .await?;
 
-        // Determine clone strategy based on what ref type we have
-        // commit_sha requires full clone + checkout, branches/tags can use shallow clone with --branch
-        let needs_full_clone = self.commit_sha.is_some() && self.tag_ref.is_none();
-
-        if needs_full_clone {
-            let commit_sha = self.commit_sha.as_ref().unwrap();
+        // A verified commit always requires a full clone + immutable checkout,
+        // even when a tag is also retained for display and audit metadata.
+        if let Some(commit_sha) = self.commit_sha.as_ref() {
             self.log(context, format!("Cloning for commit SHA: {}", commit_sha))
                 .await?;
 
@@ -542,8 +541,21 @@ impl WorkflowTask for DownloadRepoJob {
     }
 
     async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
-        // Download repository (logs written in real-time)
-        let repo_dir = self.download_repository(&context).await?;
+        // Download repository (logs written in real-time).
+        //
+        // The error is written into the deploy log before it propagates.
+        // Without this the job is marked failed but the log simply stops after
+        // "Cloning ...", so a private repo, bad credentials, a missing branch
+        // or an unreachable host are all indistinguishable to the operator —
+        // and self-hosted users have no other place to look. Every failure
+        // reason below already carries context; it just never reached them.
+        let repo_dir = match self.download_repository(&context).await {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.log(&context, format!("ERROR: {}", e)).await?;
+                return Err(e);
+            }
+        };
 
         // Set job outputs
         context.set_output(
@@ -563,7 +575,13 @@ impl WorkflowTask for DownloadRepoJob {
         context.set_artifact(&self.job_id, "source_code", repo_dir.clone());
 
         // Update working directory in context
-        context.work_dir = Some(repo_dir.parent().unwrap().to_path_buf());
+        let work_dir = repo_dir.parent().ok_or_else(|| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Repository path '{}' has no parent directory",
+                repo_dir.display()
+            ))
+        })?;
+        context.work_dir = Some(work_dir.to_path_buf());
 
         Ok(JobResult::success(context))
     }
@@ -609,6 +627,10 @@ impl WorkflowTask for DownloadRepoJob {
             }
         }
         Ok(())
+    }
+
+    fn cleanup_after_workflow(&self) -> bool {
+        true
     }
 }
 
@@ -903,8 +925,8 @@ mod tests {
 
         let context = crate::test_utils::create_test_context("test".to_string(), 1, 1, 1);
 
-        // Tag should have highest priority
-        assert_eq!(job.get_checkout_ref(&context), "v1.0.0");
+        // The verified commit must win over the mutable tag.
+        assert_eq!(job.get_checkout_ref(&context), "abc123");
 
         // Test without tag
         let job_no_tag = DownloadRepoJob::new(
@@ -917,7 +939,7 @@ mod tests {
         .with_branch_ref("branch".to_string())
         .with_commit_sha("abc123".to_string());
 
-        // Commit should have second priority
+        // Commit should also win over a branch when no tag is present.
         assert_eq!(job_no_tag.get_checkout_ref(&context), "abc123");
     }
 
@@ -973,9 +995,9 @@ mod tests {
         assert_eq!(job.tag_ref, Some("v2.0.0".to_string()));
         assert_eq!(job.commit_sha, Some("def456".to_string()));
 
-        // Verify tag has highest priority
+        // Preserve tag metadata while checking out the immutable commit.
         let context = crate::test_utils::create_test_context("test".to_string(), 1, 1, 1);
-        assert_eq!(job.get_checkout_ref(&context), "v2.0.0");
+        assert_eq!(job.get_checkout_ref(&context), "def456");
     }
 
     #[test]
