@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{check_permission, Permission, RequireAuth};
 use temps_core::external_plugin::{NavEntry, NavSection, PluginManifest, UiManifest, UiRoute};
 use temps_core::problemdetails::Problem;
 use utoipa::{OpenApi as OpenApiTrait, ToSchema};
@@ -38,7 +38,7 @@ pub struct ExternalPluginsAppState {
 async fn list_external_plugins(
     RequireAuth(_auth): RequireAuth,
     State(state): State<ExternalPluginsAppState>,
-) -> Json<Vec<PluginManifest>> {
+) -> impl IntoResponse {
     Json(state.service.manifests().await)
 }
 
@@ -74,9 +74,8 @@ pub struct ReloadResponse {
 async fn reload_plugins(
     RequireAuth(auth): RequireAuth,
     State(state): State<ExternalPluginsAppState>,
-) -> Result<(StatusCode, Json<ReloadResponse>), Problem> {
-    permission_guard!(auth, SystemAdmin);
-
+) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
+    check_permission(&auth, &Permission::SystemAdmin)?;
     tracing::info!("Admin triggered plugin reload");
 
     let manifests = state.service.reload_plugins().await;

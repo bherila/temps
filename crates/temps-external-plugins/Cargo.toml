@@ -12,17 +12,19 @@ temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
 temps-entities = { path = "../temps-entities" }
-temps-presets = { path = "../temps-presets" }
+temps-auth = { path = "../temps-auth" }
 sea-orm = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
-http-body-util = { workspace = true }
+hex = { workspace = true }
+hmac = "0.12"
 hyper = { workspace = true }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = "0.30"
 tower = { workspace = true }
