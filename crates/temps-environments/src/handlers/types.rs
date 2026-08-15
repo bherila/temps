@@ -53,7 +53,7 @@ pub struct CreateEnvironmentVariableRequest {
     pub key: String,
     pub value: String,
     pub environment_ids: Vec<i32>,
-    /// Include this environment variable in preview environments (default: true)
+    /// Include this environment variable in preview environments (default: false)
     #[serde(default = "default_include_in_preview")]
     pub include_in_preview: bool,
     /// When true the variable is treated as write-only: never returned in
@@ -84,7 +84,7 @@ pub struct UpdateEnvironmentVariableRequest {
 }
 
 fn default_include_in_preview() -> bool {
-    true
+    false
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -447,7 +447,7 @@ pub struct CreateProjectSecretRequest {
     pub value: String,
     #[serde(default)]
     pub environment_ids: Vec<i32>,
-    /// Include this secret in preview environments.
+    /// Include this secret in preview environments (default: false).
     #[serde(default = "default_include_in_preview")]
     pub include_in_preview: bool,
 }
@@ -547,5 +547,24 @@ mod tests {
         let disabled: UpdateEnvironmentSettingsRequest =
             serde_json::from_str(r#"{"attack_mode":false}"#).unwrap();
         assert_eq!(disabled.attack_mode, Some(Some(false)));
+    }
+
+    #[test]
+    fn env_var_preview_inclusion_defaults_to_false() {
+        let request: CreateEnvironmentVariableRequest = serde_json::from_str(
+            r#"{"key":"DATABASE_URL","value":"postgres://prod","environment_ids":[1]}"#,
+        )
+        .unwrap();
+
+        assert!(!request.include_in_preview);
+    }
+
+    #[test]
+    fn project_secret_preview_inclusion_defaults_to_false() {
+        let request: CreateProjectSecretRequest =
+            serde_json::from_str(r#"{"key":"API_TOKEN","value":"secret","environment_ids":[1]}"#)
+                .unwrap();
+
+        assert!(!request.include_in_preview);
     }
 }

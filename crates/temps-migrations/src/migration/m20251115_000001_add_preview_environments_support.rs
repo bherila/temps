@@ -80,7 +80,7 @@ impl MigrationTrait for Migration {
                         ColumnDef::new(EnvVars::IncludeInPreview)
                             .boolean()
                             .not_null()
-                            .default(true), // Default to true - include all existing vars in preview
+                            .default(false), // Default to false - existing vars must opt in to preview
                     )
                     .to_owned(),
             )

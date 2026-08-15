@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Preview environment secret opt-in defaults**: Existing and newly created environment variables and project secrets now default `include_in_preview` to `false`, so branch preview environments only receive values that operators explicitly marked safe for preview deployments.
+
 
 
 ## [0.1.0-beta.35] - 2026-06-19
