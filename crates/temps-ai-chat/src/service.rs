@@ -13,7 +13,7 @@ use sea_orm::{
 };
 
 use temps_ai::{AiService, ChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest, ToolCall};
-use temps_auth::context::AuthContext;
+use temps_auth::{context::AuthContext, Permission};
 use temps_entities::{ai_conversations, ai_messages};
 
 use temps_ai_api_tools::{ApiCallScope, WriteApiToolsHandle, WritePrepareOutcome};
@@ -527,18 +527,20 @@ impl ConversationService {
                     .await,
             );
         }
-        // Merge Git-repository exploration tools from the sentinel provider.
-        // Gated only by the project having a Git connection (the provider
-        // returns an empty vec when not connected). Available in every context
-        // (project, alert, deployment, error-group, …) so the model can always
-        // explore the source tree when a repo is connected, regardless of which
-        // context_type seeded the chat.
-        if let Some(repo_tools_provider) = self.providers.get("__repo_tools__") {
-            tools.extend(
-                repo_tools_provider
-                    .tools(conv.project_id, &conv.context_id)
-                    .await,
-            );
+        // Merge Git-repository exploration tools from the sentinel provider
+        // only for callers who already hold the repository-read permission.
+        // These tools fetch contents through stored Git credentials and send
+        // results through the AI provider, so ProjectsRead/ProjectsWrite alone
+        // must not expand into source-code access.
+        let repo_tools_allowed = auth.has_permission(&Permission::GitRepositoriesRead);
+        if repo_tools_allowed {
+            if let Some(repo_tools_provider) = self.providers.get("__repo_tools__") {
+                tools.extend(
+                    repo_tools_provider
+                        .tools(conv.project_id, &conv.context_id)
+                        .await,
+                );
+            }
         }
 
         // Write tool: offered only when write support is wired AND the project
@@ -783,7 +785,11 @@ impl ConversationService {
         let ai = self.ai.clone();
         let db = self.db.clone();
         let api_tools = self.providers.get("__api_tools__").cloned();
-        let repo_tools = self.providers.get("__repo_tools__").cloned();
+        let repo_tools = if auth.has_permission(&Permission::GitRepositoriesRead) {
+            self.providers.get("__repo_tools__").cloned()
+        } else {
+            None
+        };
         let conv_id = conv.id;
         let project_id = conv.project_id;
         let context_type = conv.context_type.clone();
@@ -985,14 +991,28 @@ impl ConversationService {
                                 | "list_repo_tags"
                         ) {
                             // Route Git-repo exploration tools to the sentinel
-                            // provider rather than the context provider, so the
-                            // model can explore the source tree in any context.
-                            if let Some(rt) = &repo_tools {
-                                rt.execute_tool(project_id, &context_id, &tc.name, &tc.arguments)
+                            // provider only when the caller has GitRepositoriesRead.
+                            // The tool should not have been advertised otherwise,
+                            // but keep this execution-time guard as defense in depth
+                            // in case a model emits an unadvertised tool call.
+                            if auth.has_permission(&Permission::GitRepositoriesRead) {
+                                if let Some(rt) = &repo_tools {
+                                    rt.execute_tool(
+                                        project_id,
+                                        &context_id,
+                                        &tc.name,
+                                        &tc.arguments,
+                                    )
                                     .await
+                                } else {
+                                    format!(
+                                        "Tool '{}' is not available (repo tools provider absent).",
+                                        tc.name
+                                    )
+                                }
                             } else {
                                 format!(
-                                    "Tool '{}' is not available (repo tools provider absent).",
+                                    "Tool '{}' requires the git_repositories:read permission.",
                                     tc.name
                                 )
                             }
