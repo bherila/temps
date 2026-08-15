@@ -1075,9 +1075,12 @@ impl DeployImageJob {
                 // on one machine, which is the opposite of what was asked for,
                 // and reporting it as success would hide that.
                 Err(
-                    e @ crate::services::node_service::NodeError::InsufficientCompatibleNodes {
+                    e @ (crate::services::node_service::NodeError::InsufficientCompatibleNodes {
                         ..
-                    },
+                    }
+                    | crate::services::node_service::NodeError::PlacementConstraintsUnsatisfied {
+                        ..
+                    }),
                 ) => {
                     let msg = format!("Cannot schedule this deployment: {}", e);
                     self.log(context, format!("ERROR: {}", msg)).await?;

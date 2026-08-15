@@ -550,6 +550,21 @@ impl NodeScheduler {
         // permanent.
         let architecture_exclusions: Vec<&NodeExclusion> =
             exclusions.iter().filter(|e| e.excluded).collect();
+        let has_node_constraints = target_node_ids.is_some()
+            || labels
+                .and_then(|selector| selector.as_object())
+                .map(|selector_map| !selector_map.is_empty())
+                .unwrap_or(false);
+        if has_node_constraints && eligible_nodes.is_empty() && !architecture_exclusions.is_empty()
+        {
+            return Err(NodeError::PlacementConstraintsUnsatisfied {
+                excluded: architecture_exclusions
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            });
+        }
         let compatible_slots = usize::from(local_compatible) + eligible_nodes.len();
         if anti_affinity
             && !architecture_exclusions.is_empty()
@@ -1150,6 +1165,67 @@ mod tests {
             }
             other => panic!("expected InsufficientCompatibleNodes, got {other:?}"),
         }
+    }
+
+    /// Target node constraints are placement isolation, not preferences. If a
+    /// degraded multi-arch build omits the target worker's platform, the
+    /// scheduler must fail instead of using the control plane just because the
+    /// remaining primary image can run there.
+    #[tokio::test]
+    async fn test_target_node_excluded_by_architecture_does_not_fallback_to_local() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-arm", "linux/arm64")],
+            "linux/amd64",
+        );
+
+        let err = scheduler
+            .schedule_replicas_excluding(
+                1,
+                None,
+                Some(&[1]),
+                false,
+                &[],
+                &["linux/amd64".to_string()],
+            )
+            .await
+            .unwrap_err();
+
+        match err {
+            NodeError::PlacementConstraintsUnsatisfied { ref excluded } => {
+                assert!(excluded.contains("worker-arm"), "got: {excluded}");
+                assert!(excluded.contains("linux/arm64"), "got: {excluded}");
+                assert!(excluded.contains("linux/amd64"), "got: {excluded}");
+            }
+            other => panic!("expected PlacementConstraintsUnsatisfied, got {other:?}"),
+        }
+    }
+
+    /// The same protection applies to label-only placement constraints. A
+    /// selected worker that loses its image platform during degraded build must
+    /// not cause local control-plane placement.
+    #[tokio::test]
+    async fn test_target_label_excluded_by_architecture_does_not_fallback_to_local() {
+        let mut arm = make_node_with_arch(1, "worker-arm", "linux/arm64");
+        arm.labels = serde_json::json!({"tier": "isolated"});
+        let scheduler = scheduler_with_nodes(vec![arm], "linux/amd64");
+        let selector = serde_json::json!({"tier": "isolated"});
+
+        let err = scheduler
+            .schedule_replicas_excluding(
+                1,
+                Some(&selector),
+                None,
+                false,
+                &[],
+                &["linux/amd64".to_string()],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NodeError::PlacementConstraintsUnsatisfied { .. }
+        ));
     }
 
     /// A cluster that simply has fewer nodes than replicas keeps the
