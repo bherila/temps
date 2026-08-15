@@ -789,7 +789,7 @@ impl Default for MultiNodeSettings {
 pub struct PreviewGatewaySettings {
     /// Docker image reference for the gateway. Pinned per Temps release.
     /// Operators can override this to test a custom build.
-    #[schema(example = "ghcr.io/gotempsh/temps-preview-gateway:latest")]
+    #[schema(example = "ghcr.io/gotempsh/temps-preview-gateway:0.1.0")]
     pub image: String,
     /// Host port to publish the gateway on (always bound to 127.0.0.1).
     /// Pingora forwards `ws-*` traffic to this port after authenticating.
@@ -815,7 +815,7 @@ pub struct PreviewGatewaySettings {
 impl Default for PreviewGatewaySettings {
     fn default() -> Self {
         Self {
-            image: "ghcr.io/gotempsh/temps-preview-gateway:latest".to_string(),
+            image: "ghcr.io/gotempsh/temps-preview-gateway:0.1.0".to_string(),
             host_port: 8090,
             auto_upgrade: true,
             shared_secret: String::new(),

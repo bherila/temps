@@ -37,7 +37,7 @@ use temps_core::PreviewGatewaySettings;
 use tracing::{debug, info, warn};
 
 /// Pinned image reference. Bumped per release. Never `:latest`.
-pub const PREVIEW_GATEWAY_IMAGE: &str = "ghcr.io/gotempsh/temps-preview-gateway:latest";
+pub const PREVIEW_GATEWAY_IMAGE: &str = "ghcr.io/gotempsh/temps-preview-gateway:0.1.0";
 
 /// Filename inside `TEMPS_DATA_DIR` that holds the gateway shared secret.
 /// The file is created with 0600 perms on first boot if missing; the same
@@ -664,7 +664,7 @@ pub struct GatewayStatus {
     /// | "stopped" | "missing". UI should prefer this over `running`.
     pub health: String,
     /// Image reference the container was created with (e.g.
-    /// `ghcr.io/gotempsh/temps-preview-gateway:latest`).
+    /// `ghcr.io/gotempsh/temps-preview-gateway:0.1.0`).
     pub image: Option<String>,
     /// Image digest if available (e.g. `sha256:…`).
     pub image_digest: Option<String>,
