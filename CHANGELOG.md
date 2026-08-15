@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **providers:** Generate random root credentials for managed S3 `backend=minio` services when callers omit `access_key` or `secret_key`, preventing predictable `minioadmin` credentials on the shared Temps Docker network.
 - **No-op visitor deduplication migration**: `m20260705_000001_add_visitor_unique_index` now skips bulk foreign-key rewrites when no duplicate `(visitor_id, project_id)` pairs exist, preventing TimescaleDB from eagerly decompressing unrelated hypertable chunks and exceeding `timescaledb.max_tuples_decompressed_per_dml_transaction` during upgrades.
 
 ## [0.1.0-beta.46] - 2026-07-12
