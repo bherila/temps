@@ -33,6 +33,18 @@ Reply with ONLY the title: 3–6 words, Title Case, no quotes, no surrounding pu
 /// Maximum stored title length (chars). Long titles are truncated, not rejected.
 const TITLE_MAX_CHARS: usize = 60;
 
+/// Return the client-visible representation of a tool result. Raw tool outputs can
+/// contain repository files or other privileged data fetched with server-side
+/// credentials, so only the model receives the full result. The live stream and
+/// persisted message metadata get this status string instead.
+fn public_tool_result(name: &str, result: &str) -> String {
+    if name == TEMPS_WRITE_TOOL_NAME {
+        return result.to_string();
+    }
+
+    "Tool completed; detailed result is withheld from the chat transcript.".to_string()
+}
+
 /// Normalise a model-generated title: take the first non-empty line, strip
 /// wrapping quotes and trailing punctuation, collapse whitespace, and cap the
 /// length. Reasoning models sometimes prepend stray lines, so we defensively
@@ -105,8 +117,9 @@ async fn generate_and_store_title(
 /// `Token`s; the agentic tool loop additionally surfaces each tool invocation
 /// (`ToolCall`, emitted just before the tool runs) and its outcome
 /// (`ToolResult`, emitted right after), so the client can render tool activity
-/// in real time. Only the final assistant text is persisted; tool events are
-/// live-only.
+/// in real time. Tool results exposed to clients are redacted status strings;
+/// only the model receives raw tool output. Only the final assistant text is
+/// persisted; tool events are live-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatStreamEvent {
     /// A chunk of assistant prose to append to the message content.
@@ -118,7 +131,7 @@ pub enum ChatStreamEvent {
         name: String,
         arguments: String,
     },
-    /// A tool finished; `content` is the string it returned.
+    /// A tool finished; `content` is a client-safe status string, not raw output.
     ToolResult {
         id: String,
         name: String,
@@ -1005,12 +1018,15 @@ impl ConversationService {
                         seen_calls.insert(call_key, r.clone());
                         r
                     };
-                    // Surface the result right after — live.
+                    // Surface only a safe status string to clients. The raw result
+                    // remains in the model context for the next round, but it may
+                    // contain repository files fetched with server-side credentials.
+                    let public_result = public_tool_result(&tc.name, &result);
                     if tx
                         .send(Ok(ChatStreamEvent::ToolResult {
                             id: tc.id.clone(),
                             name: tc.name.clone(),
-                            content: result.clone(),
+                            content: public_result.clone(),
                         }))
                         .is_err()
                     {
@@ -1020,7 +1036,7 @@ impl ConversationService {
                         "id": tc.id.clone(),
                         "name": tc.name.clone(),
                         "arguments": tc.arguments.clone(),
-                        "result": result.clone(),
+                        "result": public_result,
                     });
                     tools_meta.push(tool_part.clone());
                     parts.push(serde_json::json!({ "type": "tool", "tool": tool_part }));
@@ -1569,6 +1585,18 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn public_tool_result_redacts_non_write_tools() {
+        assert_eq!(
+            public_tool_result("read_repo_file", "SECRET_TOKEN=abc123"),
+            "Tool completed; detailed result is withheld from the chat transcript."
+        );
+        assert_eq!(
+            public_tool_result(TEMPS_WRITE_TOOL_NAME, r#"{"status":"proposed"}"#),
+            r#"{"status":"proposed"}"#
+        );
+    }
+
     // (a) a round calls a tool, the next round answers in prose -> the tool is
     // executed (ToolCall -> ToolResult, live) and the prose streams as the answer.
     #[tokio::test]
@@ -1613,7 +1641,9 @@ mod tests {
                 ChatStreamEvent::ToolResult {
                     id: "c1".to_string(),
                     name: "echo".to_string(),
-                    content: "tool result".to_string(),
+                    content:
+                        "Tool completed; detailed result is withheld from the chat transcript."
+                            .to_string(),
                 },
                 ChatStreamEvent::Token("final ".to_string()),
                 ChatStreamEvent::Token("answer".to_string()),
