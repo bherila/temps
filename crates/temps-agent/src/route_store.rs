@@ -24,7 +24,8 @@
 //! the store is empty and the proxy returns 503 until the first sync
 //! round finishes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -114,6 +115,31 @@ impl RouteStore {
         self.inner.read().get(&key).cloned()
     }
 
+    /// Return the set of projects whose deployment backends include
+    /// `ip`. The internal proxy uses this as the request-side identity
+    /// signal: app containers reach the bridge proxy from their overlay
+    /// IP, and route snapshots already know which project owns each
+    /// deployment backend. Unknown source IPs intentionally map to an
+    /// empty set so they cannot use the proxy as a cross-project
+    /// forwarder.
+    pub fn project_ids_for_backend_ip(&self, ip: IpAddr) -> HashSet<i32> {
+        let routes = self.inner.read();
+        let mut project_ids = HashSet::new();
+        for route in routes.values() {
+            let Some(project_id) = route.project_id else {
+                continue;
+            };
+            if route
+                .backends
+                .iter()
+                .any(|backend| backend_ip(&backend.address) == Some(ip))
+            {
+                project_ids.insert(project_id);
+            }
+        }
+        project_ids
+    }
+
     pub fn current_generation(&self) -> u64 {
         *self.generation.read()
     }
@@ -183,6 +209,13 @@ impl RouteStore {
     }
 }
 
+fn backend_ip(address: &str) -> Option<IpAddr> {
+    if let Ok(socket) = address.parse::<SocketAddr>() {
+        return Some(socket.ip());
+    }
+    address.parse::<IpAddr>().ok()
+}
+
 pub type SharedRouteStore = Arc<RouteStore>;
 
 #[cfg(test)]
@@ -191,6 +224,10 @@ mod tests {
     use tempfile::TempDir;
 
     fn entry(host: &str, addr: &str) -> RouteEntry {
+        entry_with_project(host, addr, Some(1))
+    }
+
+    fn entry_with_project(host: &str, addr: &str, project_id: Option<i32>) -> RouteEntry {
         RouteEntry {
             host: host.into(),
             backends: vec![RouteBackend {
@@ -199,7 +236,7 @@ mod tests {
                 container_name: None,
             }],
             deployment_id: Some(1),
-            project_id: Some(1),
+            project_id,
             environment_id: Some(1),
         }
     }
@@ -228,6 +265,28 @@ mod tests {
         s2.load_from_disk();
         assert_eq!(s2.current_generation(), 7);
         assert!(s2.lookup("a.temps.local").is_some());
+    }
+
+    #[test]
+    fn project_ids_for_backend_ip_matches_socket_addresses() {
+        let dir = TempDir::new().unwrap();
+        let store = RouteStore::new(dir.path().join("routes.json"));
+        store.apply_snapshot(
+            1,
+            vec![
+                entry_with_project("prod.alpha.temps.local", "172.20.1.10:3000", Some(10)),
+                entry_with_project("prod.beta.temps.local", "172.20.1.10:8080", Some(20)),
+                entry_with_project("prod.gamma.temps.local", "172.20.1.11:8080", Some(30)),
+            ],
+        );
+
+        let projects = store.project_ids_for_backend_ip("172.20.1.10".parse().unwrap());
+        assert!(projects.contains(&10));
+        assert!(projects.contains(&20));
+        assert!(!projects.contains(&30));
+        assert!(store
+            .project_ids_for_backend_ip("172.20.1.99".parse().unwrap())
+            .is_empty());
     }
 
     #[test]
