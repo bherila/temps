@@ -608,6 +608,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **tls:** On-demand certs for the console host + sslip.io auto-enable ([#147](https://github.com/gotempsh/temps/issues/147))
+### Security
+- **PostgreSQL data browser query hardening**: `temps-query-postgres` no longer accepts raw SQL `filters.where` fragments from `/external-services/{service_id}/query/.../data`, validates sort columns against discovered table metadata, escapes table identifiers, and caps result limits at 100 rows so read-only data browsing cannot inject PostgreSQL expressions or request unbounded result sets.
+
 
 ## [0.1.0-beta.35] - 2026-06-19
 
