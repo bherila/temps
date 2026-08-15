@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Environment subdomain renames now enforce global uniqueness**: `PATCH /projects/{project_id}/environments/{env_id}/subdomain` now rejects collisions with active environments in any project, preventing cross-project preview-host route hijacking or denial of service because preview hostnames are routed globally as `<subdomain>.<preview_domain>`.
+
 
 
 ## [0.1.0-beta.35] - 2026-06-19
