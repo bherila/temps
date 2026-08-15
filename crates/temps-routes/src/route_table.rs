@@ -73,6 +73,20 @@ fn build_backend_entry(
     }
 }
 
+/// Return true only when a configured compose public port selects the container's
+/// actual declared container port. The route table must never rewrite the host
+/// or private-node backend address to an arbitrary user-supplied port; it should
+/// route only to the reachable endpoint already recorded for the matching
+/// deployment container.
+fn compose_public_port_matches_container(
+    container: &temps_entities::deployment_containers::Model,
+    service: &str,
+    port: u16,
+) -> bool {
+    container.service_name.as_deref() == Some(service)
+        && container.container_port == i32::from(port)
+}
+
 /// Build a backend address for a container based on deployment mode and node location
 ///
 /// For local containers (node_private_address is None):
@@ -999,10 +1013,7 @@ impl CachedPeerTable {
                         // 1. The first public port's service (if public_ports configured)
                         // 2. The first service (fallback for non-compose or no public_ports)
                         let is_compose = containers.iter().any(|c| c.service_name.is_some());
-                        let (route_containers, override_port): (
-                            Vec<&deployment_containers::Model>,
-                            Option<u16>,
-                        ) = if is_compose {
+                        let route_containers: Vec<&deployment_containers::Model> = if is_compose {
                             // Check for public_ports config
                             let first_public = project
                                 .and_then(|p| p.preset_config.as_ref())
@@ -1021,7 +1032,13 @@ impl CachedPeerTable {
                                 Some(pp) => {
                                     let cs: Vec<_> = containers
                                         .iter()
-                                        .filter(|c| c.service_name.as_deref() == Some(&pp.service))
+                                        .filter(|c| {
+                                            compose_public_port_matches_container(
+                                                c,
+                                                &pp.service,
+                                                pp.port,
+                                            )
+                                        })
                                         .collect();
                                     if cs.is_empty() {
                                         // Fallback to first service
@@ -1030,20 +1047,15 @@ impl CachedPeerTable {
                                             .filter_map(|c| c.service_name.as_ref())
                                             .next()
                                             .cloned();
-                                        (
-                                            match first_svc {
-                                                Some(ref svc) => containers
-                                                    .iter()
-                                                    .filter(|c| {
-                                                        c.service_name.as_ref() == Some(svc)
-                                                    })
-                                                    .collect(),
-                                                None => containers.iter().collect(),
-                                            },
-                                            None,
-                                        )
+                                        match first_svc {
+                                            Some(ref svc) => containers
+                                                .iter()
+                                                .filter(|c| c.service_name.as_ref() == Some(svc))
+                                                .collect(),
+                                            None => containers.iter().collect(),
+                                        }
                                     } else {
-                                        (cs, Some(pp.port))
+                                        cs
                                     }
                                 }
                                 None => {
@@ -1053,20 +1065,17 @@ impl CachedPeerTable {
                                         .filter_map(|c| c.service_name.as_ref())
                                         .next()
                                         .cloned();
-                                    (
-                                        match first_svc {
-                                            Some(ref svc) => containers
-                                                .iter()
-                                                .filter(|c| c.service_name.as_ref() == Some(svc))
-                                                .collect(),
-                                            None => containers.iter().collect(),
-                                        },
-                                        None,
-                                    )
+                                    match first_svc {
+                                        Some(ref svc) => containers
+                                            .iter()
+                                            .filter(|c| c.service_name.as_ref() == Some(svc))
+                                            .collect(),
+                                        None => containers.iter().collect(),
+                                    }
                                 }
                             }
                         } else {
-                            (containers.iter().collect(), None)
+                            containers.iter().collect()
                         };
 
                         let mut backend_entries = Vec::with_capacity(route_containers.len());
@@ -1077,15 +1086,7 @@ impl CachedPeerTable {
                                 self.db.as_ref(),
                             )
                             .await;
-                            let mut entry = build_backend_entry(c, node_addr.as_deref());
-                            // Override port if a public port is configured
-                            if let Some(port) = override_port {
-                                if let Some(colon_pos) = entry.address.rfind(':') {
-                                    entry.address =
-                                        format!("{}{}", &entry.address[..=colon_pos], port);
-                                }
-                            }
-                            backend_entries.push(entry);
+                            backend_entries.push(build_backend_entry(c, node_addr.as_deref()));
                         }
                         BackendType::Upstream {
                             backends: backend_entries,
@@ -1246,23 +1247,30 @@ impl CachedPeerTable {
                                     Some(c) => c,
                                     None => continue,
                                 };
+                                let svc_containers: Vec<_> = svc_containers
+                                    .iter()
+                                    .copied()
+                                    .filter(|c| {
+                                        compose_public_port_matches_container(
+                                            c,
+                                            pub_service,
+                                            *pub_port,
+                                        )
+                                    })
+                                    .collect();
+                                if svc_containers.is_empty() {
+                                    continue;
+                                }
 
                                 let mut svc_backends = Vec::with_capacity(svc_containers.len());
                                 for c in svc_containers {
-                                    // Override container_port with the public port for routing
                                     let node_addr = resolve_node_private_address(
                                         c.node_id,
                                         &mut nodes_cache,
                                         self.db.as_ref(),
                                     )
                                     .await;
-                                    let mut entry = build_backend_entry(c, node_addr.as_deref());
-                                    // Replace port in address with the public port
-                                    if let Some(colon_pos) = entry.address.rfind(':') {
-                                        entry.address =
-                                            format!("{}{}", &entry.address[..=colon_pos], pub_port);
-                                    }
-                                    svc_backends.push(entry);
+                                    svc_backends.push(build_backend_entry(c, node_addr.as_deref()));
                                 }
 
                                 let svc_backend = BackendType::Upstream {
@@ -1765,6 +1773,37 @@ mod tests {
         Arc::new(NoOpQueue)
     }
 
+    fn test_container(
+        service_name: Option<&str>,
+        container_port: i32,
+        host_port: Option<i32>,
+    ) -> temps_entities::deployment_containers::Model {
+        let now = chrono::Utc::now();
+        temps_entities::deployment_containers::Model {
+            id: 1,
+            deployment_id: 1,
+            container_id: "container-1".to_string(),
+            container_name: "web-1".to_string(),
+            container_port,
+            host_port,
+            image_name: None,
+            status: None,
+            service_name: service_name.map(str::to_string),
+            created_at: now,
+            deployed_at: now,
+            ready_at: None,
+            deleted_at: None,
+            node_id: None,
+            exit_code: None,
+            exit_reason: None,
+            oom_killed: None,
+            error_message: None,
+            finished_at: None,
+            started_at: None,
+            cpu_limit_cores: None,
+        }
+    }
+
     #[test]
     fn test_route_info_creation() {
         let route = RouteInfo {
@@ -2076,6 +2115,34 @@ mod tests {
 
         // Dropping without starting should not panic
         drop(listener);
+    }
+
+    #[test]
+    fn test_compose_public_port_matches_only_declared_service_port() {
+        let container = test_container(Some("web"), 3000, Some(49153));
+
+        assert!(compose_public_port_matches_container(
+            &container, "web", 3000
+        ));
+        assert!(!compose_public_port_matches_container(
+            &container, "web", 2375
+        ));
+        assert!(!compose_public_port_matches_container(
+            &container, "admin", 3000
+        ));
+    }
+
+    #[test]
+    fn test_compose_public_port_route_uses_recorded_reachable_endpoint() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("DEPLOYMENT_MODE", "baremetal") };
+        let container = test_container(Some("web"), 3000, Some(49153));
+
+        let entry = build_backend_entry(&container, None);
+
+        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+        assert_eq!(entry.address, "127.0.0.1:49153");
+        assert_ne!(entry.address, "127.0.0.1:3000");
     }
 
     #[test]

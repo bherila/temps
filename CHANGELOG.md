@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Docker Compose public port routing is constrained to deployed container ports**: `temps-routes` now ignores `preset_config.publicPorts` entries unless the requested service and port match an actual `deployment_containers.container_port`, preventing a project user from repointing public compose subdomains at arbitrary localhost or worker-private ports.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
