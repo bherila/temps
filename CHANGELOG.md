@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Scoped CAS static-asset fallback:** The proxy now restricts `static_asset_cache` CAS lookups to the current `project_id`, `environment_id`, and `deployment_id`, and verifies `/_temps/assets/{deployment_slug}/...` URLs against the routed deployment so staging assets cannot override or leak through production hosts.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
