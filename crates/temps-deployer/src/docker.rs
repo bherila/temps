@@ -278,8 +278,9 @@ impl DockerRuntime {
     /// rather than `/tmp` so the bind mount survives a host reboot —
     /// `/tmp` is tmpfs on most Linux distros and gets wiped, leaving
     /// containers with empty `/run/secrets` until the next redeploy.
-    fn secrets_host_dir(&self, container_name: &str) -> PathBuf {
-        self.secrets_root.join(container_name)
+    fn secrets_host_dir(&self, container_name: &str) -> std::io::Result<PathBuf> {
+        validate_secret_dir_name(container_name)?;
+        Ok(self.secrets_root.join(container_name))
     }
 
     /// Resolves the numeric (uid, gid) that the container will run as,
@@ -1577,7 +1578,12 @@ impl ContainerDeployer for DockerRuntime {
         let secrets_bind = if request.secrets.is_empty() {
             None
         } else {
-            let host_dir = self.secrets_host_dir(&request.container_name);
+            let host_dir = self
+                .secrets_host_dir(&request.container_name)
+                .map_err(|e| DeployerError::SecretMountFailed {
+                    container_name: request.container_name.clone(),
+                    reason: format!("derive host dir: {}", e),
+                })?;
             // Resolve the image's USER so we can chown the secret files to
             // the uid that the container will actually run as — otherwise
             // mode-0400 root-owned files are unreadable by nonroot images.
@@ -1814,7 +1820,13 @@ impl ContainerDeployer for DockerRuntime {
             .map_err(|e| DeployerError::Other(format!("Failed to remove container: {}", e)))?;
 
         if let Some(name) = container_name {
-            let dir = self.secrets_host_dir(&name);
+            let Ok(dir) = self.secrets_host_dir(&name) else {
+                warn!(
+                    "Skipping secrets host dir cleanup for invalid container name {}",
+                    name
+                );
+                return Ok(());
+            };
             if dir.exists() {
                 if let Err(e) = std::fs::remove_dir_all(&dir) {
                     warn!(
@@ -2154,6 +2166,26 @@ fn default_secrets_root() -> PathBuf {
     base.join("secrets")
 }
 
+fn validate_secret_dir_name(name: &str) -> std::io::Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "invalid container name '{}': must be a single path component",
+                name
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Writes secrets as files into a per-container host directory for Docker
 /// to bind-mount into `/run/secrets`. The directory is created (or recreated)
 /// fresh on each call so stale entries from a previous deployment of the same
@@ -2468,6 +2500,24 @@ mod docker_tests {
         if let Some(v) = prev_data {
             std::env::set_var("TEMPS_DATA_DIR", v);
         }
+    }
+
+    #[test]
+    fn test_validate_secret_dir_name_rejects_path_traversal_components() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../escaped/deployment-1",
+            "a/b",
+            "a\\b",
+            "with\0null",
+        ] {
+            let err = validate_secret_dir_name(bad).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "name={}", bad);
+        }
+
+        validate_secret_dir_name("project-1").unwrap();
     }
 
     #[test]

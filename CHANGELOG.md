@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Docker secret path containment**: Remote image deployments now reject container names that are not a single path component before materializing secrets, preventing traversal through project-derived deployment slugs from writing secret files outside `$TEMPS_DATA_DIR/secrets`.
+
 
 
 ## [0.1.0-beta.35] - 2026-06-19
