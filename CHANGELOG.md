@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Scoped git credentials no longer expose stored PAT/OAuth tokens**: `temps-git`
+  now refuses workspace credential requests for PAT/OAuth-backed connections
+  instead of returning the encrypted provider token as a git password, preserving
+  the documented single-repo, single-operation credential boundary.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
