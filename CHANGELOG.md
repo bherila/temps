@@ -608,6 +608,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **tls:** On-demand certs for the console host + sslip.io auto-enable ([#147](https://github.com/gotempsh/temps/issues/147))
+### Security
+- **Webhook notification SSRF hardening**: Webhook notification providers now
+  validate `config.url` with `temps-core` external URL checks during API
+  create/update and provider execution, reject internal/metadata destinations,
+  and disable HTTP redirects so a public endpoint cannot bounce delivery or
+  health-check requests into private network resources.
 
 ## [0.1.0-beta.35] - 2026-06-19
 

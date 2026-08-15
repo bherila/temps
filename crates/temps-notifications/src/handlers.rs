@@ -16,6 +16,7 @@ use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
+use temps_core::url_validation::{validate_domain_async, validate_external_url};
 use temps_core::{AuditContext, AuditLogger, AuditOperation, RequestMetadata};
 use tracing::{error, info};
 use utoipa::OpenApi;
@@ -41,6 +42,29 @@ impl NotificationState {
             audit_service,
         }
     }
+}
+
+async fn validate_webhook_url_for_request(url: &str) -> Result<(), Problem> {
+    let parsed = validate_external_url(url).map_err(|e| {
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid webhook URL")
+            .detail(format!("Webhook URL is not an allowed external URL: {}", e))
+            .build()
+    })?;
+
+    if let Some(domain) = parsed
+        .host_str()
+        .filter(|host| host.parse::<std::net::IpAddr>().is_err())
+    {
+        validate_domain_async(domain).await.map_err(|e| {
+            ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Invalid webhook URL")
+                .detail(format!("Webhook URL is not an allowed external URL: {}", e))
+                .build()
+        })?;
+    }
+
+    Ok(())
 }
 // ── Audit types ──────────────────────────────────────────────────────────────
 
@@ -1216,13 +1240,7 @@ async fn create_webhook_provider(
     permission_guard!(auth, NotificationProvidersCreate);
     info!("Creating Webhook notification provider {}", request.name);
 
-    // Validate URL format
-    if !request.config.url.starts_with("http://") && !request.config.url.starts_with("https://") {
-        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("Invalid webhook URL")
-            .detail("Webhook URL must start with http:// or https://")
-            .build());
-    }
+    validate_webhook_url_for_request(&request.config.url).await?;
 
     // Validate HTTP method
     let method = request.config.method.to_uppercase();
@@ -1309,16 +1327,7 @@ async fn update_webhook_provider(
     permission_guard!(auth, NotificationProvidersWrite);
     info!("Updating Webhook notification provider {}", id);
 
-    // Validate URL format
-    if request.config.url != "***"
-        && !request.config.url.starts_with("http://")
-        && !request.config.url.starts_with("https://")
-    {
-        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("Invalid webhook URL")
-            .detail("Webhook URL must start with http:// or https://")
-            .build());
-    }
+    validate_webhook_url_for_request(&request.config.url).await?;
 
     // Validate HTTP method
     let method = request.config.method.to_uppercase();
