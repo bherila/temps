@@ -524,6 +524,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **ai-chat:** Require `GitRepositoriesRead` before AI repo tools are advertised or executed, preserving the Git repository permission boundary for server-held provider tokens.
 - **web:** Wrap long values in trace span detail panel ([#159](https://github.com/gotempsh/temps/issues/159))
 - **auth:** Constrain deployment token permissions
 - **auth:** Preserve email access and enforce project scope for deployment tokens
