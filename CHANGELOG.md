@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Agent container inventory redacts secrets**: `GET /agent/containers` now
+  returns only containers labeled `sh.temps.managed=true` and strips
+  `environment_vars`, preventing bearer-token holders from enumerating secrets
+  from unmanaged Docker workloads on the same worker.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
