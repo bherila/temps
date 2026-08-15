@@ -598,26 +598,13 @@ impl Queryable for MariaDbSource {
         let mut stream = sqlx::query(&sql)
             .bind(limit as i64)
             .bind(offset as i64)
-            .fetch(&mut *conn);
-        let mut bounded = BoundedRows::new(options.budget);
-        while let Some(row) = stream.try_next().await.map_err(|_error| {
-            error!(entity = entity_name, limit, "MariaDB row stream failed");
-            DataError::BackendQueryFailed {
-                backend: "MariaDB",
-                entity: entity_name.to_string(),
-            }
-        })? {
-            let observed = row.try_get::<i64, _>("__temps_size").map_err(|error| {
-                error!(
-                    entity = entity_name,
-                    limit,
-                    error = %error,
-                    "MariaDB bounded row size decode failed"
-                );
-                DataError::BackendQueryFailed {
-                    backend: "MariaDB",
-                    entity: entity_name.to_string(),
-                }
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                error!("MariaDB query failed: {}", e);
+                DataError::QueryFailed(
+                    "MariaDB data query failed; check server logs for details".to_string(),
+                )
             })?;
             let observed_cell = row.try_get::<i64, _>("__temps_max_cell").map_err(|error| {
                 error!(
@@ -1184,6 +1171,38 @@ fn strip_sql_string_literals(sql: &str) -> Result<String> {
     Ok(result)
 }
 
+fn contains_sql_keyword(sql: &str, keyword: &str) -> bool {
+    sql.match_indices(keyword).any(|(start, _)| {
+        let first_needs_boundary = keyword
+            .as_bytes()
+            .first()
+            .map(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .unwrap_or(false);
+        let last_needs_boundary = keyword
+            .as_bytes()
+            .last()
+            .map(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .unwrap_or(false);
+
+        let before = first_needs_boundary
+            && start
+                .checked_sub(1)
+                .and_then(|idx| sql.as_bytes().get(idx).copied())
+                .map(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                .unwrap_or(false);
+        let after_index = start + keyword.len();
+        let after = last_needs_boundary
+            && sql
+                .as_bytes()
+                .get(after_index)
+                .copied()
+                .map(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                .unwrap_or(false);
+
+        !before && !after
+    })
+}
+
 fn validate_where_clause(sql: &str) -> Result<()> {
     let sql_lower = sql.trim().to_ascii_lowercase();
 
@@ -1262,6 +1281,9 @@ fn validate_where_clause(sql: &str) -> Result<()> {
         "commit ",
         "rollback ",
         "savepoint ",
+        "select",
+        "extractvalue",
+        "updatexml",
     ];
 
     // Match on token boundaries rather than raw substrings. The trailing space
@@ -1270,16 +1292,7 @@ fn validate_where_clause(sql: &str) -> Result<()> {
     // names were unfilterable. A validator that blocks legitimate queries is a
     // validator someone eventually switches off.
     for keyword in &dangerous_keywords {
-        let keyword = keyword.trim();
-        // `sleep(`/`benchmark(` keep their paren and stay substring matches —
-        // they are not identifiers, and the structural check above is the real
-        // guard for the function-call forms.
-        let hit = if keyword.ends_with('(') {
-            without_strings.contains(keyword)
-        } else {
-            temps_query_postgres::contains_sql_token(&without_strings, keyword)
-        };
-        if hit {
+        if contains_sql_keyword(&without_strings, keyword.trim()) {
             return Err(DataError::InvalidQuery(format!(
                 "SQL operation '{}' is not allowed in the data browser",
                 keyword
@@ -1743,6 +1756,10 @@ mod tests {
         assert!(validate_where_clause("name LIKE '%drop table%'").is_ok());
         assert!(validate_where_clause("1=1; DROP TABLE users").is_err());
         assert!(validate_where_clause("id = 1 UNION SELECT password FROM users").is_err());
+        assert!(validate_where_clause("exists(select 1 from mysql.user)").is_err());
+        assert!(validate_where_clause("1=extractvalue(1, concat(0x7e, user(), 0x7e))").is_err());
+        assert!(validate_where_clause("1=updatexml(1, concat(0x7e, user(), 0x7e), 1)").is_err());
+        assert!(validate_where_clause("sleep(1) = 0").is_err());
         assert!(validate_where_clause("name = 'x' -- comment").is_err());
     }
 
