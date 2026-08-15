@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **WAL-G env files quote sourced values**: Continuous PostgreSQL WAL archiving now writes `walg.env` entries with shell-escaped values so S3 source fields such as `WALG_S3_PREFIX`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, and `AWS_ENDPOINT` cannot execute shell syntax when `archive_command` sources the file.
 
 
 ## [0.1.0-beta.39] - 2026-06-25

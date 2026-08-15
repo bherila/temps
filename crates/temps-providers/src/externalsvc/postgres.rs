@@ -36,6 +36,27 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Format an environment assignment so it is safe to source from a POSIX shell.
+///
+/// WAL-G archive/restore commands source the generated env file on every WAL
+/// operation. The write command's quoting only protects the `printf` call; the
+/// file content itself must also quote each value so attacker-controlled S3
+/// source fields cannot inject shell syntax when PostgreSQL later sources it.
+fn shell_export_assignment(line: &str) -> Option<String> {
+    let (key, value) = line.split_once('=')?;
+    let is_valid_key = key.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+        && key
+            .chars()
+            .next()
+            .is_some_and(|c| c == '_' || c.is_ascii_alphabetic());
+
+    if !is_valid_key {
+        return None;
+    }
+
+    Some(format!("export {key}={}", shell_escape(value)))
+}
+
 /// Input configuration for creating a PostgreSQL service
 /// This is what users provide when creating the service
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -641,7 +662,8 @@ impl PostgresService {
             "printf '%s\\n' {} > {} && chmod 600 {}",
             env_file_lines
                 .iter()
-                .map(|line| format!("'export {}'", line.replace('\'', "'\\''")))
+                .filter_map(|line| shell_export_assignment(line)
+                    .map(|assignment| shell_escape(&assignment)))
                 .collect::<Vec<_>>()
                 .join(" "),
             walg_env_path,
@@ -3801,6 +3823,32 @@ mod tests {
     use super::*;
 
     use crate::externalsvc::DEPLOYMENT_MODE_MUTEX as ENV_MUTEX;
+
+    #[test]
+    fn shell_export_assignment_quotes_sourced_walg_values() {
+        let assignment = shell_export_assignment(
+            "WALG_S3_PREFIX=s3://bucket/ok;touch${IFS}/tmp/pwn;#/external/walg",
+        )
+        .unwrap();
+
+        assert_eq!(
+            assignment,
+            "export WALG_S3_PREFIX='s3://bucket/ok;touch${IFS}/tmp/pwn;#/external/walg'"
+        );
+    }
+
+    #[test]
+    fn shell_export_assignment_escapes_single_quotes() {
+        let assignment = shell_export_assignment("AWS_SECRET_ACCESS_KEY=abc'def").unwrap();
+
+        assert_eq!(assignment, "export AWS_SECRET_ACCESS_KEY='abc'\\''def'");
+    }
+
+    #[test]
+    fn shell_export_assignment_rejects_invalid_keys() {
+        assert!(shell_export_assignment("BAD-KEY=value").is_none());
+        assert!(shell_export_assignment("NO_VALUE").is_none());
+    }
 
     #[test]
     fn test_postgres_input_config_default_values() {
