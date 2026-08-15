@@ -879,19 +879,23 @@ impl ParameterStrategy for MinioParameterStrategy {
             );
         }
 
-        // Auto-generate access_key if not provided
+        // Auto-generate access_key if not provided. Never use MinIO's
+        // well-known defaults because these values become root credentials
+        // for the managed MinIO container.
         if is_empty_value(params.get("access_key")) {
             params.insert(
                 "access_key".to_string(),
-                JsonValue::String("minioadmin".to_string()),
+                JsonValue::String(generate_access_key()),
             );
         }
 
-        // Auto-generate secret_key if not provided
+        // Auto-generate secret_key if not provided. Never use MinIO's
+        // well-known defaults because these values become root credentials
+        // for the managed MinIO container.
         if is_empty_value(params.get("secret_key")) {
             params.insert(
                 "secret_key".to_string(),
-                JsonValue::String("minioadmin".to_string()),
+                JsonValue::String(generate_secret_key()),
             );
         }
 
@@ -1772,6 +1776,30 @@ mod tests {
             err.contains("container_name"),
             "error should mention 'container_name', got: {err}"
         );
+    }
+
+    #[test]
+    fn minio_generates_random_credentials_instead_of_well_known_defaults() {
+        let strategy = MinioParameterStrategy;
+        let mut params = HashMap::new();
+
+        strategy
+            .auto_generate_missing(&mut params)
+            .expect("MinIO defaults should generate");
+
+        let access_key = params
+            .get("access_key")
+            .and_then(|value| value.as_str())
+            .expect("MinIO access key should be generated");
+        let secret_key = params
+            .get("secret_key")
+            .and_then(|value| value.as_str())
+            .expect("MinIO secret key should be generated");
+
+        assert_ne!(access_key, "minioadmin");
+        assert_ne!(secret_key, "minioadmin");
+        assert_eq!(access_key.len(), 20);
+        assert_eq!(secret_key.len(), 40);
     }
 
     #[test]
