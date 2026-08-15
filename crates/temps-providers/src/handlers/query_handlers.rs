@@ -1434,23 +1434,17 @@ pub async fn query_data(
         .await
         .map_err(|error| query_error_problem(error, service_id, request.limit))?;
 
-    let total_count = result.stats.total_rows.unwrap_or(result.stats.row_count) as u64;
-    let execution_time_ms = result.stats.execution_ms;
-    let fields: Vec<FieldResponse> = result
-        .schema
-        .fields
-        .into_iter()
-        .map(|f| FieldResponse {
-            name: f.name,
-            field_type: format!("{:?}", f.field_type),
-            nullable: f.nullable,
-        })
-        .collect();
+            let detail = match &e {
+                temps_query::DataError::QueryFailed(_) => {
+                    "Query failed; check server logs for details".to_string()
+                }
+                _ => e.to_string(),
+            };
 
-    // This route is not reachable by the agent (it is absent from the write
-    // allowlist), so the human budget always applies.
-    let truncated = result.stats.truncated;
-    let rows = data_rows_to_json(result.rows);
+            temps_core::problemdetails::new(status)
+                .with_title(title)
+                .with_detail(detail)
+        })?;
 
     let response = QueryDataResponse {
         fields,
