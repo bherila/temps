@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use rand::seq::SliceRandom;
@@ -115,7 +115,11 @@ pub async fn spawn(
     let app = axum::Router::new().fallback(handle).with_state(state);
 
     tokio::spawn(async move {
-        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let server = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
             shutdown.notified().await;
             info!("internal edge proxy shutting down");
         });
@@ -154,6 +158,14 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         }
     };
 
+    if !caller_may_access_route(&state.store, req.extensions(), &entry) {
+        warn!(%host, route_project_id = ?entry.project_id, "blocked cross-project internal proxy request");
+        return error_body(
+            StatusCode::FORBIDDEN,
+            "internal route is not accessible from this workload",
+        );
+    }
+
     if entry.backends.is_empty() {
         warn!(%host, "host has no backends");
         return error_body(StatusCode::SERVICE_UNAVAILABLE, "no live backends");
@@ -173,6 +185,24 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
     }
 
     proxy_with_retries(&state, &entry, req).await
+}
+
+fn caller_may_access_route(
+    store: &SharedRouteStore,
+    extensions: &axum::http::Extensions,
+    entry: &RouteEntry,
+) -> bool {
+    let Some(route_project_id) = entry.project_id else {
+        // Legacy or malformed snapshots without project metadata are not
+        // safe to expose through the workload-to-workload proxy.
+        return false;
+    };
+    let Some(peer) = extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0) else {
+        return false;
+    };
+    store
+        .project_ids_for_backend_ip(peer.ip())
+        .contains(&route_project_id)
 }
 
 /// True if the client requested a protocol upgrade. We check both the
@@ -626,4 +656,71 @@ fn error_body(status: StatusCode, message: &str) -> Response {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::route_store::{RouteBackend, RouteEntry, RouteStore};
+    use std::path::PathBuf;
+
+    fn route(host: &str, project_id: i32, backend: &str) -> RouteEntry {
+        RouteEntry {
+            host: host.to_string(),
+            backends: vec![RouteBackend {
+                address: backend.to_string(),
+                container_id: None,
+                container_name: None,
+            }],
+            deployment_id: Some(project_id * 10),
+            project_id: Some(project_id),
+            environment_id: Some(project_id * 100),
+        }
+    }
+
+    fn extensions_for(peer: &str) -> axum::http::Extensions {
+        let mut extensions = axum::http::Extensions::new();
+        extensions.insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        extensions
+    }
+
+    #[test]
+    fn caller_policy_allows_same_project_backend_ip() {
+        let store = Arc::new(RouteStore::new(PathBuf::from("/tmp/unused-routes.json")));
+        let target = route("prod.alpha.temps.local", 42, "172.20.1.10:3000");
+        store.apply_snapshot(1, vec![target.clone()]);
+
+        assert!(caller_may_access_route(
+            &store,
+            &extensions_for("172.20.1.10:49152"),
+            &target
+        ));
+    }
+
+    #[test]
+    fn caller_policy_blocks_cross_project_backend_ip() {
+        let store = Arc::new(RouteStore::new(PathBuf::from("/tmp/unused-routes.json")));
+        let attacker = route("prod.attacker.temps.local", 7, "172.20.1.7:3000");
+        let victim = route("prod.victim.temps.local", 42, "172.20.1.42:3000");
+        store.apply_snapshot(1, vec![attacker, victim.clone()]);
+
+        assert!(!caller_may_access_route(
+            &store,
+            &extensions_for("172.20.1.7:49152"),
+            &victim
+        ));
+    }
+
+    #[test]
+    fn caller_policy_blocks_unknown_source_ip() {
+        let store = Arc::new(RouteStore::new(PathBuf::from("/tmp/unused-routes.json")));
+        let target = route("prod.alpha.temps.local", 42, "172.20.1.10:3000");
+        store.apply_snapshot(1, vec![target.clone()]);
+
+        assert!(!caller_may_access_route(
+            &store,
+            &extensions_for("172.20.1.99:49152"),
+            &target
+        ));
+    }
 }

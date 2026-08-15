@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **SECURITY: Project-scoped internal routes.** The worker `temps-agent` internal proxy now authorizes `*.temps.local` requests by matching the caller's overlay source IP to route snapshot project metadata, denying unknown or cross-project callers so one deployed workload cannot reach another project's private deployment hostname by setting `Host`.
+
 
 
 ## [0.1.0-beta.35] - 2026-06-19
