@@ -2028,14 +2028,26 @@ impl LoadBalancer {
     }
 }
 
+/// Canonicalize hostnames before comparing them with configured domain rows.
+///
+/// Host headers are attacker-controlled and may differ from the stored domain
+/// only by DNS-equivalent presentation details such as case or a trailing dot.
+/// Certificate and HTTPS-enforcement lookups must not treat those variants as
+/// distinct hosts.
+fn normalize_host_for_cert_lookup(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
 /// Returns true when `host` (or its wildcard parent) has an active TLS
 /// certificate stored in the database. Used to make the HTTP→HTTPS redirect
 /// per-domain rather than a global toggle: redirect only when a cert exists,
 /// serve plain HTTP otherwise. Mirrors the wildcard lookup in `tls_cert_loader`.
 async fn host_has_active_cert(db: &DbConnection, host: &str) -> bool {
+    let normalized_host = normalize_host_for_cert_lookup(host);
+
     // Exact match
     let exact = domains::Entity::find()
-        .filter(domains::Column::Domain.eq(host))
+        .filter(domains::Column::Domain.eq(&normalized_host))
         // "active_renewal_failed" still serves a valid cert, so it counts here too.
         .filter(domains::Column::Status.is_in(domains::CERT_SERVING_STATUSES))
         .filter(domains::Column::Certificate.is_not_null())
@@ -2048,7 +2060,7 @@ async fn host_has_active_cert(db: &DbConnection, host: &str) -> bool {
     }
 
     // Wildcard match: api.example.com → *.example.com
-    let parts: Vec<&str> = host.split('.').collect();
+    let parts: Vec<&str> = normalized_host.split('.').collect();
     if parts.len() >= 2 {
         let wildcard = format!("*.{}", parts[1..].join("."));
         let wc = domains::Entity::find()
@@ -2065,6 +2077,26 @@ async fn host_has_active_cert(db: &DbConnection, host: &str) -> bool {
     }
 
     false
+}
+
+async fn should_redirect_http_to_https(
+    config_service: &temps_config::ConfigService,
+    db: &DbConnection,
+    host: &str,
+) -> bool {
+    match config_service.get_url_scheme().await {
+        // HTTP-only quick/local installs are the only mode where an untrusted
+        // Host without a configured certificate may remain on plaintext HTTP.
+        Ok(scheme) if scheme == "http" => host_has_active_cert(db, host).await,
+        Ok(_) => true,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "Failed to read external_url scheme; enforcing HTTPS redirect"
+            );
+            true
+        }
+    }
 }
 
 /// Map an on-demand cert in-process state to the port-80 503 response the end
@@ -3254,17 +3286,21 @@ impl ProxyHttp for LoadBalancer {
         // HTTP to HTTPS redirect for non-TLS connections.
         // This MUST come after ACME challenge handling to allow Let's Encrypt HTTP-01 validation.
         //
-        // Redirect is per-domain: we only redirect when the requesting host
-        // actually has an active TLS certificate in the database (exact match or
-        // wildcard parent). This means HTTP-only installs (sslip.io quick/local
-        // modes, no cert provisioned) never get redirected, while hosts that
-        // have gone through SSL provisioning get automatic HTTPS enforcement.
+        // Production HTTPS installs redirect every non-TLS request, including
+        // console/API fallback requests with arbitrary or non-canonical Host
+        // headers. HTTP-only quick/local installs only redirect configured hosts
+        // that already have a serving certificate, preserving local plaintext UX.
         //
         // `disable_https_redirect` is a global escape hatch (set by the service
         // unit in local/testing mode) that bypasses the check entirely.
         let needs_redirect = !self.disable_https_redirect
             && !self.is_tls_connection(session)
-            && host_has_active_cert(self.db.as_ref(), &ctx.host).await;
+            && should_redirect_http_to_https(
+                self.config_service.as_ref(),
+                self.db.as_ref(),
+                &ctx.host,
+            )
+            .await;
         if needs_redirect {
             // Build the HTTPS redirect URL preserving path and query string
             let redirect_url = if let Some(query) = &ctx.query_string {
@@ -4353,8 +4389,22 @@ mod on_demand_http_tests {
     //! The session-writing wrapper (`handle_on_demand_http`) is exercised in
     //! integration; here we pin the two pure helpers it delegates to so the
     //! 503 contract and the `redirect_to_env` target derivation are locked.
-    use super::{ephemeral_redirect_location, on_demand_cert_state_response};
+    use super::{
+        ephemeral_redirect_location, normalize_host_for_cert_lookup, on_demand_cert_state_response,
+    };
     use crate::on_demand_cert::OnDemandCertState;
+
+    #[test]
+    fn cert_lookup_host_normalization_handles_dns_equivalent_hosts() {
+        assert_eq!(
+            normalize_host_for_cert_lookup("Example.COM."),
+            "example.com"
+        );
+        assert_eq!(
+            normalize_host_for_cert_lookup("API.Example.COM.."),
+            "api.example.com"
+        );
+    }
 
     #[test]
     fn pending_and_issuing_map_to_provisioning_503() {

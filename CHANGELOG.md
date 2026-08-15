@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **HTTPS enforcement for console/API fallback hosts**: Production HTTPS
+  installs now redirect non-TLS requests even when the attacker-controlled
+  `Host` header does not match a configured certificate row, preventing
+  alternate hosts from exposing the login/API surface over plaintext HTTP.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
