@@ -424,6 +424,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Miscellaneous
 
 - **changelog:** Generate CHANGELOG.md with git-cliff instead of hand-editing
+### Fixed
+
+- **email:** Reject deployment-token authentication on the global `POST /emails` endpoint because email domains are instance-wide today and cannot be safely scoped to a token-bound project.
 
 ## [0.1.0-beta.40] - 2026-07-01
 
