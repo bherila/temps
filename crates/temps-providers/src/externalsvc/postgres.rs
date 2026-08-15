@@ -40,105 +40,25 @@ pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Rejections from same-version-only [`PostgresService::upgrade`]. The
-/// `ExternalService::upgrade` trait method returns `anyhow::Result<()>`
-/// across every provider, so this can't be a variant of a typed
-/// `Result<(), E>` without changing that trait's signature everywhere.
-/// Instead it's wrapped into the `anyhow::Error` via `?`/`.into()` so
-/// callers can `downcast_ref::<PostgresUpgradeRejected>()` for an exact,
-/// wording-independent match instead of matching on `e.to_string()`.
-#[derive(Debug, thiserror::Error)]
-pub enum PostgresUpgradeRejected {
-    #[error("Cannot downgrade PostgreSQL (from {from} to {to})")]
-    Downgrade { from: u32, to: u32 },
-
-    #[error(
-        "Cannot change PostgreSQL major version via this endpoint (from {from} to {to}). \
-         Use the major-version upgrade API (POST /external-services/{{id}}/upgrades) instead, \
-         which performs a real pg_dumpall/restore with a retained rollback volume and a \
-         mandatory pre-upgrade backup."
-    )]
-    MajorVersionChange { from: u32, to: u32 },
-}
-
-/// Builds the `pg_isready` healthcheck command pinned to the configured
-/// username/database. Without `-d`, `pg_isready` (via libpq) defaults the
-/// target database to the username, so any service where `database !=
-/// username` would log a FATAL on every healthcheck tick.
+/// Format an environment assignment so it is safe to source from a POSIX shell.
 ///
-/// Shared with `postgres_lifecycle` so both container-creation sites build
-/// the exact same healthcheck command.
-pub(crate) fn postgres_healthcheck_cmd(username: &str, database: &str) -> String {
-    format!(
-        "pg_isready -U {} -d {}",
-        shell_escape(username),
-        shell_escape(database)
-    )
-}
+/// WAL-G archive/restore commands source the generated env file on every WAL
+/// operation. The write command's quoting only protects the `printf` call; the
+/// file content itself must also quote each value so attacker-controlled S3
+/// source fields cannot inject shell syntax when PostgreSQL later sources it.
+fn shell_export_assignment(line: &str) -> Option<String> {
+    let (key, value) = line.split_once('=')?;
+    let is_valid_key = key.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+        && key
+            .chars()
+            .next()
+            .is_some_and(|c| c == '_' || c.is_ascii_alphabetic());
 
-fn walg_target_user_data(backup: &temps_entities::backups::Model) -> Result<Option<String>> {
-    let metadata: serde_json::Value = serde_json::from_str(&backup.metadata)
-        .with_context(|| format!("Backup {} has invalid metadata JSON", backup.backup_id))?;
-    let Some(version) = metadata.get("walg_identity_version") else {
-        return Ok(None);
-    };
-    if version.as_u64() != Some(1) {
-        return Err(anyhow::anyhow!(
-            "Backup {} uses unsupported WAL-G identity version {}",
-            backup.backup_id,
-            version
-        ));
+    if !is_valid_key {
+        return None;
     }
-    let value = metadata.get("walg_target_user_data").ok_or_else(|| {
-        anyhow::anyhow!(
-            "Backup {} is missing its WAL-G target user data",
-            backup.backup_id
-        )
-    })?;
-    if value
-        .get("temps_backup_id")
-        .and_then(serde_json::Value::as_str)
-        != Some(backup.backup_id.as_str())
-    {
-        return Err(anyhow::anyhow!(
-            "Backup {} has WAL-G target user data for a different backup",
-            backup.backup_id
-        ));
-    }
-    Ok(Some(serde_json::to_string(value).with_context(|| {
-        format!(
-            "Failed to serialize WAL-G target user data for backup {}",
-            backup.backup_id
-        )
-    })?))
-}
 
-/// Validate a PostgreSQL role/username before it is interpolated into a
-/// shell command or SQL. Allows only `[A-Za-z0-9_]` (the realistic role-name
-/// charset), non-empty, and at most 63 bytes.
-///
-/// Defense-in-depth: the upgrade orchestrator already `shell_escape`s the
-/// username at every interpolation site, but rejecting shell/SQL
-/// metacharacters (quotes, `$`, `;`, spaces, backticks, …) up front means a
-/// crafted username can never reach a `sh -c` string or a `sed` program in
-/// the first place. Mirrors [`PostgresService::validate_database_name`], but
-/// permits uppercase since role names are commonly mixed-case.
-pub(crate) fn validate_pg_username(name: &str) -> std::result::Result<(), String> {
-    if name.is_empty() {
-        return Err("PostgreSQL username cannot be empty".to_string());
-    }
-    if name.len() > 63 {
-        return Err(format!(
-            "PostgreSQL username '{name}' exceeds the 63 character limit"
-        ));
-    }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err(format!(
-            "PostgreSQL username '{name}' contains invalid characters; only \
-             ASCII letters, digits, and underscores are allowed"
-        ));
-    }
-    Ok(())
+    Some(format!("export {key}={}", shell_escape(value)))
 }
 
 /// Input configuration for creating a PostgreSQL service
@@ -861,7 +781,8 @@ impl PostgresService {
             "printf '%s\\n' {} > {} && chmod 600 {}",
             env_file_lines
                 .iter()
-                .map(|line| format!("'export {}'", line.replace('\'', "'\\''")))
+                .filter_map(|line| shell_export_assignment(line)
+                    .map(|assignment| shell_escape(&assignment)))
                 .collect::<Vec<_>>()
                 .join(" "),
             walg_env_path,
@@ -4150,6 +4071,32 @@ mod tests {
     fn healthcheck_cmd_escapes_single_quotes_in_username_and_database() {
         let cmd = postgres_healthcheck_cmd("a'user", "a'db");
         assert_eq!(cmd, "pg_isready -U 'a'\\''user' -d 'a'\\''db'");
+    }
+
+    #[test]
+    fn shell_export_assignment_quotes_sourced_walg_values() {
+        let assignment = shell_export_assignment(
+            "WALG_S3_PREFIX=s3://bucket/ok;touch${IFS}/tmp/pwn;#/external/walg",
+        )
+        .unwrap();
+
+        assert_eq!(
+            assignment,
+            "export WALG_S3_PREFIX='s3://bucket/ok;touch${IFS}/tmp/pwn;#/external/walg'"
+        );
+    }
+
+    #[test]
+    fn shell_export_assignment_escapes_single_quotes() {
+        let assignment = shell_export_assignment("AWS_SECRET_ACCESS_KEY=abc'def").unwrap();
+
+        assert_eq!(assignment, "export AWS_SECRET_ACCESS_KEY='abc'\\''def'");
+    }
+
+    #[test]
+    fn shell_export_assignment_rejects_invalid_keys() {
+        assert!(shell_export_assignment("BAD-KEY=value").is_none());
+        assert!(shell_export_assignment("NO_VALUE").is_none());
     }
 
     #[test]
