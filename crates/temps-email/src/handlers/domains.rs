@@ -545,7 +545,7 @@ pub async fn setup_dns(
     Path(id): Path<i32>,
     Json(request): Json<SetupDnsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EmailDomainsWrite);
+    permission_guard!(auth, SettingsWrite);
 
     // Check if DNS provider service is available
     let dns_provider_service = state.dns_provider_service.as_ref().ok_or_else(|| {
@@ -564,14 +564,49 @@ pub async fn setup_dns(
             not_found().detail("Email domain not found").build()
         })?;
 
-    // Get the DNS provider
-    let dns_provider = dns_provider_service
-        .get(request.dns_provider_id)
+    // Extract the base domain (e.g., "example.com" from "mail.example.com")
+    let email_domain = &domain_with_dns.domain.domain;
+    let base_domain = extract_base_domain(email_domain);
+
+    // Only allow automatic setup through the provider that actively manages this
+    // verified domain. DNS provider credentials are settings-scoped secrets, so
+    // accepting an arbitrary provider ID here would let callers use credentials
+    // outside the provider's managed zones.
+    let (dns_provider, _managed_domain) = dns_provider_service
+        .find_provider_for_domain(&base_domain)
         .await
         .map_err(|e| {
-            error!("Failed to get DNS provider: {}", e);
-            not_found().detail("DNS provider not found").build()
+            error!(
+                "Failed to verify DNS provider access for domain {}: {}",
+                base_domain, e
+            );
+            internal_server_error()
+                .detail("Failed to verify DNS provider access for this domain")
+                .build()
+        })?
+        .ok_or_else(|| {
+            bad_request()
+                .detail(format!(
+                    "No active, verified DNS provider is configured to automatically manage {}",
+                    base_domain
+                ))
+                .build()
         })?;
+
+    if dns_provider.id != request.dns_provider_id {
+        warn!(
+            requested_provider_id = request.dns_provider_id,
+            managed_provider_id = dns_provider.id,
+            domain = %base_domain,
+            "Rejected DNS setup with provider that does not manage the domain"
+        );
+        return Err(bad_request()
+            .detail(format!(
+                "DNS provider {} is not authorized to manage {}",
+                request.dns_provider_id, base_domain
+            ))
+            .build());
+    }
 
     // Create DNS provider instance
     let provider_instance = dns_provider_service
@@ -582,10 +617,6 @@ pub async fn setup_dns(
                 .detail(format!("Failed to initialize DNS provider: {}", e))
                 .build()
         })?;
-
-    // Extract the base domain (e.g., "example.com" from "mail.example.com")
-    let email_domain = &domain_with_dns.domain.domain;
-    let base_domain = extract_base_domain(email_domain);
 
     info!(
         "Setting up {} DNS records for {} using provider {}",

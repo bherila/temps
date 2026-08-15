@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Email DNS setup authorization**: `POST /api/email-domains/{id}/setup-dns` now requires `SettingsWrite` and only uses the active, verified, auto-managed DNS provider for the email domain's base zone, preventing lower-privileged users from exercising stored DNS provider credentials by guessing provider IDs.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
