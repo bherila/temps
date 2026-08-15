@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Blob and KV data authorization**: Data-plane handlers now enforce `BlobRead`/`BlobWrite`/`BlobDelete` and `KvRead`/`KvWrite`/`KvDelete` before using a request-supplied `project_id`, and deployment-token requests remain confined to their bound project so low-privilege credentials cannot access another project's storage.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
