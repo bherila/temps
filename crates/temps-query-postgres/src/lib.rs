@@ -14,6 +14,8 @@ use tokio_postgres::{Client, NoTls, Row};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{debug, error, warn};
 
+const MAX_QUERY_LIMIT: usize = 100;
+
 /// Escape a SQL identifier by doubling any internal double-quote characters.
 /// Prevents identifier injection when used inside `"..."` quoting.
 fn escape_ident(name: &str) -> String {
@@ -202,36 +204,6 @@ pub async fn connect_with_self_signed_tls(
 }
 
 impl PostgresSource {
-    /// Strip SQL string literals to avoid false positives when scanning for dangerous patterns.
-    /// Replaces content inside single-quoted strings with empty strings.
-    fn strip_sql_string_literals(sql: &str) -> String {
-        let mut result = String::with_capacity(sql.len());
-        let mut in_string = false;
-        let mut chars = sql.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            if in_string {
-                if c == '\'' {
-                    // Check for escaped quote ('')
-                    if chars.peek() == Some(&'\'') {
-                        chars.next(); // skip the escaped quote
-                    } else {
-                        in_string = false;
-                        result.push('\'');
-                    }
-                }
-                // Skip characters inside string literals
-            } else if c == '\'' {
-                in_string = true;
-                result.push('\'');
-            } else {
-                result.push(c);
-            }
-        }
-
-        result
-    }
-
     /// Validate that a sort_by field name is a safe SQL identifier.
     /// Only allows alphanumeric characters, underscores, and optionally
     /// double-quoted identifiers.
@@ -273,144 +245,22 @@ impl PostgresSource {
         Ok(())
     }
 
-    /// Validate SQL input for dangerous operations.
-    /// Used to sanitize user-provided WHERE clauses in the data browser.
-    ///
-    /// Security: Uses both a denylist of dangerous patterns AND structural
-    /// validation to prevent SQL injection. The denylist catches known attack
-    /// patterns while structural checks block injection vectors like subqueries,
-    /// UNION, and function calls that could bypass simple pattern matching.
-    fn validate_sql(sql: &str) -> Result<()> {
-        let sql_lower = sql.trim().to_lowercase();
-
-        if sql_lower.is_empty() {
-            return Err(DataError::InvalidQuery(
-                "WHERE clause cannot be empty".to_string(),
-            ));
+    /// Reject raw SQL filter fragments. The public query API accepts JSON from
+    /// low-privileged readers, so PostgreSQL must not concatenate caller-provided
+    /// expressions into WHERE clauses. A future typed filter DSL can translate
+    /// validated operators into bound parameters here.
+    fn validate_filters(filters: Option<&serde_json::Value>) -> Result<()> {
+        match filters {
+            None => Ok(()),
+            Some(value) if value.as_object().is_some_and(|object| object.is_empty()) => Ok(()),
+            Some(_) => Err(DataError::InvalidQuery(
+                "PostgreSQL data browsing does not accept raw SQL filters".to_string(),
+            )),
         }
+    }
 
-        // Strip string literals to avoid false positives on content inside quotes
-        let without_strings = Self::strip_sql_string_literals(&sql_lower);
-
-        // STRUCTURAL CHECKS: Block injection vectors that denylist alone cannot catch
-
-        // Prevent multi-statement execution via semicolons
-        if without_strings.contains(';') {
-            return Err(DataError::InvalidQuery(
-                "Multiple SQL statements are not allowed".to_string(),
-            ));
-        }
-
-        // Prevent subqueries via parenthesized SELECT
-        // This blocks: (SELECT ...), EXISTS (SELECT ...), IN (SELECT ...)
-        if without_strings.contains('(') {
-            // Allow simple IN lists like: id IN (1, 2, 3) but block any subqueries
-            // by checking if SELECT appears after any opening paren
-            let paren_content_has_select = without_strings.match_indices('(').any(|(idx, _)| {
-                let after_paren = &without_strings[idx..];
-                // Check if there's a SELECT between this ( and its matching )
-                after_paren
-                    .find(')')
-                    .map(|close_idx| {
-                        let inner = &after_paren[1..close_idx];
-                        inner.contains("select")
-                    })
-                    .unwrap_or(false)
-            });
-            if paren_content_has_select {
-                return Err(DataError::InvalidQuery(
-                    "Subqueries are not allowed in the data browser".to_string(),
-                ));
-            }
-        }
-
-        // Block SQL comments which can be used to hide attack payloads
-        if without_strings.contains("--") || without_strings.contains("/*") {
-            return Err(DataError::InvalidQuery(
-                "SQL comments are not allowed in the data browser".to_string(),
-            ));
-        }
-
-        // DENYLIST: Block dangerous SQL keywords and operations
-        // These are checked against the string-stripped version to prevent
-        // hiding keywords inside string literals
-        let dangerous_keywords = [
-            // DDL operations
-            "drop ",
-            "truncate ",
-            "alter ",
-            "create ",
-            "grant ",
-            "revoke ",
-            // Data manipulation that shouldn't appear in WHERE
-            "insert ",
-            "update ",
-            "delete ",
-            "copy ",
-            // Set operations that enable data exfiltration
-            "union ",
-            "union\t",
-            "union\n",
-            "intersect ",
-            "except ",
-            // Dangerous PostgreSQL functions
-            "pg_read_file",
-            "pg_write_file",
-            "pg_ls_dir",
-            "pg_read_binary_file",
-            "pg_stat_file",
-            "lo_import",
-            "lo_export",
-            "lo_get",
-            "lo_put",
-            "pg_sleep",
-            "pg_terminate_backend",
-            "pg_cancel_backend",
-            "pg_reload_conf",
-            "pg_rotate_logfile",
-            "set_config",
-            "current_setting",
-            "dblink",
-            "dblink_connect",
-            "dblink_exec",
-            // Information disclosure functions
-            "pg_ls_logdir",
-            "pg_ls_waldir",
-            "pg_ls_tmpdir",
-            "pg_ls_archive_statusdir",
-            // Execute/prepare
-            "execute ",
-            "prepare ",
-            // Transaction control
-            "begin ",
-            "commit ",
-            "rollback ",
-            "savepoint ",
-            // INTO clause (write results to table/file)
-            " into ",
-        ];
-
-        for keyword in &dangerous_keywords {
-            if without_strings.contains(keyword) {
-                return Err(DataError::InvalidQuery(format!(
-                    "SQL operation '{}' is not allowed in the data browser",
-                    keyword.trim()
-                )));
-            }
-        }
-
-        // Also check for dangerous keywords at the very start of the string
-        let dangerous_starts = ["into "];
-        for keyword in &dangerous_starts {
-            if without_strings.starts_with(keyword) {
-                return Err(DataError::InvalidQuery(format!(
-                    "SQL operation '{}' is not allowed in the data browser",
-                    keyword.trim()
-                )));
-            }
-        }
-
-        Ok(())
+    fn clamp_limit(limit: Option<usize>) -> usize {
+        limit.unwrap_or(MAX_QUERY_LIMIT).min(MAX_QUERY_LIMIT)
     }
 
     /// Map PostgreSQL type to FieldType
@@ -1096,49 +946,49 @@ impl Queryable for PostgresSource {
 
         let start = std::time::Instant::now();
 
-        // Build SQL query
+        Self::validate_filters(filters.as_ref())?;
+        let schema = self.get_schema(container_path, entity_name).await?;
+
+        // Build SQL query with escaped identifiers only. PostgreSQL cannot bind
+        // table/column identifiers as parameters, so all identifier inputs are
+        // either escaped or validated against the discovered table schema.
         let mut sql = format!(
             "SELECT * FROM \"{}\".\"{}\"",
             escape_ident(schema_name),
             escape_ident(entity_name)
         );
 
-        // Add WHERE clause if filters provided
-        if let Some(filter_json) = filters {
-            if let Some(where_clause) = filter_json.get("where").and_then(|v| v.as_str()) {
-                // Validate WHERE clause for dangerous operations
-                Self::validate_sql(where_clause)?;
-                sql.push_str(" WHERE ");
-                sql.push_str(where_clause);
-            }
-        }
-
         // Add ORDER BY
         if let Some(sort_by) = &options.sort_by {
             Self::validate_sort_field(sort_by)?;
+            if !schema.fields.iter().any(|field| field.name == *sort_by) {
+                return Err(DataError::InvalidQuery(format!(
+                    "Sort field '{}' is not present in table '{}.{}'",
+                    sort_by, schema_name, entity_name
+                )));
+            }
             let sort_order = match options.sort_order.as_deref() {
                 Some("desc") | Some("DESC") => "DESC",
                 _ => "ASC",
             };
-            // Quote the column name to handle camelCase identifiers correctly
-            let quoted_sort = if sort_by.starts_with('"') && sort_by.ends_with('"') {
-                sort_by.to_string() // Already quoted
-            } else {
-                format!("\"{}\"", sort_by)
-            };
-            sql.push_str(&format!(" ORDER BY {} {}", quoted_sort, sort_order));
+            sql.push_str(&format!(
+                " ORDER BY \"{}\" {}",
+                escape_ident(sort_by),
+                sort_order
+            ));
         }
 
-        // Add LIMIT and OFFSET
-        let limit = options.limit.unwrap_or(100);
+        // Add LIMIT and OFFSET. Enforce a hard maximum so callers cannot request
+        // unbounded result sets through the data browser endpoint.
+        let limit = Self::clamp_limit(options.limit);
         let offset = options.offset.unwrap_or(0);
         sql.push_str(&format!(" LIMIT {} OFFSET {}", limit, offset));
 
         debug!("Executing query: {}", sql);
 
-        // Safety: SQL injection is prevented by validate_sql() for WHERE clauses
-        // and escape_ident() for identifiers. The database user should be read-only
-        // as defense-in-depth.
+        // Safety: SQL injection is prevented by rejecting raw WHERE fragments,
+        // escaping table identifiers, and validating sort columns against schema.
+        // The database user should be read-only as defense-in-depth.
         let client = &self.client;
 
         let rows = client.query(&sql, &[]).await.map_err(|e| {
@@ -1179,9 +1029,6 @@ impl Queryable for PostgresSource {
         let data_rows: Result<Vec<DataRow>> = rows.iter().map(Self::row_to_datarow).collect();
         let data_rows = data_rows?;
 
-        // Get schema from first row or from table schema
-        let schema = self.get_schema(container_path, entity_name).await?;
-
         let execution_ms = start.elapsed().as_millis() as u64;
         let row_count = data_rows.len();
 
@@ -1214,21 +1061,14 @@ impl Queryable for PostgresSource {
 
         let schema_name = &container_path.segments[1];
 
-        let mut sql = format!(
+        Self::validate_filters(filters.as_ref())?;
+        let _schema = self.get_schema(container_path, entity_name).await?;
+
+        let sql = format!(
             "SELECT COUNT(*) FROM \"{}\".\"{}\"",
             escape_ident(schema_name),
             escape_ident(entity_name)
         );
-
-        // Add WHERE clause if filters provided
-        if let Some(filter_json) = filters {
-            if let Some(where_clause) = filter_json.get("where").and_then(|v| v.as_str()) {
-                // Validate WHERE clause for dangerous operations
-                Self::validate_sql(where_clause)?;
-                sql.push_str(" WHERE ");
-                sql.push_str(where_clause);
-            }
-        }
 
         let client = &self.client;
 
@@ -1275,25 +1115,8 @@ impl temps_query::QuerySchemaProvider for PostgresSource {
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "title": "PostgreSQL Query Filters",
-            "description": "Filter data using SQL WHERE clause syntax",
-            "properties": {
-                "where": {
-                    "type": "string",
-                    "title": "WHERE Clause",
-                    "description": "SQL WHERE clause (without 'WHERE' keyword). Example: status = 'active' AND created_at > '2025-01-01'",
-                    "examples": [
-                        "status = 'active'",
-                        "created_at > '2025-01-01'",
-                        "age >= 18 AND country = 'US'",
-                        "name LIKE '%test%'",
-                        "id IN (1, 2, 3)"
-                    ],
-                    // UI hints embedded as custom properties
-                    "x-ui-widget": "textarea",
-                    "x-ui-placeholder": "status = 'active' AND created_at > NOW() - INTERVAL '7 days'",
-                    "x-ui-rows": 3
-                }
-            },
+            "description": "PostgreSQL data browsing currently disables raw SQL filters for security. Use sorting and pagination to inspect rows.",
+            "properties": {},
             "additionalProperties": false
         })
     }
@@ -1362,229 +1185,32 @@ mod tests {
         assert_eq!(PostgresSource::map_pg_type("jsonb"), FieldType::Json);
     }
 
-    // ── SQL Injection Prevention Tests ────────────────────────────────
+    // ── Filter validation tests ──────────────────────────────────────
 
-    // Helper: assert that a WHERE clause is rejected
-    fn assert_sql_rejected(sql: &str) {
-        let result = PostgresSource::validate_sql(sql);
+    #[test]
+    fn test_postgres_filters_reject_raw_where_fragments() {
+        let filters = serde_json::json!({"where": "status = 'active'"});
+        let result = PostgresSource::validate_filters(Some(&filters));
+
         assert!(
             result.is_err(),
-            "Expected SQL to be rejected but it was accepted: {:?}",
-            sql
+            "raw SQL WHERE fragments must not be accepted from API callers"
         );
     }
 
-    // Helper: assert that a WHERE clause is allowed
-    fn assert_sql_allowed(sql: &str) {
-        let result = PostgresSource::validate_sql(sql);
-        assert!(
-            result.is_ok(),
-            "Expected SQL to be accepted but it was rejected: {:?} — error: {:?}",
-            sql,
-            result.unwrap_err()
-        );
-    }
-
-    // ── Legitimate WHERE clauses that MUST be allowed ────────────────
-
     #[test]
-    fn test_sql_valid_simple_equality() {
-        assert_sql_allowed("status = 'active'");
+    fn test_postgres_filters_allow_absent_or_empty_filters() {
+        assert!(PostgresSource::validate_filters(None).is_ok());
+
+        let filters = serde_json::json!({});
+        assert!(PostgresSource::validate_filters(Some(&filters)).is_ok());
     }
 
     #[test]
-    fn test_sql_valid_comparison_operators() {
-        assert_sql_allowed("age >= 18 AND country = 'US'");
-        assert_sql_allowed("created_at > '2025-01-01'");
-        assert_sql_allowed("price < 100.50");
-    }
-
-    #[test]
-    fn test_sql_valid_like_pattern() {
-        assert_sql_allowed("name LIKE '%test%'");
-        assert_sql_allowed("email ILIKE '%@example.com'");
-    }
-
-    #[test]
-    fn test_sql_valid_in_list() {
-        assert_sql_allowed("id IN (1, 2, 3)");
-        assert_sql_allowed("status IN ('active', 'pending')");
-    }
-
-    #[test]
-    fn test_sql_valid_is_null() {
-        assert_sql_allowed("deleted_at IS NULL");
-        assert_sql_allowed("name IS NOT NULL");
-    }
-
-    #[test]
-    fn test_sql_valid_between() {
-        assert_sql_allowed("created_at BETWEEN '2025-01-01' AND '2025-12-31'");
-    }
-
-    #[test]
-    fn test_sql_valid_boolean_logic() {
-        assert_sql_allowed("active = true AND (role = 'admin' OR role = 'user')");
-    }
-
-    // ── SQL Injection attacks that MUST be blocked ───────────────────
-
-    #[test]
-    fn test_sql_injection_semicolon_multi_statement() {
-        assert_sql_rejected("1=1; DROP TABLE users");
-        assert_sql_rejected("status = 'active'; DELETE FROM sessions");
-    }
-
-    #[test]
-    fn test_sql_injection_union_select_data_exfiltration() {
-        assert_sql_rejected("1=1 UNION SELECT * FROM users");
-        assert_sql_rejected("1=1 union select password from users");
-        assert_sql_rejected("id = 1 UNION\tSELECT * FROM secrets");
-    }
-
-    #[test]
-    fn test_sql_injection_subquery_in_where() {
-        assert_sql_rejected("id = (SELECT id FROM users LIMIT 1)");
-        assert_sql_rejected("name = (select password from users limit 1)");
-    }
-
-    #[test]
-    fn test_sql_injection_exists_subquery() {
-        // EXISTS with subquery should be blocked by the subquery detection
-        assert_sql_rejected("EXISTS (SELECT 1 FROM users WHERE admin = true)");
-    }
-
-    #[test]
-    fn test_sql_injection_in_subquery() {
-        assert_sql_rejected("id IN (SELECT user_id FROM admin_users)");
-    }
-
-    #[test]
-    fn test_sql_injection_drop_table() {
-        assert_sql_rejected("1=1; DROP TABLE users");
-        assert_sql_rejected("drop table users");
-    }
-
-    #[test]
-    fn test_sql_injection_truncate() {
-        assert_sql_rejected("1=1; truncate table sessions");
-    }
-
-    #[test]
-    fn test_sql_injection_alter_table() {
-        assert_sql_rejected("alter table users add column backdoor text");
-    }
-
-    #[test]
-    fn test_sql_injection_create() {
-        assert_sql_rejected("1=1; create table evil (data text)");
-    }
-
-    #[test]
-    fn test_sql_injection_grant_revoke() {
-        assert_sql_rejected("grant all on users to evil");
-        assert_sql_rejected("revoke select on users from public");
-    }
-
-    #[test]
-    fn test_sql_injection_insert_update_delete() {
-        assert_sql_rejected("1=1; insert into users (email) values ('evil@hack.com')");
-        assert_sql_rejected("1=1; update users set role = 'admin'");
-        assert_sql_rejected("1=1; delete from sessions");
-    }
-
-    #[test]
-    fn test_sql_injection_pg_sleep_timing_attack() {
-        assert_sql_rejected("pg_sleep(10)");
-        assert_sql_rejected("1=1 AND pg_sleep(5) IS NOT NULL");
-    }
-
-    #[test]
-    fn test_sql_injection_pg_file_read() {
-        assert_sql_rejected("pg_read_file('/etc/passwd')");
-        assert_sql_rejected("pg_read_binary_file('/etc/shadow')");
-        assert_sql_rejected("pg_write_file('/tmp/evil', 'data')");
-    }
-
-    #[test]
-    fn test_sql_injection_pg_ls_dir() {
-        assert_sql_rejected("pg_ls_dir('/etc')");
-        assert_sql_rejected("pg_ls_logdir()");
-        assert_sql_rejected("pg_ls_waldir()");
-    }
-
-    #[test]
-    fn test_sql_injection_lo_import_export() {
-        assert_sql_rejected("lo_import('/etc/passwd')");
-        assert_sql_rejected("lo_export(1234, '/tmp/data')");
-    }
-
-    #[test]
-    fn test_sql_injection_terminate_backend() {
-        assert_sql_rejected("pg_terminate_backend(1234)");
-        assert_sql_rejected("pg_cancel_backend(1234)");
-    }
-
-    #[test]
-    fn test_sql_injection_dblink() {
-        assert_sql_rejected("dblink('host=evil.com', 'SELECT * FROM users')");
-        assert_sql_rejected("dblink_connect('evil_conn', 'host=evil.com')");
-        assert_sql_rejected("dblink_exec('evil_conn', 'DROP TABLE users')");
-    }
-
-    #[test]
-    fn test_sql_injection_set_config() {
-        assert_sql_rejected("set_config('log_statement', 'all', false)");
-    }
-
-    #[test]
-    fn test_sql_injection_copy() {
-        assert_sql_rejected("1=1; copy users to '/tmp/dump'");
-    }
-
-    #[test]
-    fn test_sql_injection_comment_hiding() {
-        assert_sql_rejected("1=1 -- AND admin = false");
-        assert_sql_rejected("1=1 /* hidden payload */");
-    }
-
-    #[test]
-    fn test_sql_injection_into_clause() {
-        assert_sql_rejected("1=1 into outfile '/tmp/data'");
-    }
-
-    #[test]
-    fn test_sql_injection_execute_prepare() {
-        assert_sql_rejected("execute evil_plan");
-        assert_sql_rejected("prepare evil_plan as select * from users");
-    }
-
-    #[test]
-    fn test_sql_injection_transaction_control() {
-        assert_sql_rejected("begin ; drop table users");
-        assert_sql_rejected("commit ; drop table users");
-        assert_sql_rejected("rollback ; drop table users");
-    }
-
-    #[test]
-    fn test_sql_injection_intersect_except() {
-        assert_sql_rejected("1=1 intersect select * from admin_users");
-        assert_sql_rejected("1=1 except select * from restricted");
-    }
-
-    #[test]
-    fn test_sql_injection_empty_where() {
-        assert_sql_rejected("");
-        assert_sql_rejected("   ");
-    }
-
-    #[test]
-    fn test_sql_injection_keyword_inside_string_literal_allowed() {
-        // The word "drop" inside a string literal should NOT trigger rejection
-        // because strip_sql_string_literals removes string content before checking
-        assert_sql_allowed("description = 'drop this item'");
-        assert_sql_allowed("name = 'select the best option'");
-        assert_sql_allowed("note = 'please delete me'");
+    fn test_postgres_limit_is_capped() {
+        assert_eq!(PostgresSource::clamp_limit(None), MAX_QUERY_LIMIT);
+        assert_eq!(PostgresSource::clamp_limit(Some(25)), 25);
+        assert_eq!(PostgresSource::clamp_limit(Some(10_000)), MAX_QUERY_LIMIT);
     }
 
     // ── Sort field validation tests ──────────────────────────────────
