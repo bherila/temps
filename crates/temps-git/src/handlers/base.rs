@@ -717,7 +717,14 @@ pub async fn list_connections(
 
     let (connections, total_count) = state
         .git_provider_manager
-        .get_user_connections_paginated(page, per_page, sort, direction)
+        .get_user_connections_paginated(
+            auth.user_id(),
+            auth.is_admin(),
+            page,
+            per_page,
+            sort,
+            direction,
+        )
         .await?;
 
     let response_connections: Vec<ConnectionResponse> = connections

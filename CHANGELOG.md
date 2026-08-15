@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can get a local build working without trial and error.
 
 ### Fixed
+- **Git provider connection authorization**: Setup-created GitHub PAT connections are now assigned to the admin user, and project creation/template fork flows verify that authenticated users can only use their own git provider connections unless they are administrators. This prevents low-privileged users from enumerating or deploying with an operator setup token.
 -
 
 
