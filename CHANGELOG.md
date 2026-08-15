@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Pinned preview gateway image default**: The default `ghcr.io/gotempsh/temps-preview-gateway` image now uses the release tag `0.1.0` instead of mutable `latest`, so automatic startup reconciliation pulls an auditable artifact rather than whatever the registry tag currently resolves to.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
