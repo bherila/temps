@@ -10,6 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sea_orm::{DatabaseConnection, EntityTrait};
 
+use temps_auth::Permission;
 use temps_entities::metric_alert_rules;
 
 use crate::provider::{ConversationContextProvider, ConversationSeed};
@@ -35,6 +36,10 @@ impl AlertChatProvider {
 impl ConversationContextProvider for AlertChatProvider {
     fn context_type(&self) -> &'static str {
         "alert"
+    }
+
+    fn required_permission(&self) -> Option<Permission> {
+        Some(Permission::OtelRead)
     }
 
     async fn seed(&self, project_id: i32, context_id: &str) -> Option<ConversationSeed> {

@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 
 use temps_ai::ChatTool;
-use temps_auth::context::AuthContext;
+use temps_auth::{context::AuthContext, Permission};
 
 /// Shared behavioural guidance appended to every conversation's system framing,
 /// right after each context's role preamble and before its specific facts.
@@ -63,6 +63,15 @@ pub struct ConversationSeed {
 pub trait ConversationContextProvider: Send + Sync {
     /// The `context_type` this provider handles, e.g. `"deployment"`.
     fn context_type(&self) -> &'static str;
+
+    /// Finer-grained permission required before this provider may seed or replay
+    /// context. The route already enforces project access; providers that embed
+    /// data guarded by a more specific domain permission must return it here so
+    /// the caller cannot use chat as a permission bypass. Default: no extra
+    /// permission.
+    fn required_permission(&self) -> Option<Permission> {
+        None
+    }
 
     /// Finer-grained authorization for this context (the route already enforces
     /// project-level access). Default allow.

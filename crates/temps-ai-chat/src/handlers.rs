@@ -556,6 +556,10 @@ pub async fn create_conversation(
         return Err(too_long("context_id", MAX_CONTEXT_ID_LEN));
     }
     ensure_enabled(&state, project_id).await?;
+    state
+        .service
+        .authorize_context(project_id, &req.context_type, &req.context_id, &auth)
+        .await?;
     let conv = state
         .service
         .get_or_create(
@@ -599,6 +603,10 @@ pub async fn get_conversation(
     let conv = state
         .service
         .get_by_public_id(project_id, &public_id)
+        .await?;
+    state
+        .service
+        .authorize_context(project_id, &conv.context_type, &conv.context_id, &auth)
         .await?;
     let messages = state
         .service
@@ -645,6 +653,10 @@ pub async fn send_message(
     let conv = state
         .service
         .get_by_public_id(project_id, &public_id)
+        .await?;
+    state
+        .service
+        .authorize_context(project_id, &conv.context_type, &conv.context_id, &auth)
         .await?;
     // Page context is advisory framing, not user content: cap it and silently
     // drop an oversized value rather than failing the message.

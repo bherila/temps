@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 
 use temps_ai::ChatTool;
+use temps_auth::Permission;
 use temps_entities::types::JobStatus;
 use temps_entities::{deployment_jobs, deployments};
 use temps_logs::LogService;
@@ -69,6 +70,10 @@ impl DeploymentChatProvider {
 impl ConversationContextProvider for DeploymentChatProvider {
     fn context_type(&self) -> &'static str {
         "deployment"
+    }
+
+    fn required_permission(&self) -> Option<Permission> {
+        Some(Permission::DeploymentsRead)
     }
 
     async fn seed(&self, project_id: i32, context_id: &str) -> Option<ConversationSeed> {
