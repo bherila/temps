@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **External plugin proxy authentication**: Require authenticated Temps callers for `/x/plugins` and `/x/{plugin}` routes, strip caller-supplied `x-temps-*` identity headers, and synthesize trusted plugin auth headers from `AuthContext` so plugins cannot be reached or impersonated by unauthenticated requests.
+
 
 
 ## [0.1.0-beta.35] - 2026-06-19

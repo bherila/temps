@@ -4,10 +4,22 @@ use std::path::PathBuf;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use temps_auth::AuthContext;
 use tracing::{debug, error};
+
+type HmacSha256 = Hmac<Sha256>;
+
+const HEADER_PLUGIN: &str = "x-temps-plugin";
+const HEADER_USER_ID: &str = "x-temps-user-id";
+const HEADER_USER_EMAIL: &str = "x-temps-user-email";
+const HEADER_USER_ROLE: &str = "x-temps-user-role";
+const HEADER_REQUEST_ID: &str = "x-temps-request-id";
+const HEADER_AUTH_SIGNATURE: &str = "x-temps-auth-signature";
 
 /// Proxy configuration for a single external plugin.
 #[derive(Debug, Clone)]
@@ -110,27 +122,90 @@ async fn forward_to_unix_socket(
         }
     });
 
+    let auth = original_request
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .ok_or_else(|| "Authentication required for external plugin proxy".to_string())?;
+
+    let request_id = uuid::Uuid::new_v4().to_string();
     let (mut parts, body) = original_request.into_parts();
 
+    // Never forward caller-controlled Temps protocol headers. They are trusted
+    // by plugin SDKs, so the proxy must derive them only from Temps auth state.
+    parts.headers.remove(HEADER_USER_ID);
+    parts.headers.remove(HEADER_USER_EMAIL);
+    parts.headers.remove(HEADER_USER_ROLE);
+    parts.headers.remove(HEADER_REQUEST_ID);
+    parts.headers.remove(HEADER_AUTH_SIGNATURE);
+    parts.headers.remove(HEADER_PLUGIN);
+
     parts.headers.insert(
-        "x-temps-plugin",
+        HEADER_PLUGIN,
         proxy
             .plugin_name
             .parse()
             .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("unknown")),
     );
+    if let Some(user) = auth.user.as_ref() {
+        parts.headers.insert(
+            HEADER_USER_ID,
+            HeaderValue::from_str(&user.id.to_string()).map_err(|e| {
+                format!(
+                    "Invalid authenticated user ID header for plugin proxy: {}",
+                    e
+                )
+            })?,
+        );
+        parts.headers.insert(
+            HEADER_USER_EMAIL,
+            HeaderValue::from_str(&user.email).map_err(|e| {
+                format!(
+                    "Invalid authenticated user email header for plugin proxy: {}",
+                    e
+                )
+            })?,
+        );
+    }
+    let role = auth.effective_role.to_string();
     parts.headers.insert(
-        "x-temps-request-id",
-        uuid::Uuid::new_v4()
-            .to_string()
-            .parse()
-            .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("")),
+        HEADER_USER_ROLE,
+        HeaderValue::from_str(&role).map_err(|e| {
+            format!(
+                "Invalid authenticated user role header for plugin proxy: {}",
+                e
+            )
+        })?,
+    );
+    parts.headers.insert(
+        HEADER_REQUEST_ID,
+        HeaderValue::from_str(&request_id)
+            .map_err(|e| format!("Invalid request ID header for plugin proxy: {}", e))?,
     );
 
     let target_uri: hyper::Uri = path_and_query
         .parse()
         .map_err(|e| format!("Invalid URI '{}': {}", path_and_query, e))?;
     parts.uri = target_uri;
+
+    let user_id = auth
+        .user
+        .as_ref()
+        .map(|user| user.id.to_string())
+        .unwrap_or_default();
+    let signature = sign_plugin_request(
+        &proxy.auth_secret,
+        parts.method.as_str(),
+        path_and_query,
+        &request_id,
+        &user_id,
+        &role,
+    )?;
+    parts.headers.insert(
+        HEADER_AUTH_SIGNATURE,
+        HeaderValue::from_str(&signature)
+            .map_err(|e| format!("Invalid auth signature header for plugin proxy: {}", e))?,
+    );
 
     parts.headers.insert(
         hyper::header::HOST,
@@ -147,6 +222,28 @@ async fn forward_to_unix_socket(
     let (parts, body) = response.into_parts();
     let body = Body::new(body);
     Ok(Response::from_parts(parts, body))
+}
+
+fn sign_plugin_request(
+    auth_secret: &str,
+    method: &str,
+    path_and_query: &str,
+    request_id: &str,
+    user_id: &str,
+    role: &str,
+) -> Result<String, String> {
+    let mut mac = HmacSha256::new_from_slice(auth_secret.as_bytes())
+        .map_err(|e| format!("Invalid plugin auth secret for HMAC signing: {}", e))?;
+    mac.update(method.as_bytes());
+    mac.update(b"\n");
+    mac.update(path_and_query.as_bytes());
+    mac.update(b"\n");
+    mac.update(request_id.as_bytes());
+    mac.update(b"\n");
+    mac.update(user_id.as_bytes());
+    mac.update(b"\n");
+    mac.update(role.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
+use temps_auth::{check_permission, Permission, RequireAuth};
 use temps_core::external_plugin::{NavEntry, NavSection, PluginManifest, UiManifest, UiRoute};
 use utoipa::{OpenApi as OpenApiTrait, ToSchema};
 
@@ -29,7 +30,10 @@ pub struct ExternalPluginsAppState {
     ),
     security(("bearer_auth" = []))
 )]
-async fn list_external_plugins(State(state): State<ExternalPluginsAppState>) -> impl IntoResponse {
+async fn list_external_plugins(
+    RequireAuth(_auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+) -> impl IntoResponse {
     Json(state.service.manifests().await)
 }
 
@@ -62,21 +66,25 @@ pub struct ReloadResponse {
     ),
     security(("bearer_auth" = []))
 )]
-async fn reload_plugins(State(state): State<ExternalPluginsAppState>) -> impl IntoResponse {
+async fn reload_plugins(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
+    check_permission(&auth, &Permission::SystemAdmin)?;
     tracing::info!("Admin triggered plugin reload");
 
     let manifests = state.service.reload_plugins().await;
     let names: Vec<String> = manifests.iter().map(|m| m.name.clone()).collect();
     let count = names.len();
 
-    (
+    Ok((
         StatusCode::OK,
         Json(ReloadResponse {
             loaded: count,
             plugins: names,
             message: format!("Reload complete. {} plugin(s) loaded.", count),
         }),
-    )
+    ))
 }
 
 /// Build the router for external plugin management endpoints.
