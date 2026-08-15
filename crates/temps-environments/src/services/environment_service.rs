@@ -790,8 +790,8 @@ impl EnvironmentService {
     /// the proxy reloads its route table.
     ///
     /// Returns `InvalidInput` if the slugified value is empty, exceeds the
-    /// DNS label length limit, or collides with another environment in the
-    /// same project.
+    /// DNS label length limit, or collides with another active environment
+    /// globally because preview hostnames are keyed by subdomain.
     pub async fn update_environment_subdomain(
         &self,
         project_id: i32,
@@ -819,9 +819,10 @@ impl EnvironmentService {
             return Ok(environment);
         }
 
-        // Reject collisions with any other environment in the same project.
+        // Reject collisions with any other active environment. Preview
+        // hostnames are globally routed as `<subdomain>.<preview_domain>`, so
+        // the namespace cannot be scoped to the caller's project.
         let conflict = environments::Entity::find()
-            .filter(environments::Column::ProjectId.eq(project_id))
             .filter(environments::Column::Subdomain.eq(&normalized))
             .filter(environments::Column::Id.ne(env_id))
             .filter(environments::Column::DeletedAt.is_null())
@@ -829,8 +830,8 @@ impl EnvironmentService {
             .await?;
         if let Some(other) = conflict {
             return Err(EnvironmentError::InvalidInput(format!(
-                "Subdomain '{}' is already used by environment '{}' in this project",
-                normalized, other.name
+                "Subdomain '{}' is already used by environment '{}' in project {}",
+                normalized, other.name, other.project_id
             )));
         }
 
@@ -1682,6 +1683,52 @@ mod tests {
                 assert!(
                     msg.contains("production"),
                     "Error should name the conflicting env: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected InvalidInput, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_subdomain_rejects_conflict_across_projects() {
+        let env = make_env_model(false, false);
+        let conflict = environments::Model {
+            id: 2,
+            name: "victim-production".to_string(),
+            slug: "production".to_string(),
+            subdomain: "victim".to_string(),
+            project_id: 99,
+            ..make_env_model(false, false)
+        };
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // 1. get_environment
+            .append_query_results(vec![vec![env]])
+            // 2. global conflict check returns an environment in another project
+            .append_query_results(vec![vec![conflict]])
+            .into_connection();
+        let svc = make_service(db);
+
+        let result = svc
+            .update_environment_subdomain(10, 1, "victim".to_string())
+            .await;
+
+        match result {
+            Err(EnvironmentError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("already used"),
+                    "Error should describe conflict: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("victim-production"),
+                    "Error should name the conflicting env: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("project 99"),
+                    "Error should identify the conflicting project: {}",
                     msg
                 );
             }
