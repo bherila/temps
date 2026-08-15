@@ -15,17 +15,7 @@ use tokio_postgres::{types::ToSql, Client, NoTls};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{debug, error, warn};
 
-const FILTER_WHERE_PLACEHOLDER: &str = "status = 'active' AND created_at > '2025-01-01'";
-
-/// Server-side ceiling for the introspection paths that take no `QueryOptions`
-/// — `count` and the size/row-estimate lookups behind `get_entity_info`.
-///
-/// Those have no caller-supplied deadline to honour, but they are the paths a
-/// prompt-injected agent can call in bulk (`get_entity_info` is in the read
-/// allowlist), and `COUNT(*)` with a caller-supplied WHERE clause is a full
-/// scan. Ten seconds is far more than an honest count needs and short enough
-/// that a pile of them cannot hold the pool.
-const DEFAULT_COUNT_TIMEOUT_MS: u64 = 10_000;
+const MAX_QUERY_LIMIT: usize = 100;
 
 /// Escape a SQL identifier by doubling any internal double-quote characters.
 /// Prevents identifier injection when used inside `"..."` quoting.
@@ -934,264 +924,6 @@ pub async fn connect_with_self_signed_tls_config(
 }
 
 impl PostgresSource {
-    /// Above this many estimated rows, report the planner's estimate rather
-    /// than running an exact `COUNT(*)`.
-    ///
-    /// `COUNT(*)` in PostgreSQL is a full heap scan — there is no maintained
-    /// row counter — so opening a large table in the data browser used to
-    /// block on a scan of the whole thing before a single row could render.
-    /// Below the threshold the exact count is cheap and worth having; above
-    /// it, nobody is reading "12,481,003" as an exact figure anyway.
-    const EXACT_COUNT_MAX_ROWS: f32 = 50_000.0;
-
-    /// Row count and on-disk size for a table, cheaply.
-    ///
-    /// `pg_class.reltuples` and `pg_total_relation_size` are both O(1) catalog
-    /// lookups. `reltuples` is `-1` on a table that has never been analysed
-    /// (PG14+) and `0` on older versions, in which case we fall through to the
-    /// exact count rather than reporting a wrong number.
-    ///
-    /// Returns `(row_count, size_bytes)`; either may be `None` if the catalog
-    /// lookup fails (e.g. insufficient privileges), which callers already
-    /// render as "—" rather than as zero.
-    async fn row_count_and_size(
-        &self,
-        schema_name: &str,
-        entity_name: &str,
-    ) -> (Option<usize>, Option<u64>) {
-        self.row_count_and_size_with_timeout(schema_name, entity_name, DEFAULT_COUNT_TIMEOUT_MS)
-            .await
-    }
-
-    async fn row_count_and_size_with_timeout(
-        &self,
-        schema_name: &str,
-        entity_name: &str,
-        timeout_ms: u64,
-    ) -> (Option<usize>, Option<u64>) {
-        let client = &self.client;
-        let _timeout_guard = self.query_timeout_lock.lock().await;
-        if let Err(error) = client
-            .batch_execute(&format!("SET statement_timeout = {timeout_ms}"))
-            .await
-        {
-            warn!(%error, "failed to bound PostgreSQL entity-info statistics query");
-            return (None, None);
-        }
-
-        let qualified = format!(
-            "\"{}\".\"{}\"",
-            escape_ident(schema_name),
-            escape_ident(entity_name)
-        );
-
-        // Bound as a *string* to ::regclass — never interpolated as SQL — so a
-        // crafted table name cannot escape into the catalog query.
-        let stats = client
-            .query_one(
-                // `$1::text::regclass`, not `$1::regclass`: the latter makes
-                // the extended protocol infer a `regclass` parameter type,
-                // which the driver cannot bind a String to — the query then
-                // fails silently and every table falls back to the full scan
-                // this function exists to avoid.
-                "SELECT reltuples, pg_total_relation_size($1::text::regclass) \
-                 FROM pg_class WHERE oid = $1::text::regclass",
-                &[&qualified],
-            )
-            .await
-            .ok();
-
-        let (reltuples, size_bytes) = match stats {
-            Some(row) => (
-                row.try_get::<_, f32>(0).ok(),
-                row.try_get::<_, i64>(1).ok().map(|s| s.max(0) as u64),
-            ),
-            None => (None, None),
-        };
-
-        // Large and analysed → trust the estimate and skip the scan.
-        if let Some(estimate) = reltuples {
-            if estimate >= Self::EXACT_COUNT_MAX_ROWS {
-                return (Some(estimate as usize), size_bytes);
-            }
-        }
-
-        // Small, or never analysed → exact count is affordable.
-        let count_query = format!("SELECT COUNT(*) FROM {qualified}");
-        let row_count = client
-            .query_one(&count_query, &[])
-            .await
-            .ok()
-            .and_then(|row| row.try_get::<_, i64>(0).ok())
-            .map(|c| c as usize);
-
-        (row_count, size_bytes)
-    }
-    /// Return the byte length of a PostgreSQL dollar-quote delimiter at the
-    /// start of `sql`. Tags follow unquoted identifier rules, except that `$`
-    /// is not permitted inside the tag.
-    fn dollar_quote_delimiter_len(sql: &str) -> Option<usize> {
-        let after_dollar = sql.strip_prefix('$')?;
-        if after_dollar.starts_with('$') {
-            return Some(2);
-        }
-
-        let mut chars = after_dollar.char_indices();
-        let (_, first) = chars.next()?;
-        // PostgreSQL accepts any high-bit character in an unquoted identifier,
-        // including characters Rust does not classify as alphabetic.
-        if !(first == '_' || first.is_ascii_alphabetic() || !first.is_ascii()) {
-            return None;
-        }
-
-        for (index, character) in chars {
-            if character == '$' {
-                return Some(1 + index + character.len_utf8());
-            }
-            if !(character == '_' || character.is_ascii_alphanumeric() || !character.is_ascii()) {
-                return None;
-            }
-        }
-
-        None
-    }
-
-    /// Strip SQL string literals to avoid false positives when scanning for dangerous patterns.
-    /// Replaces content inside single-quoted strings with empty strings while
-    /// honoring PostgreSQL `E'...'` escapes and dollar-quoted strings.
-    /// Ambiguous backslash-escaped quotes in ordinary strings are rejected so
-    /// validation is independent of the server's `standard_conforming_strings`
-    /// setting.
-    fn strip_sql_string_literals(sql: &str) -> Result<String> {
-        let mut result = String::with_capacity(sql.len());
-        let mut position = 0;
-
-        while position < sql.len() {
-            let remaining = &sql[position..];
-
-            let at_token_boundary = sql[..position].chars().next_back().is_none_or(|previous| {
-                !(previous.is_ascii_alphanumeric()
-                    || previous == '_'
-                    || previous == '$'
-                    || !previous.is_ascii())
-            });
-            if let Some(delimiter_len) = at_token_boundary
-                .then(|| Self::dollar_quote_delimiter_len(remaining))
-                .flatten()
-            {
-                let delimiter = &remaining[..delimiter_len];
-                let content = &remaining[delimiter_len..];
-                let closing_offset = content.find(delimiter).ok_or_else(|| {
-                    DataError::InvalidQuery(
-                        "Unterminated dollar-quoted string in WHERE clause".to_string(),
-                    )
-                })?;
-                result.push_str("''");
-                position += delimiter_len + closing_offset + delimiter_len;
-                continue;
-            }
-
-            let Some(character) = remaining.chars().next() else {
-                break;
-            };
-            if character == '"' {
-                position += character.len_utf8();
-                let mut terminated = false;
-                while position < sql.len() {
-                    let identifier_remaining = &sql[position..];
-                    let Some(identifier_char) = identifier_remaining.chars().next() else {
-                        break;
-                    };
-                    position += identifier_char.len_utf8();
-                    if identifier_char == '"' {
-                        if sql[position..].starts_with('"') {
-                            position += '"'.len_utf8();
-                        } else {
-                            terminated = true;
-                            break;
-                        }
-                    }
-                }
-
-                if !terminated {
-                    return Err(DataError::InvalidQuery(
-                        "Unterminated quoted identifier in WHERE clause".to_string(),
-                    ));
-                }
-                // Keep a quoted-identifier placeholder so `"function"(...)`
-                // is still recognized as a forbidden function call.
-                result.push_str("\"\"");
-                continue;
-            }
-            if character != '\'' {
-                result.push(character);
-                position += character.len_utf8();
-                continue;
-            }
-
-            let prefix = &sql[..position];
-            let escape_string = (prefix.ends_with('e') || prefix.ends_with('E'))
-                && prefix[..prefix.len() - 1]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|previous| {
-                        !(previous.is_ascii_alphanumeric()
-                            || previous == '_'
-                            || previous == '$'
-                            || !previous.is_ascii())
-                    });
-            result.push('\'');
-            position += character.len_utf8();
-            let mut terminated = false;
-
-            while position < sql.len() {
-                let string_remaining = &sql[position..];
-                let Some(string_char) = string_remaining.chars().next() else {
-                    break;
-                };
-                position += string_char.len_utf8();
-
-                if string_char == '\\' {
-                    if escape_string {
-                        let Some(escaped) = sql[position..].chars().next() else {
-                            return Err(DataError::InvalidQuery(
-                                "Unterminated escape sequence in WHERE clause string literal"
-                                    .to_string(),
-                            ));
-                        };
-                        position += escaped.len_utf8();
-                        continue;
-                    }
-
-                    if sql[position..].starts_with('\'') {
-                        return Err(DataError::InvalidQuery(
-                            "Backslash-escaped quotes require an explicit PostgreSQL E string"
-                                .to_string(),
-                        ));
-                    }
-                }
-
-                if string_char == '\'' {
-                    if sql[position..].starts_with('\'') {
-                        position += '\''.len_utf8();
-                    } else {
-                        result.push('\'');
-                        terminated = true;
-                        break;
-                    }
-                }
-            }
-
-            if !terminated {
-                return Err(DataError::InvalidQuery(
-                    "Unterminated string literal in WHERE clause".to_string(),
-                ));
-            }
-        }
-
-        Ok(result)
-    }
-
     /// Validate that a sort_by field name is a safe SQL identifier.
     /// Only allows alphanumeric characters, underscores, and optionally
     /// double-quoted identifiers.
@@ -1241,206 +973,22 @@ impl PostgresSource {
         Ok(())
     }
 
-    /// Validate SQL input for dangerous operations.
-    /// Used to sanitize user-provided WHERE clauses in the data browser.
-    ///
-    /// Security: Uses both a denylist of dangerous patterns AND structural
-    /// validation to prevent SQL injection. The denylist catches known attack
-    /// patterns while structural checks block injection vectors like subqueries,
-    /// UNION, and function calls that could bypass simple pattern matching.
-    fn validate_sql(sql: &str) -> Result<()> {
-        let sql_trimmed = sql.trim();
-
-        if sql_trimmed.is_empty() {
-            return Err(DataError::InvalidQuery(
-                "WHERE clause cannot be empty".to_string(),
-            ));
+    /// Reject raw SQL filter fragments. The public query API accepts JSON from
+    /// low-privileged readers, so PostgreSQL must not concatenate caller-provided
+    /// expressions into WHERE clauses. A future typed filter DSL can translate
+    /// validated operators into bound parameters here.
+    fn validate_filters(filters: Option<&serde_json::Value>) -> Result<()> {
+        match filters {
+            None => Ok(()),
+            Some(value) if value.as_object().is_some_and(|object| object.is_empty()) => Ok(()),
+            Some(_) => Err(DataError::InvalidQuery(
+                "PostgreSQL data browsing does not accept raw SQL filters".to_string(),
+            )),
         }
+    }
 
-        // Strip string literals to avoid false positives on content inside quotes
-        // Lex case-sensitive dollar tags and quoted identifiers before
-        // lowercasing the remaining SQL for keyword comparisons.
-        //
-        // SECURITY: collapse every whitespace run to a single space *before*
-        // the keyword checks below. The denylist matches literal prefixes like
-        // `"union "` / `"union\t"` / `"union\n"`, which meant any other
-        // separator PostgreSQL's lexer accepts slipped straight through —
-        // `false UNION\rSELECT …` matched nothing, contained no `;` or `(`,
-        // and so passed every structural check too. Normalising here means the
-        // list only ever has to know about one separator.
-        let without_strings =
-            normalize_sql_whitespace(&Self::strip_sql_string_literals(sql_trimmed)?).to_lowercase();
-
-        // STRUCTURAL CHECKS: Block injection vectors that denylist alone cannot catch
-
-        // Prevent multi-statement execution via semicolons
-        if without_strings.contains(';') {
-            return Err(DataError::InvalidQuery(
-                "Multiple SQL statements are not allowed".to_string(),
-            ));
-        }
-
-        // Prevent subqueries through every parenthesized PostgreSQL query form.
-        reject_subqueries_and_function_calls(&without_strings)?;
-
-        // Block SQL comments which can be used to hide attack payloads
-        if without_strings.contains("--") || without_strings.contains("/*") {
-            return Err(DataError::InvalidQuery(
-                "SQL comments are not allowed in the data browser".to_string(),
-            ));
-        }
-
-        // DENYLIST: Block dangerous SQL keywords and operations
-        // These are checked against the string-stripped version to prevent
-        // hiding keywords inside string literals
-        let dangerous_keywords = [
-            // DDL operations
-            "drop ",
-            "truncate ",
-            "alter ",
-            "create ",
-            "grant ",
-            "revoke ",
-            // Data manipulation that shouldn't appear in WHERE
-            "insert ",
-            "update ",
-            "delete ",
-            "copy ",
-            // Set operations that enable data exfiltration. One space suffices
-            // now that `normalize_sql_whitespace` runs first — previously this
-            // enumerated separators by hand and missed \r, \f and \v.
-            "union ",
-            "intersect ",
-            "except ",
-            // Dangerous PostgreSQL functions
-            "pg_read_file",
-            "pg_write_file",
-            "pg_ls_dir",
-            "pg_read_binary_file",
-            "pg_stat_file",
-            "lo_import",
-            "lo_export",
-            "lo_get",
-            "lo_put",
-            "pg_sleep",
-            "pg_terminate_backend",
-            "pg_cancel_backend",
-            "pg_reload_conf",
-            "pg_rotate_logfile",
-            "set_config",
-            "current_setting",
-            "dblink",
-            "dblink_connect",
-            "dblink_exec",
-            // Information disclosure functions
-            "pg_ls_logdir",
-            "pg_ls_waldir",
-            "pg_ls_tmpdir",
-            "pg_ls_archive_statusdir",
-            // Execute/prepare
-            "execute ",
-            "prepare ",
-            // Transaction control
-            "begin ",
-            "commit ",
-            "rollback ",
-            "savepoint ",
-            // INTO clause (write results to table/file)
-            " into ",
-        ];
-
-        // Match on token boundaries, not raw substrings. The trailing space in
-        // each entry was doing the boundary work, badly: it made any column
-        // whose name *ends* with a keyword unfilterable (`payload` contains
-        // `load `... once the following space is counted) while missing the
-        // keyword at end-of-input entirely.
-        for keyword in &dangerous_keywords {
-            if contains_sql_token(&without_strings, keyword.trim()) {
-                return Err(DataError::InvalidQuery(format!(
-                    "SQL operation '{}' is not allowed in the data browser",
-                    keyword.trim()
-                )));
-            }
-        }
-
-        // SECURITY: no regex operators.
-        //
-        // The denylist above runs on string-stripped input, so a regex pattern
-        // — which lives entirely inside a string literal — is invisible to it.
-        // `1=1 AND 'aaaaaaaaaaaaaaaaaaaaaaaa' ~ '^(a+)+$'` strips to
-        // `1=1 and '' ~ ''` and passes everything. PostgreSQL's regex engine is
-        // a backtracking NFA, so that is catastrophic backtracking: the same
-        // CPU-burn primitive on the operator's database that the function-call
-        // guard exists to prevent, reached through a door the guard cannot see.
-        //
-        // Not fixable by pattern-matching the payload, because the payload is
-        // opaque to us by construction. Reject the operators instead — LIKE and
-        // ILIKE cover what a data browser filter legitimately needs.
-        // A bare `~` covers ~, ~*, !~, !~* and ~~ in one test. `SIMILAR TO` is a
-        // separate spelling that PostgreSQL translates into the SAME
-        // backtracking engine, so rejecting only the operator forms left the
-        // ReDoS this check exists to stop wide open under a different name.
-        if without_strings.contains('~') || contains_sql_token(&without_strings, "similar") {
-            return Err(DataError::InvalidQuery(
-                "Regular-expression matching (~, ~*, !~, !~*, SIMILAR TO) is not allowed in the \
-                 data browser — use LIKE or ILIKE instead"
-                    .to_string(),
-            ));
-        }
-
-        // SECURITY: no parenless information functions.
-        //
-        // The function-call guard keys on an identifier immediately before `(`,
-        // so PostgreSQL's niladic-callable functions — spelled without parens —
-        // walk straight past it, as does a `::regclass` cast. None of these are
-        // data theft on their own, but they give blind boolean extraction of
-        // the connection user, schema and catalog, plus a relation-existence
-        // oracle whose error text this API returns verbatim. A data-browser
-        // filter has no legitimate use for any of them.
-        const INFORMATION_TOKENS: [&str; 15] = [
-            "current_user",
-            "session_user",
-            "current_role",
-            "current_catalog",
-            "current_schema",
-            "current_database",
-            // Bare `USER` is a reserved niladic keyword equivalent to
-            // CURRENT_USER, so denying only the `current_` spelling left the
-            // same blind-extraction oracle open under a shorter name.
-            "user",
-            // Every `reg*` cast is a catalog-existence oracle — the cast either
-            // resolves or raises an error naming what was missing, and this API
-            // returns that error text verbatim. Denying only `regclass` covered
-            // one of seven.
-            "regclass",
-            "regrole",
-            "regnamespace",
-            "regtype",
-            "regproc",
-            "regprocedure",
-            "regoper",
-            "regconfig",
-        ];
-        for token in INFORMATION_TOKENS {
-            if contains_sql_token(&without_strings, token) {
-                return Err(DataError::InvalidQuery(format!(
-                    "'{token}' is not allowed in the data browser"
-                )));
-            }
-        }
-
-        // Also check for dangerous keywords at the very start of the string
-        let dangerous_starts = ["into "];
-        for keyword in &dangerous_starts {
-            if without_strings.starts_with(keyword) {
-                return Err(DataError::InvalidQuery(format!(
-                    "SQL operation '{}' is not allowed in the data browser",
-                    keyword.trim()
-                )));
-            }
-        }
-
-        Ok(())
+    fn clamp_limit(limit: Option<usize>) -> usize {
+        limit.unwrap_or(MAX_QUERY_LIMIT).min(MAX_QUERY_LIMIT)
     }
 
     /// Map PostgreSQL type to FieldType
@@ -2094,22 +1642,17 @@ impl Queryable for PostgresSource {
 
         let start = std::time::Instant::now();
 
-        // Build SQL query
+        Self::validate_filters(filters.as_ref())?;
+        let schema = self.get_schema(container_path, entity_name).await?;
+
+        // Build SQL query with escaped identifiers only. PostgreSQL cannot bind
+        // table/column identifiers as parameters, so all identifier inputs are
+        // either escaped or validated against the discovered table schema.
         let mut sql = format!(
             "SELECT * FROM \"{}\".\"{}\"",
             escape_ident(schema_name),
             escape_ident(entity_name)
         );
-
-        // Add WHERE clause if filters provided
-        if let Some(filter_json) = filters {
-            if let Some(where_clause) = filter_json.get("where").and_then(|v| v.as_str()) {
-                // Validate WHERE clause for dangerous operations
-                Self::validate_sql(where_clause)?;
-                sql.push_str(" WHERE ");
-                sql.push_str(where_clause);
-            }
-        }
 
         // Add ORDER BY
         if let Some(sort_by) = &options.sort_by {
@@ -2127,21 +1670,26 @@ impl Queryable for PostgresSource {
             // resting on that.
             let sort_by = sort_by.trim();
             Self::validate_sort_field(sort_by)?;
+            if !schema.fields.iter().any(|field| field.name == *sort_by) {
+                return Err(DataError::InvalidQuery(format!(
+                    "Sort field '{}' is not present in table '{}.{}'",
+                    sort_by, schema_name, entity_name
+                )));
+            }
             let sort_order = match options.sort_order.as_deref() {
                 Some("desc") | Some("DESC") => "DESC",
                 _ => "ASC",
             };
-            // Quote the column name to handle camelCase identifiers correctly
-            let quoted_sort = if sort_by.starts_with('"') && sort_by.ends_with('"') {
-                sort_by.to_string() // Already quoted
-            } else {
-                format!("\"{}\"", sort_by)
-            };
-            sql.push_str(&format!(" ORDER BY {} {}", quoted_sort, sort_order));
+            sql.push_str(&format!(
+                " ORDER BY \"{}\" {}",
+                escape_ident(sort_by),
+                sort_order
+            ));
         }
 
-        // Add LIMIT and OFFSET
-        let limit = options.limit.unwrap_or(100);
+        // Add LIMIT and OFFSET. Enforce a hard maximum so callers cannot request
+        // unbounded result sets through the data browser endpoint.
+        let limit = Self::clamp_limit(options.limit);
         let offset = options.offset.unwrap_or(0);
         sql.push_str(&format!(" LIMIT {} OFFSET {}", limit, offset));
         let sql = with_wire_row_budget(&sql, &columns, options.budget)?;
@@ -2151,9 +1699,9 @@ impl Queryable for PostgresSource {
             limit, offset, "executing PostgreSQL data query"
         );
 
-        // Safety: SQL injection is prevented by validate_sql() for WHERE clauses
-        // and escape_ident() for identifiers. The database user should be read-only
-        // as defense-in-depth.
+        // Safety: SQL injection is prevented by rejecting raw WHERE fragments,
+        // escaping table identifiers, and validating sort columns against schema.
+        // The database user should be read-only as defense-in-depth.
         let client = &self.client;
         let _timeout_guard = self.query_timeout_lock.lock().await;
 
@@ -2267,9 +1815,6 @@ impl Queryable for PostgresSource {
         }
         let (data_rows, truncated) = bounded.into_parts();
 
-        // Get schema from first row or from table schema
-        let schema = self.get_schema(container_path, entity_name).await?;
-
         let execution_ms = start.elapsed().as_millis() as u64;
         let row_count = data_rows.len();
 
@@ -2303,21 +1848,14 @@ impl Queryable for PostgresSource {
 
         let schema_name = &container_path.segments[1];
 
-        let mut sql = format!(
+        Self::validate_filters(filters.as_ref())?;
+        let _schema = self.get_schema(container_path, entity_name).await?;
+
+        let sql = format!(
             "SELECT COUNT(*) FROM \"{}\".\"{}\"",
             escape_ident(schema_name),
             escape_ident(entity_name)
         );
-
-        // Add WHERE clause if filters provided
-        if let Some(filter_json) = filters {
-            if let Some(where_clause) = filter_json.get("where").and_then(|v| v.as_str()) {
-                // Validate WHERE clause for dangerous operations
-                Self::validate_sql(where_clause)?;
-                sql.push_str(" WHERE ");
-                sql.push_str(where_clause);
-            }
-        }
 
         let client = &self.client;
         let _timeout_guard = self.query_timeout_lock.lock().await;
@@ -2489,25 +2027,8 @@ impl temps_query::QuerySchemaProvider for PostgresSource {
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "title": "PostgreSQL Query Filters",
-            "description": "Filter data using SQL WHERE clause syntax",
-            "properties": {
-                "where": {
-                    "type": "string",
-                    "title": "WHERE Clause",
-                    "description": "SQL WHERE clause (without 'WHERE' keyword). Example: status = 'active' AND created_at > '2025-01-01'",
-                    "examples": [
-                        "status = 'active'",
-                        "created_at > '2025-01-01'",
-                        "age >= 18 AND country = 'US'",
-                        "name LIKE '%test%'",
-                        "id IN (1, 2, 3)"
-                    ],
-                    // UI hints embedded as custom properties
-                    "x-ui-widget": "textarea",
-                    "x-ui-placeholder": FILTER_WHERE_PLACEHOLDER,
-                    "x-ui-rows": 3
-                }
-            },
+            "description": "PostgreSQL data browsing currently disables raw SQL filters for security. Use sorting and pagination to inspect rows.",
+            "properties": {},
             "additionalProperties": false
         })
     }
@@ -2832,875 +2353,32 @@ mod tests {
         assert_eq!(PostgresSource::map_pg_type("jsonb"), FieldType::Json);
     }
 
-    // ── SQL Injection Prevention Tests ────────────────────────────────
+    // ── Filter validation tests ──────────────────────────────────────
 
-    // Helper: assert that a WHERE clause is rejected
-    fn assert_sql_rejected(sql: &str) {
-        let result = PostgresSource::validate_sql(sql);
+    #[test]
+    fn test_postgres_filters_reject_raw_where_fragments() {
+        let filters = serde_json::json!({"where": "status = 'active'"});
+        let result = PostgresSource::validate_filters(Some(&filters));
+
         assert!(
             result.is_err(),
-            "Expected SQL to be rejected but it was accepted: {:?}",
-            sql
+            "raw SQL WHERE fragments must not be accepted from API callers"
         );
     }
 
-    // Helper: assert that a WHERE clause is allowed
-    fn assert_sql_allowed(sql: &str) {
-        let result = PostgresSource::validate_sql(sql);
-        assert!(
-            result.is_ok(),
-            "Expected SQL to be accepted but it was rejected: {:?} — error: {:?}",
-            sql,
-            result.unwrap_err()
-        );
-    }
-
-    // ── Legitimate WHERE clauses that MUST be allowed ────────────────
-
     #[test]
-    fn test_sql_valid_simple_equality() {
-        assert_sql_allowed("status = 'active'");
+    fn test_postgres_filters_allow_absent_or_empty_filters() {
+        assert!(PostgresSource::validate_filters(None).is_ok());
+
+        let filters = serde_json::json!({});
+        assert!(PostgresSource::validate_filters(Some(&filters)).is_ok());
     }
 
     #[test]
-    fn test_sql_valid_comparison_operators() {
-        assert_sql_allowed("age >= 18 AND country = 'US'");
-        assert_sql_allowed("created_at > '2025-01-01'");
-        assert_sql_allowed("price < 100.50");
-    }
-
-    #[test]
-    fn test_sql_valid_like_pattern() {
-        assert_sql_allowed("name LIKE '%test%'");
-        assert_sql_allowed("email ILIKE '%@example.com'");
-    }
-
-    #[test]
-    fn test_sql_valid_in_list() {
-        assert_sql_allowed("id IN (1, 2, 3)");
-        assert_sql_allowed("status IN ('active', 'pending')");
-    }
-
-    #[test]
-    fn test_sql_valid_is_null() {
-        assert_sql_allowed("deleted_at IS NULL");
-        assert_sql_allowed("name IS NOT NULL");
-    }
-
-    #[test]
-    fn test_sql_valid_between() {
-        assert_sql_allowed("created_at BETWEEN '2025-01-01' AND '2025-12-31'");
-    }
-
-    #[test]
-    fn test_sql_valid_boolean_logic() {
-        assert_sql_allowed("active = true AND (role = 'admin' OR role = 'user')");
-    }
-
-    // ── SQL Injection attacks that MUST be blocked ───────────────────
-
-    #[test]
-    fn test_sql_injection_semicolon_multi_statement() {
-        assert_sql_rejected("1=1; DROP TABLE users");
-        assert_sql_rejected("status = 'active'; DELETE FROM sessions");
-    }
-
-    #[test]
-    fn test_sql_injection_union_select_data_exfiltration() {
-        assert_sql_rejected("1=1 UNION SELECT * FROM users");
-        assert_sql_rejected("1=1 union select password from users");
-        assert_sql_rejected("id = 1 UNION\tSELECT * FROM secrets");
-    }
-
-    #[test]
-    fn test_sql_injection_union_with_exotic_whitespace() {
-        // The denylist used to enumerate separators literally ("union ",
-        // "union\t", "union\n"), so any other whitespace PostgreSQL's lexer
-        // accepts walked straight past it — no semicolon, no parenthesis, so
-        // every structural check passed too. This was full arbitrary-table
-        // exfiltration through a documented filter parameter.
-        assert_sql_rejected("false UNION\rSELECT usename, passwd FROM pg_shadow");
-        assert_sql_rejected("false UNION\u{000C}SELECT usename FROM pg_shadow");
-        assert_sql_rejected("false UNION\u{000B}SELECT usename FROM pg_shadow");
-        // Mixed and repeated separators must collapse to one too.
-        assert_sql_rejected("false UNION \r\n\t SELECT usename FROM pg_shadow");
-        assert_sql_rejected("1=1 INTERSECT\rSELECT 1");
-        assert_sql_rejected("1=1 EXCEPT\rSELECT 1");
-    }
-
-    #[test]
-    fn validate_sort_field_does_not_panic_on_a_lone_quote() {
-        // `"` satisfies both starts_with('"') and ends_with('"'), so the
-        // quoted-identifier branch sliced &s[1..0] and panicked. Reachable via
-        // ?sort_by=%22 with only ExternalServicesRead, and via the agent's
-        // --sort_by flag, which makes it prompt-injectable.
-        assert!(PostgresSource::validate_sort_field("\"").is_err());
-        assert!(PostgresSource::validate_sort_field("\"\"").is_err());
-        // Ordinary identifiers, quoted and bare, still validate.
-        assert!(PostgresSource::validate_sort_field("\"created_at\"").is_ok());
-        assert!(PostgresSource::validate_sort_field("created_at").is_ok());
-    }
-
-    #[test]
-    fn normalize_sql_whitespace_collapses_every_separator() {
-        assert_eq!(normalize_sql_whitespace("a\rb"), "a b");
-        assert_eq!(normalize_sql_whitespace("a\u{000C}b"), "a b");
-        assert_eq!(normalize_sql_whitespace("a \r\n\t b"), "a b");
-        // Non-whitespace is untouched, so ordinary clauses still validate.
-        assert_eq!(normalize_sql_whitespace("id = 1"), "id = 1");
-    }
-
-    #[test]
-    fn test_sql_injection_subquery_in_where() {
-        assert_sql_rejected("id = (SELECT id FROM users LIMIT 1)");
-        assert_sql_rejected("name = (select password from users limit 1)");
-    }
-
-    #[test]
-    fn test_sql_injection_exists_subquery() {
-        // EXISTS with subquery should be blocked by the subquery detection
-        assert_sql_rejected("EXISTS (SELECT 1 FROM users WHERE admin = true)");
-    }
-
-    #[test]
-    fn test_sql_injection_in_subquery() {
-        assert_sql_rejected("id IN (SELECT user_id FROM admin_users)");
-    }
-
-    #[test]
-    fn test_sql_injection_alternate_query_expression_subqueries() {
-        assert_sql_rejected("7 IN (TABLE private_ids)");
-        assert_sql_rejected("7 in (\nTaBlE\tprivate_ids)");
-        assert_sql_rejected("7 IN ((TABLE private_ids))");
-        assert_sql_rejected("7 IN (VALUES (7))");
-        assert_sql_rejected("7 IN (WITH ids AS (TABLE private_ids) TABLE ids)");
-
-        // Token boundaries must not reject ordinary identifiers that merely
-        // contain a query-expression keyword.
-        assert_sql_allowed("selected_id IN (1, 2)");
-        assert_sql_allowed("\"table\" IN (1, 2)");
-    }
-
-    #[test]
-    fn test_sql_injection_drop_table() {
-        assert_sql_rejected("1=1; DROP TABLE users");
-        assert_sql_rejected("drop table users");
-    }
-
-    #[test]
-    fn test_sql_injection_truncate() {
-        assert_sql_rejected("1=1; truncate table sessions");
-    }
-
-    #[test]
-    fn test_sql_injection_alter_table() {
-        assert_sql_rejected("alter table users add column backdoor text");
-    }
-
-    #[test]
-    fn test_sql_injection_create() {
-        assert_sql_rejected("1=1; create table evil (data text)");
-    }
-
-    #[test]
-    fn test_sql_injection_grant_revoke() {
-        assert_sql_rejected("grant all on users to evil");
-        assert_sql_rejected("revoke select on users from public");
-    }
-
-    #[test]
-    fn test_sql_injection_insert_update_delete() {
-        assert_sql_rejected("1=1; insert into users (email) values ('evil@hack.com')");
-        assert_sql_rejected("1=1; update users set role = 'admin'");
-        assert_sql_rejected("1=1; delete from sessions");
-    }
-
-    #[test]
-    fn test_sql_injection_pg_sleep_timing_attack() {
-        assert_sql_rejected("pg_sleep(10)");
-        assert_sql_rejected("1=1 AND pg_sleep(5) IS NOT NULL");
-    }
-
-    #[test]
-    fn test_sql_injection_pg_file_read() {
-        assert_sql_rejected("pg_read_file('/etc/passwd')");
-        assert_sql_rejected("pg_read_binary_file('/etc/shadow')");
-        assert_sql_rejected("pg_write_file('/tmp/evil', 'data')");
-    }
-
-    #[test]
-    fn test_sql_injection_pg_ls_dir() {
-        assert_sql_rejected("pg_ls_dir('/etc')");
-        assert_sql_rejected("pg_ls_logdir()");
-        assert_sql_rejected("pg_ls_waldir()");
-    }
-
-    #[test]
-    fn test_sql_injection_lo_import_export() {
-        assert_sql_rejected("lo_import('/etc/passwd')");
-        assert_sql_rejected("lo_export(1234, '/tmp/data')");
-    }
-
-    #[test]
-    fn test_sql_injection_terminate_backend() {
-        assert_sql_rejected("pg_terminate_backend(1234)");
-        assert_sql_rejected("pg_cancel_backend(1234)");
-    }
-
-    #[test]
-    fn test_sql_injection_dblink() {
-        assert_sql_rejected("dblink('host=evil.com', 'SELECT * FROM users')");
-        assert_sql_rejected("dblink_connect('evil_conn', 'host=evil.com')");
-        assert_sql_rejected("dblink_exec('evil_conn', 'DROP TABLE users')");
-    }
-
-    #[test]
-    fn test_sql_injection_set_config() {
-        assert_sql_rejected("set_config('log_statement', 'all', false)");
-    }
-
-    // Regression for security review finding #4: data-returning functions carry
-    // their SQL payload inside a string literal, which is stripped before the
-    // denylist runs — so these were NOT on the denylist and slipped through.
-    // The structural "no function calls" rule blocks the whole class.
-    #[test]
-    fn test_sql_injection_xml_function_exfiltration() {
-        assert_sql_rejected(
-            "1=1 AND query_to_xml('select * from users', true, false, '') IS NOT NULL",
-        );
-        assert_sql_rejected("database_to_xml(true, false, '') IS NOT NULL");
-        assert_sql_rejected("table_to_xml('users', true, false, '') IS NOT NULL");
-    }
-
-    #[test]
-    fn test_escape_string_cannot_hide_function_call() {
-        assert_sql_rejected(
-            r"E'x\'' IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%'",
-        );
-        assert_sql_allowed(r"name = E'O\'Brien'");
-        assert_sql_rejected(r"name = 'O\'Brien'");
-        assert_sql_rejected("name = 'unterminated");
-    }
-
-    #[test]
-    fn test_dollar_quoted_string_cannot_hide_function_call() {
-        assert_sql_rejected(
-            "$tag$'$tag$ IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND $tail$'$tail$ IS NOT NULL",
-        );
-        assert_sql_allowed("name = $$O'Brien$$");
-        assert_sql_allowed("name = $person$O'Brien$person$");
-        assert_sql_allowed("name = $Tag$O'Brien$Tag$");
-        assert_sql_rejected("name = $Tag$O'Brien$tag$");
-        assert_sql_allowed("name = $💣$O'Brien$💣$");
-        assert_sql_rejected("name = $💣$unterminated");
-        assert_sql_allowed("identifier$tag$ = 1");
-        assert_sql_rejected("name = $person$unterminated");
-    }
-
-    #[test]
-    fn test_quoted_identifier_cannot_hide_function_call() {
-        assert_sql_rejected(
-            "\"'\" IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND \"'\" IS NOT NULL",
-        );
-        assert_sql_allowed("\"O'Brien\" = 1");
-        assert_sql_allowed("U&\"O\\0027Brien\" = 1");
-        assert_sql_allowed("\"contains \"\"quote\"\"\" = 1");
-        assert_sql_rejected("\"unterminated = 1");
-    }
-
-    #[test]
-    fn test_sql_injection_quoted_function_identifier_exfiltration() {
-        // PostgreSQL allows function identifiers to be quoted and optionally
-        // schema-qualified. The closing quote must still be recognized as a
-        // function-call prefix.
-        assert_sql_rejected(
-            "1=1 AND \"query_to_xml\"('select * from users', true, false, '') IS NOT NULL",
-        );
-        assert_sql_rejected(
-            "pg_catalog.\"query_to_xml\"('select * from users', true, false, '') IS NOT NULL",
-        );
-        assert_sql_rejected(
-            "\"pg_catalog\".\"query_to_xml\"('select * from users', true, false, '') IS NOT NULL",
-        );
-        assert_sql_rejected(
-            "U&\"query_to_xml\" UESCAPE '!'('select * from users', true, false, '') IS NOT NULL",
-        );
-        assert_sql_rejected(
-            "pg_catalog.U&\"query_to_xml\" UESCAPE '!'('select * from users', true, false, '') IS NOT NULL",
-        );
-        assert_sql_rejected("\"length\"(password) > 0");
-    }
-
-    #[test]
-    fn test_sql_injection_postgres_identifier_characters_before_call() {
-        // PostgreSQL accepts `$` and non-ASCII bytes after the first identifier
-        // character. They must not turn the extracted prefix into an empty or
-        // partial identifier.
-        assert_sql_rejected("evil$function(secret) IS NOT NULL");
-        assert_sql_rejected("fünction(secret) IS NOT NULL");
-    }
-
-    #[test]
-    fn test_sql_injection_qualified_grouping_keyword_function_calls() {
-        // These final identifiers are allowed only as SQL grouping keywords.
-        // Once schema-qualified, PostgreSQL parses them as function names.
-        assert_sql_rejected("public.in()");
-        assert_sql_rejected("public.and()");
-        assert_sql_rejected("public.or()");
-        assert_sql_rejected("public.not()");
-        assert_sql_rejected("public . in ()");
-    }
-
-    #[test]
-    fn test_filter_placeholder_obeys_no_function_call_contract() {
-        assert_sql_allowed(FILTER_WHERE_PLACEHOLDER);
-        assert_sql_rejected("created_at > NOW() - INTERVAL '7 days'");
-    }
-
-    #[tokio::test]
-    async fn verified_tls_rung_refuses_a_server_that_does_not_offer_tls() {
-        // THE regression test for the inert TLS ladder.
-        //
-        // tokio-postgres defaults to `SslMode::Prefer`, under which
-        // `connect_tls` returns `Ok(MaybeTlsStream::Raw)` — an ordinary
-        // cleartext socket — when the server answers anything but `S` to the
-        // SSLRequest. So the "verified TLS" rung used to SUCCEED against a
-        // plaintext server, log that it had connected with verified TLS, and
-        // leave the two lower rungs (and with them the `host_is_private`
-        // cleartext guard) unreachable. An on-path attacker forced that by
-        // answering `N`: an SSL-strip requiring no certificate.
-        //
-        // The stock `postgres` image ships with SSL off, so it answers `N` —
-        // exactly the shape of the attack. Rung 1 must now fail here. No unit
-        // test can show this: it is a property of the wire handshake.
-        let container = match GenericImage::new("postgres", "18-alpine")
-            .with_exposed_port(ContainerPort::Tcp(5432))
-            .with_wait_for(WaitFor::message_on_stderr(
-                "database system is ready to accept connections",
-            ))
-            .with_env_var("POSTGRES_DB", "postgres")
-            .with_env_var("POSTGRES_USER", "postgres")
-            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
-            .start()
-            .await
-        {
-            Ok(container) => container,
-            Err(error) => {
-                eprintln!("Docker unavailable; skipping PostgreSQL TLS regression test: {error}");
-                return;
-            }
-        };
-
-        let host = container
-            .get_host()
-            .await
-            .expect("started PostgreSQL container must expose its host")
-            .to_string();
-        let port = container
-            .get_host_port_ipv4(5432)
-            .await
-            .expect("started PostgreSQL container must expose port 5432");
-
-        // Build the config the way `PostgresSource::connect` does, by calling
-        // the same helper it calls, rather than hand-rolling one here.
-        //
-        // The first version of this test built its own config with
-        // `.ssl_mode(Require)` — which meant deleting `.ssl_mode(...)` from the
-        // production path left the test still passing, since it was asserting
-        // against its own copy. A regression test that cannot observe the
-        // regression is worse than none: it reports safety it never checked.
-        let resolved_host = resolve_host_once(&host, port)
-            .await
-            .expect("started PostgreSQL container host should resolve");
-        let cfg = connect_config_for(&resolved_host, port, "postgres", "", "postgres");
-
-        // Retry while the server finishes coming up, so a slow start is not
-        // mistaken for the TLS refusal we are actually asserting.
-        let mut last_err = None;
-        for _ in 0..10 {
-            match connect_with_verified_tls(&cfg).await {
-                Ok(_) => panic!(
-                    "SECURITY REGRESSION: the verified-TLS rung connected to a server with TLS \
-                     disabled. That means SslMode is not Require and the connection is cleartext \
-                     while reporting itself as verified — the lower rungs, including the \
-                     host_is_private guard, become unreachable."
-                ),
-                Err(e) => {
-                    last_err = Some(e.to_string());
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                }
-            }
-        }
-
-        let err = last_err.expect("loop must record an error");
-        assert!(
-            err.contains("tls") || err.contains("TLS") || err.contains("does not support"),
-            "expected a TLS-refusal error from the verified rung, got: {err}"
-        );
-
-        // And the ladder as a whole still works for this host, because 127.0.0.1
-        // is private: it falls through to the explicit cleartext rung. Without
-        // this half, "refuse TLS-less servers" would have broken every
-        // self-hosted deployment whose Postgres has no certificate.
-        let source = {
-            let mut connected = None;
-            for _ in 0..10 {
-                match PostgresSource::connect(&host, port, "postgres", "", "postgres").await {
-                    Ok(source) => {
-                        connected = Some(source);
-                        break;
-                    }
-                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
-                }
-            }
-            connected.expect(
-                "the ladder must still reach a private, TLS-less PostgreSQL via the cleartext rung",
-            )
-        };
-        drop(source);
-    }
-
-    #[tokio::test]
-    async fn oversized_first_row_is_rejected_by_real_postgres_query() {
-        let container = match GenericImage::new("postgres", "18-alpine")
-            .with_exposed_port(ContainerPort::Tcp(5432))
-            .with_wait_for(WaitFor::message_on_stderr(
-                "database system is ready to accept connections",
-            ))
-            .with_env_var("POSTGRES_DB", "postgres")
-            .with_env_var("POSTGRES_USER", "postgres")
-            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
-            .start()
-            .await
-        {
-            Ok(container) => container,
-            Err(error) if container_runtime_unavailable(&error.to_string()) => {
-                eprintln!("Docker unavailable; skipping PostgreSQL row-budget test: {error}");
-                return;
-            }
-            Err(error) => panic!("failed to start PostgreSQL row-budget container: {error}"),
-        };
-        let host = container
-            .get_host()
-            .await
-            .expect("started PostgreSQL container must expose its host")
-            .to_string();
-        let port = container
-            .get_host_port_ipv4(5432)
-            .await
-            .expect("started PostgreSQL container must expose port 5432");
-        let source = std::sync::Arc::new(
-            PostgresSource::connect(&host, port, "postgres", "", "postgres")
-                .await
-                .expect("started PostgreSQL container must accept source connections"),
-        );
-        source
-            .client
-            .batch_execute(
-                "CREATE TABLE oversized_rows (id bigint, payload text); \
-                 INSERT INTO oversized_rows VALUES (1, repeat('x', 2097152));",
-            )
-            .await
-            .expect("oversized row fixture should be created");
-        let budget = QueryBudget {
-            max_bytes: 128 * 1024,
-            max_cell_bytes: 64 * 1024,
-            ..QueryBudget::default()
-        };
-        let error = source
-            .query(
-                &ContainerPath::from_slice(&["postgres", "public"]),
-                "oversized_rows",
-                None,
-                QueryOptions {
-                    limit: Some(1),
-                    budget,
-                    ..QueryOptions::default()
-                },
-            )
-            .await
-            .expect_err("the first oversized row must be rejected");
-        assert!(matches!(
-            error,
-            DataError::ResultLimitExceeded {
-                limit_kind: "wire_cell_bytes",
-                ..
-            }
-        ));
-
-        source
-            .client
-            .batch_execute(
-                "CREATE TABLE array_rows (id bigint, tags text[]); \
-                 INSERT INTO array_rows VALUES (1, ARRAY['alpha', 'beta']);",
-            )
-            .await
-            .expect("array fixture should be created");
-        let result = source
-            .query(
-                &ContainerPath::from_slice(&["postgres", "public"]),
-                "array_rows",
-                None,
-                QueryOptions {
-                    limit: Some(1),
-                    budget,
-                    ..QueryOptions::default()
-                },
-            )
-            .await
-            .expect("bounded PostgreSQL arrays should remain browsable");
-        assert_eq!(result.rows[0]["tags"], serde_json::json!(["alpha", "beta"]));
-
-        source
-            .client
-            .batch_execute(
-                "CREATE TYPE browse_state AS ENUM ('ready', 'paused'); \
-                 CREATE TABLE compatibility_types (\
-                     state browse_state, address inet, duration interval, \
-                     clock time with time zone, flags bit varying\
-                 ); \
-                 INSERT INTO compatibility_types VALUES (\
-                     'ready', '192.0.2.1', interval '1 hour', '12:34:56+00', B'1010'\
-                 );",
-            )
-            .await
-            .expect("common PostgreSQL type fixture should be created");
-        let compatible = source
-            .query(
-                &ContainerPath::from_slice(&["postgres", "public"]),
-                "compatibility_types",
-                None,
-                QueryOptions {
-                    limit: Some(1),
-                    budget,
-                    ..QueryOptions::default()
-                },
-            )
-            .await
-            .expect("common PostgreSQL built-ins and enums should remain browsable");
-        assert_eq!(compatible.rows[0]["state"], serde_json::json!("ready"));
-        assert_eq!(
-            compatible.rows[0]["address"],
-            serde_json::json!("192.0.2.1")
-        );
-        assert_eq!(compatible.rows[0]["flags"], serde_json::json!("1010"));
-
-        source
-            .client
-            .batch_execute(
-                "CREATE TABLE compressed_varbit_rows (id bigint, flags bit varying); \
-                 INSERT INTO compressed_varbit_rows VALUES \
-                     (1, repeat('1', 2097152)::bit varying);",
-            )
-            .await
-            .expect("compressed varbit fixture should be created");
-        let compressed_error = source
-            .query(
-                &ContainerPath::from_slice(&["postgres", "public"]),
-                "compressed_varbit_rows",
-                None,
-                QueryOptions {
-                    limit: Some(1),
-                    budget,
-                    ..QueryOptions::default()
-                },
-            )
-            .await
-            .expect_err("TOAST-compressed varbit must fail admission before JSON expansion");
-        assert!(matches!(
-            compressed_error,
-            DataError::ResultLimitExceeded {
-                limit_kind: "wire_cell_bytes",
-                ..
-            }
-        ));
-
-        source
-            .client
-            .batch_execute(
-                "CREATE TYPE opaque_payload AS (secret text); \
-                 CREATE TABLE extension_rows (id bigint, payload opaque_payload); \
-                 INSERT INTO extension_rows VALUES (1, ROW('hidden')::opaque_payload);",
-            )
-            .await
-            .expect("unsupported extension fixture should be created");
-        let extension_row = source
-            .query(
-                &ContainerPath::from_slice(&["postgres", "public"]),
-                "extension_rows",
-                None,
-                QueryOptions {
-                    limit: Some(1),
-                    budget,
-                    ..QueryOptions::default()
-                },
-            )
-            .await
-            .expect("unsupported extension field must not hide supported row fields");
-        assert_eq!(extension_row.rows[0]["id"], serde_json::json!(1));
-        assert_eq!(extension_row.rows[0]["payload"], serde_json::Value::Null);
-
-        source
-            .client
-            .batch_execute(
-                "CREATE VIEW slow_rows AS \
-                 SELECT 1::bigint AS id FROM (SELECT pg_sleep(0.2)) AS delay;",
-            )
-            .await
-            .expect("slow view fixture should be created");
-        let query_source = source.clone();
-        let count_source = source.clone();
-        let held_timeout_lock = source.query_timeout_lock.lock().await;
-        let query_task = tokio::spawn(async move {
-            query_source
-                .query(
-                    &ContainerPath::from_slice(&["postgres", "public"]),
-                    "slow_rows",
-                    None,
-                    QueryOptions {
-                        limit: Some(1),
-                        timeout_ms: Some(10),
-                        ..QueryOptions::default()
-                    },
-                )
-                .await
-        });
-        // Queue the short-timeout row query first, then the count. The shared
-        // mutex must keep count's 10s timeout from overwriting the row query's
-        // 10ms timeout on their single PostgreSQL session.
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        let count_task = tokio::spawn(async move {
-            count_source
-                .count(
-                    &ContainerPath::from_slice(&["postgres", "public"]),
-                    "slow_rows",
-                    None,
-                )
-                .await
-        });
-        drop(held_timeout_lock);
-
-        let query_error = query_task
-            .await
-            .expect("row query task should join")
-            .expect_err("10ms row query must time out before the count changes the session");
-        assert!(matches!(query_error, DataError::BackendQueryFailed { .. }));
-        assert_eq!(
-            count_task
-                .await
-                .expect("count task should join")
-                .expect("count should inherit its own timeout"),
-            1
-        );
-
-        let held_timeout_lock = source.query_timeout_lock.lock().await;
-        let metadata_source = source.clone();
-        let count_source = source.clone();
-        let metadata_task = tokio::spawn(async move {
-            metadata_source
-                .row_count_and_size_with_timeout("public", "slow_rows", 10)
-                .await
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        let count_task = tokio::spawn(async move {
-            count_source
-                .count(
-                    &ContainerPath::from_slice(&["postgres", "public"]),
-                    "slow_rows",
-                    None,
-                )
-                .await
-        });
-        drop(held_timeout_lock);
-
-        let (metadata_count, _) = metadata_task
-            .await
-            .expect("entity-info metadata task should join");
-        assert_eq!(
-            metadata_count, None,
-            "entity-info fallback COUNT(*) must be cancelled by its own timeout"
-        );
-        assert_eq!(
-            count_task
-                .await
-                .expect("post-metadata count task should join")
-                .expect("count should receive its own timeout after entity-info"),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn test_quoted_function_identifier_rejected_by_real_query_paths() {
-        let container = match GenericImage::new("postgres", "18-alpine")
-            .with_exposed_port(ContainerPort::Tcp(5432))
-            .with_wait_for(WaitFor::message_on_stderr(
-                "database system is ready to accept connections",
-            ))
-            .with_env_var("POSTGRES_DB", "postgres")
-            .with_env_var("POSTGRES_USER", "postgres")
-            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
-            .start()
-            .await
-        {
-            Ok(container) => container,
-            Err(error) => {
-                eprintln!("Docker unavailable; skipping PostgreSQL regression test: {error}");
-                return;
-            }
-        };
-
-        let host = container
-            .get_host()
-            .await
-            .expect("started PostgreSQL container must expose its host")
-            .to_string();
-        let port = container
-            .get_host_port_ipv4(5432)
-            .await
-            .expect("started PostgreSQL container must expose port 5432");
-
-        // The container can emit its first readiness line during initialization;
-        // retry while the final server process comes online.
-        let source = {
-            let mut connected = None;
-            for _ in 0..10 {
-                match PostgresSource::connect(&host, port, "postgres", "", "postgres").await {
-                    Ok(source) => {
-                        connected = Some(source);
-                        break;
-                    }
-                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
-                }
-            }
-            connected.expect("PostgreSQL test container must become reachable")
-        };
-
-        source
-            .execute_raw(
-                r#"CREATE TABLE public.public_users (id integer PRIMARY KEY, "'" integer NOT NULL);
-                   INSERT INTO public.public_users VALUES (1, 1);
-                   CREATE TABLE public.private_secrets (secret text NOT NULL);
-                   INSERT INTO public.private_secrets VALUES ('synthetic-secret');
-                   CREATE TABLE public.private_ids (id integer NOT NULL);
-                   INSERT INTO public.private_ids VALUES (7);
-                   CREATE FUNCTION public."in"() RETURNS boolean LANGUAGE sql STABLE AS
-                   $$ SELECT EXISTS (
-                       SELECT 1 FROM public.private_secrets
-                       WHERE secret = 'synthetic-secret'
-                   ) $$;"#,
-            )
-            .await
-            .expect("test tables must be created");
-
-        let path = ContainerPath::from_slice(&["postgres", "public"]);
-        let attacks = [
-            "\"query_to_xml\"('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%'",
-            "U&\"query_to_xml\" UESCAPE '!'('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%'",
-            "pg_catalog.U&\"query_to_xml\" UESCAPE '!'('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%'",
-            "public.in()",
-            "7 IN (TABLE private_ids)",
-            "7 in (\nTaBlE\tprivate_ids)",
-            r"E'x\'' IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%'",
-            "$tag$'$tag$ IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND $tail$'$tail$ IS NOT NULL",
-            "$💣$'$💣$ IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND $tail$'$tail$ IS NOT NULL",
-            "\"'\" IS NOT NULL AND query_to_xml('select secret from private_secrets', true, false, '')::text LIKE '%synthetic-secret%' AND \"'\" IS NOT NULL",
-        ];
-
-        for attack in attacks {
-            // Prove each expression is valid PostgreSQL and the quoted function
-            // executes when it is not intercepted by the data-explorer validator.
-            let direct_row = source
-                .client
-                .query_one(&format!("SELECT {attack} FROM public_users"), &[])
-                .await
-                .expect("quoted query_to_xml call must be valid PostgreSQL");
-            assert!(direct_row.get::<_, bool>(0));
-
-            let filters = Some(serde_json::json!({ "where": attack }));
-            let query_error = source
-                .query(
-                    &path,
-                    "public_users",
-                    filters.clone(),
-                    QueryOptions::default(),
-                )
-                .await
-                .expect_err("query path must reject a quoted function identifier");
-            assert!(matches!(query_error, DataError::InvalidQuery(_)));
-
-            let count_error = source
-                .count(&path, "public_users", filters)
-                .await
-                .expect_err("count path must reject a quoted function identifier");
-            assert!(matches!(count_error, DataError::InvalidQuery(_)));
-        }
-    }
-
-    #[test]
-    fn test_sql_injection_arbitrary_function_call_blocked() {
-        // Any function call is rejected, so we never have to enumerate them.
-        assert_sql_rejected("length(password) > 0");
-        assert_sql_rejected("1=1 AND cast(secret AS text) = 'x'");
-        assert_sql_rejected("upper(name) = 'ADMIN'");
-    }
-
-    #[test]
-    fn test_function_call_block_allows_grouping_and_in_lists() {
-        // The new rule must not break legitimate grouping or IN-lists.
-        assert_sql_allowed("(status = 'active' OR status = 'pending') AND id > 10");
-        assert_sql_allowed("id IN (1, 2, 3)");
-        assert_sql_allowed("id IN (1,2,3) AND NOT (deleted = true)");
-        assert_sql_allowed("age >= 18 AND age <= 65");
-    }
-
-    #[test]
-    fn test_sql_injection_copy() {
-        assert_sql_rejected("1=1; copy users to '/tmp/dump'");
-    }
-
-    #[test]
-    fn test_sql_injection_comment_hiding() {
-        assert_sql_rejected("1=1 -- AND admin = false");
-        assert_sql_rejected("1=1 /* hidden payload */");
-    }
-
-    #[test]
-    fn test_sql_injection_into_clause() {
-        assert_sql_rejected("1=1 into outfile '/tmp/data'");
-    }
-
-    #[test]
-    fn test_sql_injection_execute_prepare() {
-        assert_sql_rejected("execute evil_plan");
-        assert_sql_rejected("prepare evil_plan as select * from users");
-    }
-
-    #[test]
-    fn test_sql_injection_transaction_control() {
-        assert_sql_rejected("begin ; drop table users");
-        assert_sql_rejected("commit ; drop table users");
-        assert_sql_rejected("rollback ; drop table users");
-    }
-
-    #[test]
-    fn test_sql_injection_intersect_except() {
-        assert_sql_rejected("1=1 intersect select * from admin_users");
-        assert_sql_rejected("1=1 except select * from restricted");
-    }
-
-    #[test]
-    fn test_sql_injection_empty_where() {
-        assert_sql_rejected("");
-        assert_sql_rejected("   ");
-    }
-
-    #[test]
-    fn test_sql_injection_keyword_inside_string_literal_allowed() {
-        // The word "drop" inside a string literal should NOT trigger rejection
-        // because strip_sql_string_literals removes string content before checking
-        assert_sql_allowed("description = 'drop this item'");
-        assert_sql_allowed("name = 'select the best option'");
-        assert_sql_allowed("note = 'please delete me'");
+    fn test_postgres_limit_is_capped() {
+        assert_eq!(PostgresSource::clamp_limit(None), MAX_QUERY_LIMIT);
+        assert_eq!(PostgresSource::clamp_limit(Some(25)), 25);
+        assert_eq!(PostgresSource::clamp_limit(Some(10_000)), MAX_QUERY_LIMIT);
     }
 
     // ── Sort field validation tests ──────────────────────────────────
