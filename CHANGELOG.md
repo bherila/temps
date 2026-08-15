@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Redis database isolation is allocation-backed again**: Redis runtime `REDIS_DATABASE` and `REDIS_URL` values now come from a fail-closed allocation table stored in Redis DB 0 instead of a 16-bucket hash of the project/environment name, preventing colliding resources from sharing logical databases. Deprovisioning now flushes the allocated database and removes the allocation metadata so stale keys are not exposed to a future resource.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
