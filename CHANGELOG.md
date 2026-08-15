@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **deployments:** Only attach configured private Docker registry credentials to external-image pulls when the requested `image_ref` registry matches `docker_registry.registry_url`, preventing credentials from being sent to arbitrary registries.
+
 ## [0.1.0-beta.41] - 2026-07-02
 
 ### CI
