@@ -397,6 +397,7 @@ pub async fn rotate_api_key(
     Path(api_key_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ApiKeysWrite);
+    permission_guard!(auth, ApiKeysCreate);
 
     let rotated = state
         .api_key_service
