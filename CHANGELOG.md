@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Compose build context confinement**: Docker Compose deployments with `build:` directives now reject absolute or parent-traversing `build.context` and `build.dockerfile` paths so attacker-controlled compose files cannot expose host/control-plane files to Docker builds. Generated Temps runtime env files such as `.env.temps` are written under the managed compose data directory instead of the checked-out repository, keeping deployment secrets out of user-controlled build contexts.
+
 
 
 ## [0.1.0-beta.35] - 2026-06-19
@@ -308,7 +309,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Compose build context confinement**: Docker Compose deployments with `build:` directives now reject absolute or parent-traversing `build.context` and `build.dockerfile` paths so attacker-controlled compose files cannot expose host/control-plane files to Docker builds. Generated Temps runtime env files such as `.env.temps` are written under the managed compose data directory instead of the checked-out repository, keeping deployment secrets out of user-controlled build contexts.
+
 
 ### Security
 - **High: CLI device-flow API key stored in plaintext column** (`temps-auth`) — `cli_login_sessions.api_key_plaintext` persisted the freshly-minted, full-power API token (`tk_...`, valid 90 days) as raw `TEXT` until the next CLI poll consumed it (typically seconds, but up to 900s on session expiry). Every other long-lived credential in the codebase (OIDC client_secret, environment-variable secrets, workspace preview passwords) used `EncryptionService` AES-256-GCM at rest; this column was the exception. A DB-read primitive (leaked backup, future SQLi, nosy DBA) yielded directly-usable session tokens. Fixed by encrypting before persist in `cli_device_approve` and decrypting at delivery in `deliver_approved`; the column type stays `TEXT` (now holding ciphertext, named historically). Two new error variants `EncryptionFailed` / `DecryptionFailed` both map to 500 so crypto state isn't leaked to the CLI. Pinned by two new unit tests: round-trip lossless + ciphertext-doesn't-contain-plaintext, and AEAD tamper-detection (flipped byte → decryption fails closed). No migration needed — sessions that were `approved` pre-upgrade will fail decryption and resolve as `ExpiredToken`, forcing one re-login.
