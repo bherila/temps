@@ -162,7 +162,10 @@ impl BackupEngine for S3MirrorEngine {
         );
 
         // ── One-shot mc mirror container ─────────────────────────────────────
-        super::image_pull::ensure_image_pulled_v2(MC_IMAGE, ENGINE_KEY).await?;
+        // This sidecar receives source/destination S3 credentials, so do not
+        // trust a same-tag local image on shared Docker daemons. Refresh from
+        // the registry before each run to overwrite poisoned local tags.
+        super::image_pull::force_pull_image_v2(MC_IMAGE, ENGINE_KEY).await?;
 
         let env_vars = vec![
             format!(
