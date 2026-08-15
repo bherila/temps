@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **web:** date/time range picker (15m/1h/24h/7d + custom) on the service Logs screen, and a `temps services logs --id <id>` CLI command with `--from`/`--to` filtering ([#460](https://github.com/gotempsh/temps/pull/460))
 
 ### Fixed
+- **Compose build context confinement**: Docker Compose deployments with `build:` directives now reject absolute or parent-traversing `build.context` and `build.dockerfile` paths so attacker-controlled compose files cannot expose host/control-plane files to Docker builds. Generated Temps runtime env files such as `.env.temps` are written under the managed compose data directory instead of the checked-out repository, keeping deployment secrets out of user-controlled build contexts.
+
 
 - **Platform-admin code-execution boundary**: Remove container, sandbox creation/exec, and pipeline execution permissions from `PlatformAdmin` so the role cannot run caller-selected code inside customer workloads.
 - **PostgreSQL data-explorer query isolation**: Reject function calls and every PostgreSQL subquery form in user-supplied WHERE clauses, and parse PostgreSQL string and quoted-identifier boundaries safely, so expressions cannot read other tables through XML helpers or `IN (TABLE ...)` query expressions.
@@ -777,6 +779,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **changelog:** Record the on-demand previews / cancel comment / build limits work
 
 ### Fixed
+- **Compose build context confinement**: Docker Compose deployments with `build:` directives now reject absolute or parent-traversing `build.context` and `build.dockerfile` paths so attacker-controlled compose files cannot expose host/control-plane files to Docker builds. Generated Temps runtime env files such as `.env.temps` are written under the managed compose data directory instead of the checked-out repository, keeping deployment secrets out of user-controlled build contexts.
+
 
 - **security:** 0.1.0 hardening pass (29 findings, 3 rounds) ([#95](https://github.com/gotempsh/temps/issues/95))
 - **security:** Close 2 remaining 0.1.0 release blockers ([#98](https://github.com/gotempsh/temps/issues/98))
