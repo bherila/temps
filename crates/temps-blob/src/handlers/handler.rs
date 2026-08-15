@@ -153,6 +153,8 @@ async fn blob_put(
     Query(query): Query<PutBlobQuery>,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, BlobWrite);
+
     // Get project ID from query or auth context
     let project_id =
         extract_project_id(&auth, query.project_id, &state.project_access_checker).await?;
@@ -190,8 +192,9 @@ async fn blob_delete(
     State(state): State<Arc<BlobAppState>>,
     Json(request): Json<DeleteBlobRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id =
-        extract_project_id(&auth, request.project_id, &state.project_access_checker).await?;
+    permission_guard!(auth, BlobDelete);
+
+    let project_id = extract_project_id(&auth, request.project_id)?;
 
     let deleted = state
         .blob_service
@@ -224,8 +227,9 @@ async fn blob_list(
     State(state): State<Arc<BlobAppState>>,
     Query(query): Query<ListBlobsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id =
-        extract_project_id(&auth, query.project_id, &state.project_access_checker).await?;
+    permission_guard!(auth, BlobRead);
+
+    let project_id = extract_project_id(&auth, query.project_id)?;
 
     let options = ListOptions {
         limit: query.limit,
@@ -258,8 +262,10 @@ async fn blob_copy(
     State(state): State<Arc<BlobAppState>>,
     Json(request): Json<CopyBlobRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id =
-        extract_project_id(&auth, request.project_id, &state.project_access_checker).await?;
+    permission_guard!(auth, BlobRead);
+    permission_guard!(auth, BlobWrite);
+
+    let project_id = extract_project_id(&auth, request.project_id)?;
 
     // Extract pathname from URL (handles both full URLs and relative paths)
     let from_pathname = extract_pathname_from_url(&request.from_url);
@@ -336,6 +342,8 @@ async fn blob_head(
     State(state): State<Arc<BlobAppState>>,
     Path(params): Path<BlobPathParams>,
 ) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, BlobRead);
+
     // For deployment tokens, verify the token's project matches the path
     // For API keys/sessions, use the project_id from the path (admins can access any project)
     let project_id = if let Some(token_project_id) = auth.project_id() {
@@ -392,6 +400,8 @@ async fn blob_download(
     State(state): State<Arc<BlobAppState>>,
     Path(params): Path<BlobPathParams>,
 ) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, BlobRead);
+
     // For deployment tokens, verify the token's project matches the path
     // For API keys/sessions, use the project_id from the path (admins can access any project)
     let project_id = if let Some(token_project_id) = auth.project_id() {
