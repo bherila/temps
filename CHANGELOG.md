@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Template Git connection authorization**: Creating a project from a template now scopes the selected `git_provider_connection_id` to the authenticated user before using its token, preventing project creators from causing repository creation or template pushes through another user's Git provider connection.
 
 
 ## [0.1.0-beta.35] - 2026-06-19

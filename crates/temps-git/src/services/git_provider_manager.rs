@@ -1387,6 +1387,24 @@ impl GitProviderManager {
         Ok(connection)
     }
 
+    /// Get a specific connection owned by a user.
+    pub async fn get_connection_for_user(
+        &self,
+        connection_id: i32,
+        user_id: i32,
+    ) -> Result<git_provider_connections::Model, GitProviderManagerError> {
+        let connection = git_provider_connections::Entity::find()
+            .filter(git_provider_connections::Column::Id.eq(connection_id))
+            .filter(git_provider_connections::Column::UserId.eq(user_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                GitProviderManagerError::ConnectionNotFound(connection_id.to_string())
+            })?;
+
+        Ok(connection)
+    }
+
     /// Set syncing status for a connection. When flipping to `true`, we also
     /// reset `synced_repository_count` to 0 so the UI's running progress
     /// starts fresh for this sync.
@@ -4334,6 +4352,7 @@ impl GitProviderManager {
     ///
     /// # Arguments
     /// * `connection_id` - The git provider connection ID
+    /// * `user_id` - Authenticated user ID that must own the connection
     /// * `repo_name` - Name for the new repository
     /// * `repo_owner` - Optional owner/organization (defaults to authenticated user)
     /// * `description` - Optional description for the repository
@@ -4349,6 +4368,7 @@ impl GitProviderManager {
     pub async fn create_repository_and_push_template(
         &self,
         connection_id: i32,
+        user_id: i32,
         repo_name: &str,
         repo_owner: Option<&str>,
         description: Option<&str>,
@@ -4362,8 +4382,9 @@ impl GitProviderManager {
             repo_name, template_url, template_ref, template_subfolder
         );
 
-        // Get the connection and provider
-        let connection = self.get_connection(connection_id).await?;
+        // Get the connection and provider, scoped to the requesting user so
+        // callers cannot use another user's Git provider credentials.
+        let connection = self.get_connection_for_user(connection_id, user_id).await?;
         let provider_service = self.get_provider_service(connection.provider_id).await?;
         let access_token = self
             .validate_and_refresh_connection_token(connection_id)
