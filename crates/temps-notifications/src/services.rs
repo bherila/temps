@@ -17,6 +17,7 @@ use temps_core::notifications::{
     EmailMessage, NotificationData, NotificationError as CoreNotificationError,
     NotificationService as CoreNotificationService,
 };
+use temps_core::url_validation::{validate_domain_async, validate_external_url};
 use temps_entities::types::RoleType;
 use temps_entities::{
     notification_preferences, notification_providers, notifications, roles, user_roles, users,
@@ -248,254 +249,27 @@ pub struct WebhookProvider {
     pub timeout_secs: u64,
 }
 
-/// Cloudflare Email Sending provider.
-///
-/// Delivers notification emails through Cloudflare's transactional Email
-/// Sending API (`POST /accounts/{account_id}/email/sending/send`) instead of a
-/// self-managed SMTP relay. The operator only needs to configure their
-/// Cloudflare account id, an API token with the *Email Sending* permission, the
-/// verified sender, and the list of recipients — everything else (HTML/text
-/// rendering, subject) is derived from the notification itself.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CloudflareProvider {
-    /// Cloudflare account id that owns the Email Sending configuration.
-    pub account_id: String,
-    /// Cloudflare API token with the Email Sending permission. Stored encrypted.
-    pub api_token: String,
-    /// Verified sender address (must belong to a domain configured for
-    /// Cloudflare Email Sending, e.g. `welcome@infracf.example.com`).
-    pub from_address: String,
-    /// Optional human-friendly sender name shown in the recipient's inbox.
-    #[serde(default)]
-    pub from_name: Option<String>,
-    /// Recipients that should receive the notification.
-    pub to_addresses: Vec<String>,
-    /// Override for the Cloudflare API base URL. Never serialized into stored
-    /// config — it exists only so integration tests can point the provider at a
-    /// local mock server. Production always uses [`Self::API_BASE`].
-    #[serde(skip)]
-    pub api_base: Option<String>,
-}
+async fn validate_webhook_url(url: &str) -> Result<()> {
+    let parsed = validate_external_url(url)
+        .map_err(|e| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, e))?;
 
-impl CloudflareProvider {
-    /// Cloudflare API base. Kept as an associated const so tests and call sites
-    /// build the same URL.
-    const API_BASE: &'static str = "https://api.cloudflare.com/client/v4";
-
-    /// Effective API base — the test override if set, otherwise the real one.
-    fn api_base(&self) -> &str {
-        self.api_base.as_deref().unwrap_or(Self::API_BASE)
-    }
-
-    fn send_endpoint(&self) -> String {
-        format!(
-            "{}/accounts/{}/email/sending/send",
-            self.api_base(),
-            self.account_id
-        )
-    }
-
-    /// Build the `from` field for the Cloudflare payload.
-    ///
-    /// Cloudflare Email Sending accepts either a bare address string or a
-    /// structured `{ "email", "name" }` object for a display name (the RFC 5322
-    /// `Name <address>` *string* form is NOT parsed — it would be treated as a
-    /// literal address). We emit the object form only when a name is set.
-    fn sender_value(&self) -> serde_json::Value {
-        match &self.from_name {
-            Some(name) if !name.trim().is_empty() => serde_json::json!({
-                "email": self.from_address,
-                "name": name,
-            }),
-            _ => serde_json::json!(self.from_address),
-        }
-    }
-
-    /// Plain-text fallback body. Cloudflare requires a `text` part alongside the
-    /// HTML one, so derive a readable version from the notification.
-    fn render_text_body(notification: &Notification) -> String {
-        let mut body = format!("{}\n\n{}", notification.title, notification.message);
-        if !notification.metadata.is_empty() {
-            body.push_str("\n\n---\n");
-            for (key, value) in &notification.metadata {
-                body.push_str(&format!("{}: {}\n", key, value));
-            }
-        }
-        body
-    }
-
-    /// POST a single rendered email to Cloudflare. Returns an error carrying the
-    /// status and response body so failures are diagnosable from the logs.
-    async fn post_email(
-        &self,
-        client: &reqwest::Client,
-        to: &str,
-        subject: &str,
-        html: &str,
-        text: &str,
-    ) -> Result<()> {
-        let payload = serde_json::json!({
-            "to": to,
-            "from": self.sender_value(),
-            "subject": subject,
-            "html": html,
-            "text": text,
-        });
-
-        let response = client
-            .post(self.send_endpoint())
-            .bearer_auth(&self.api_token)
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
+    if let Some(domain) = parsed
+        .host_str()
+        .filter(|host| host.parse::<std::net::IpAddr>().is_err())
+    {
+        validate_domain_async(domain)
             .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Cloudflare email send to {} failed (request error): {}",
-                    to,
-                    e
-                )
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!(
-                "Cloudflare email send to {} failed with status {}: {}",
-                to,
-                status,
-                body
-            ));
-        }
-
-        Ok(())
+            .map_err(|e| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, e))?;
     }
+
+    Ok(())
 }
 
-#[async_trait]
-impl NotificationProvider for CloudflareProvider {
-    async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
-        if self.account_id.trim().is_empty() {
-            return Err(anyhow::anyhow!("Cloudflare account_id cannot be empty"));
-        }
-        if self.api_token.trim().is_empty() {
-            return Err(anyhow::anyhow!("Cloudflare api_token cannot be empty"));
-        }
-        if self.from_address.trim().is_empty() {
-            return Err(anyhow::anyhow!("Cloudflare from_address cannot be empty"));
-        }
-        if self.to_addresses.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Cloudflare provider requires at least one recipient in to_addresses"
-            ));
-        }
-        Ok(())
-    }
-
-    async fn send(&self, notification: &Notification) -> Result<()> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
-
-        let priority_prefix = match notification.priority {
-            NotificationPriority::Low => "[LOW] ",
-            NotificationPriority::Normal => "",
-            NotificationPriority::High => "[HIGH] ",
-            NotificationPriority::Critical => "[CRITICAL] ",
-        };
-        let subject = format!("{}{}", priority_prefix, notification.title);
-
-        // Reuse the shared notification email template unless the message is
-        // already a full HTML document (matching EmailProvider's behaviour).
-        let trimmed = notification.message.trim_start();
-        let is_full_document = trimmed.starts_with("<!DOCTYPE")
-            || trimmed.starts_with("<!doctype")
-            || trimmed.starts_with("<html")
-            || trimmed.starts_with("<HTML");
-        let html = if is_full_document {
-            notification.message.clone()
-        } else {
-            EmailProvider::render_notification_email(notification)
-        };
-        let text = Self::render_text_body(notification);
-
-        // De-duplicate recipients while preserving determinism.
-        let mut recipients = self.to_addresses.clone();
-        recipients.sort();
-        recipients.dedup();
-
-        let mut last_err: Option<anyhow::Error> = None;
-        let mut delivered = false;
-        for addr in &recipients {
-            match self.post_email(&client, addr, &subject, &html, &text).await {
-                Ok(()) => delivered = true,
-                Err(e) => {
-                    error!("Failed to send Cloudflare email to {}: {}", addr, e);
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        // Surface a failure only if every recipient failed — partial delivery
-        // still counts as a successful notification, consistent with SMTP.
-        if !delivered {
-            return Err(last_err.unwrap_or_else(|| {
-                anyhow::anyhow!("Cloudflare provider had no recipients to deliver to")
-            }));
-        }
-
-        Ok(())
-    }
-
-    async fn health_check(&self) -> Result<bool> {
-        // Validate the API token via Cloudflare's documented token-verify
-        // endpoint (`GET /user/tokens/verify`). This is a cheap, side-effect-free
-        // check that fails fast on bad/expired credentials without sending a real
-        // email. It is account-independent by design.
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()?;
-
-        let url = format!("{}/user/tokens/verify", self.api_base());
-
-        match client.get(url).bearer_auth(&self.api_token).send().await {
-            Ok(response) => Ok(response.status().is_success()),
-            Err(e) => {
-                error!("Cloudflare provider health check failed: {}", e);
-                Ok(false)
-            }
-        }
-    }
-}
-
-/// HTML-encode the five characters that can break element structure or inject
-/// new tags when user-controlled text is interpolated into an HTML template.
-fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#x27;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Escape Slack mrkdwn special characters so user-controlled text cannot inject
-/// hyperlinks (`<url|text>`), `<!channel>` mention floods, `&entity;` refs, or
-/// forge bold/italic/code/strikethrough formatting.
-fn slack_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('*', "\\*")
-        .replace('_', "\\_")
-        .replace('`', "\\`")
-        .replace('~', "\\~")
+fn webhook_http_client(timeout_secs: u64) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
 }
 
 #[async_trait]
@@ -1225,8 +999,7 @@ impl NotificationProvider for WebhookProvider {
     async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
         // Validate webhook URL with full SSRF protection (blocks private IPs,
         // loopback, cloud metadata, link-local, etc.)
-        temps_core::url_validation::validate_external_url(&self.url)
-            .map_err(|e| anyhow::anyhow!("Invalid webhook URL '{}': {}", self.url, e))?;
+        validate_webhook_url(&self.url).await?;
 
         // Validate HTTP method
         let method = self.method.to_uppercase();
@@ -1241,9 +1014,8 @@ impl NotificationProvider for WebhookProvider {
     }
 
     async fn send(&self, notification: &Notification) -> Result<()> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .build()?;
+        validate_webhook_url(&self.url).await?;
+        let client = webhook_http_client(self.timeout_secs)?;
 
         // Build the payload with all notification data. `_`-prefixed keys are
         // channel-specific payloads (e.g. the email's `_chart_svg`) — drop them
@@ -1297,9 +1069,8 @@ impl NotificationProvider for WebhookProvider {
     }
 
     async fn health_check(&self) -> Result<bool> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .build()?;
+        validate_webhook_url(&self.url).await?;
+        let client = webhook_http_client(self.timeout_secs)?;
 
         // Send a test payload
         let test_payload = serde_json::json!({
@@ -2544,18 +2315,17 @@ mod tests {
         assert!(config.headers.is_empty()); // default empty
     }
 
-    #[test]
-    fn test_webhook_url_validation() {
-        // Test valid URLs
-        let valid_https = "https://example.com/webhook";
-        let valid_http = "http://localhost:8080/webhook";
-
-        assert!(valid_https.starts_with("http://") || valid_https.starts_with("https://"));
-        assert!(valid_http.starts_with("http://") || valid_http.starts_with("https://"));
-
-        // Test invalid URLs
-        let invalid_url = "ftp://example.com/webhook";
-        assert!(!invalid_url.starts_with("http://") && !invalid_url.starts_with("https://"));
+    #[tokio::test]
+    async fn test_webhook_url_validation() {
+        assert!(validate_webhook_url("https://93.184.216.34/webhook")
+            .await
+            .is_ok());
+        assert!(validate_webhook_url("http://localhost:8080/webhook")
+            .await
+            .is_err());
+        assert!(validate_webhook_url("ftp://example.com/webhook")
+            .await
+            .is_err());
     }
 
     #[test]
@@ -3194,7 +2964,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_ssrf_allows_public_https() {
-        let mut webhook = create_webhook("https://hooks.example.com/webhook");
+        let mut webhook = create_webhook("https://93.184.216.34/webhook");
         let db = Arc::new(MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection());
         let result = webhook.initialize(db).await;
         assert!(result.is_ok(), "Must allow public HTTPS URLs");
@@ -3203,7 +2973,7 @@ mod tests {
     #[tokio::test]
     async fn test_webhook_invalid_method_rejected() {
         let mut webhook = WebhookProvider {
-            url: "https://hooks.example.com/webhook".to_string(),
+            url: "https://93.184.216.34/webhook".to_string(),
             method: "DELETE".to_string(),
             headers: std::collections::HashMap::new(),
             timeout_secs: 30,
