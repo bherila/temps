@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 -
 
+### Security
+- **S3 mirror sidecar image refresh**: S3 mirror backups now force-pull `minio/mc:latest` before running the credential-bearing sidecar, preventing a same-tag local Docker image from being trusted on shared daemons where deployment builds can seed the image cache.
+
 
 ## [0.1.0-beta.35] - 2026-06-19
 

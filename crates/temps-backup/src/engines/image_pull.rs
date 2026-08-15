@@ -22,12 +22,7 @@ use temps_backup_core::engine_v2::BackupError;
 /// `engine` is the engine key (e.g. `"control_plane"`, `"postgres_pgdump"`);
 /// errors carry it in logs so failures land on the right engine in the UI.
 pub async fn ensure_image_pulled_v2(image_tag: &str, engine: &str) -> Result<(), BackupError> {
-    let docker = Docker::connect_with_local_defaults().map_err(|e| BackupError::Failed {
-        reason: format!(
-            "ensure_image_pulled_v2 ({}): failed to connect to Docker: {}",
-            engine, e
-        ),
-    })?;
+    let docker = connect_to_docker("ensure_image_pulled_v2", engine)?;
 
     if docker.inspect_image(image_tag).await.is_ok() {
         return Ok(());
@@ -37,12 +32,42 @@ pub async fn ensure_image_pulled_v2(image_tag: &str, engine: &str) -> Result<(),
         image_tag,
         engine, "ensure_image_pulled_v2: image not cached, pulling"
     );
+    pull_image(&docker, image_tag, engine).await
+}
 
+/// Pull `image_tag` from its registry even when Docker already has a local image
+/// with the same tag. Use this for sidecars that execute with sensitive
+/// credentials, where trusting a pre-existing local tag would allow cache
+/// poisoning on shared Docker daemons.
+pub async fn force_pull_image_v2(image_tag: &str, engine: &str) -> Result<(), BackupError> {
+    let docker = connect_to_docker("force_pull_image_v2", engine)?;
+
+    info!(
+        image_tag,
+        engine, "force_pull_image_v2: refreshing image from registry"
+    );
+    pull_image(&docker, image_tag, engine).await
+}
+
+fn connect_to_docker(operation: &str, engine: &str) -> Result<Docker, BackupError> {
+    Docker::connect_with_local_defaults().map_err(|e| BackupError::Failed {
+        reason: format!(
+            "{} ({}): failed to connect to Docker: {}",
+            operation, engine, e
+        ),
+    })
+}
+
+fn split_image_tag(image_tag: &str) -> (&str, &str) {
+    match image_tag.rsplit_once(':') {
+        Some((image, tag)) if !tag.contains('/') => (image, tag),
+        _ => (image_tag, "latest"),
+    }
+}
+
+async fn pull_image(docker: &Docker, image_tag: &str, engine: &str) -> Result<(), BackupError> {
     use bollard::query_parameters::CreateImageOptionsBuilder;
-    let (image, tag) = match image_tag.split_once(':') {
-        Some((i, t)) => (i, t),
-        None => (image_tag, "latest"),
-    };
+    let (image, tag) = split_image_tag(image_tag);
     let options = CreateImageOptionsBuilder::new()
         .from_image(image)
         .tag(tag)
@@ -64,6 +89,32 @@ pub async fn ensure_image_pulled_v2(image_tag: &str, engine: &str) -> Result<(),
         }
     }
 
-    info!(image_tag, engine, "ensure_image_pulled_v2: pull complete");
+    info!(image_tag, engine, "Docker pull complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_image_tag;
+
+    #[test]
+    fn split_image_tag_uses_explicit_tag() {
+        assert_eq!(
+            split_image_tag("minio/mc:RELEASE.2025-08-13T08-35-41Z"),
+            ("minio/mc", "RELEASE.2025-08-13T08-35-41Z")
+        );
+    }
+
+    #[test]
+    fn split_image_tag_defaults_missing_tag_to_latest() {
+        assert_eq!(split_image_tag("minio/mc"), ("minio/mc", "latest"));
+    }
+
+    #[test]
+    fn split_image_tag_preserves_registry_port_without_explicit_tag() {
+        assert_eq!(
+            split_image_tag("registry.example.com:5000/minio/mc"),
+            ("registry.example.com:5000/minio/mc", "latest")
+        );
+    }
 }
