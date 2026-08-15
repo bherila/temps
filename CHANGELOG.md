@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 -
 
+### Security
+- **Managed external service port bindings are loopback-only again**: Postgres, Redis, MongoDB, S3/MinIO, and RustFS now publish their Docker host ports on `127.0.0.1` instead of `0.0.0.0` so database and object-storage credentials/data are not exposed on every host interface by default.
+
 
 ## [0.1.0-beta.35] - 2026-06-19
 
