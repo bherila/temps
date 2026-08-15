@@ -723,10 +723,37 @@ impl ConversationService {
             .await?)
     }
 
-    /// Find or create the current user's conversation for a context. Context
-    /// identity is per creator, so project members never share stored results
-    /// or resumable CLI sessions.
-    #[allow(clippy::too_many_arguments)]
+    /// Verify the caller may access this conversation context's seeded data.
+    ///
+    /// Some providers embed information that has its own permission boundary
+    /// (for example deployment logs or OpenTelemetry alert rules). Check that
+    /// permission before creating a seeded conversation or replaying an existing
+    /// seed to the AI backend.
+    pub async fn authorize_context(
+        &self,
+        project_id: i32,
+        context_type: &str,
+        context_id: &str,
+        auth: &AuthContext,
+    ) -> Result<(), ChatError> {
+        let provider = self
+            .providers
+            .get(context_type)
+            .ok_or_else(|| ChatError::NoProvider(context_type.to_string()))?;
+        if let Some(permission) = provider.required_permission() {
+            if !auth.has_permission(&permission) {
+                return Err(ChatError::ContextUnavailable);
+            }
+        }
+        if !provider.authorize(project_id, context_id).await {
+            return Err(ChatError::ContextUnavailable);
+        }
+        Ok(())
+    }
+
+    /// Find or create the conversation for a context (idempotent per active
+    /// context). On create, seeds via the provider: a `system` framing message
+    /// plus an optional first `assistant` message (e.g. the diagnosis).
     pub async fn get_or_create(
         &self,
         project_id: i32,
@@ -748,9 +775,6 @@ impl ConversationService {
             .providers
             .get(context_type)
             .ok_or_else(|| ChatError::NoProvider(context_type.to_string()))?;
-        if !provider.authorize(project_id, context_id).await {
-            return Err(ChatError::ContextUnavailable);
-        }
         let seed = provider
             .seed(project_id, context_id)
             .await
@@ -3000,6 +3024,7 @@ mod tests {
     /// A stub provider exposing a single `echo` tool, counting executions.
     struct StubProvider {
         tool_calls: Arc<std::sync::atomic::AtomicUsize>,
+        required_permission: Option<temps_auth::Permission>,
     }
 
     struct AuthRecordingProvider {
@@ -3012,6 +3037,9 @@ mod tests {
     impl ConversationContextProvider for StubProvider {
         fn context_type(&self) -> &'static str {
             "test"
+        }
+        fn required_permission(&self) -> Option<temps_auth::Permission> {
+            self.required_permission
         }
         async fn seed(
             &self,
@@ -3136,6 +3164,72 @@ mod tests {
         AuthContext::new_session(user, temps_auth::permissions::Role::Admin)
     }
 
+    #[tokio::test]
+    async fn test_authorize_context_enforces_provider_permission() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let provider = Arc::new(StubProvider {
+            tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            required_permission: Some(temps_auth::Permission::DeploymentsRead),
+        });
+        let svc = ConversationService::new(
+            Arc::new(db),
+            Arc::new(ScriptedAi::new(vec![])),
+            vec![provider],
+        );
+
+        let now = Utc::now();
+        let user = temps_entities::users::Model {
+            id: 2,
+            name: "limited".to_string(),
+            email: "limited@internal".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let auth = AuthContext::new_api_key(
+            user,
+            None,
+            Some(vec![temps_auth::Permission::ProjectsWrite]),
+            "limited".to_string(),
+            1,
+        );
+
+        let err = svc
+            .authorize_context(7, "test", "42", &auth)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ChatError::ContextUnavailable));
+    }
+
+    #[tokio::test]
+    async fn test_authorize_context_allows_provider_permission() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let provider = Arc::new(StubProvider {
+            tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            required_permission: Some(temps_auth::Permission::DeploymentsRead),
+        });
+        let svc = ConversationService::new(
+            Arc::new(db),
+            Arc::new(ScriptedAi::new(vec![])),
+            vec![provider],
+        );
+
+        svc.authorize_context(7, "test", "42", &test_auth())
+            .await
+            .unwrap();
+    }
+
     fn assistant_msg_model() -> ai_messages::Model {
         ai_messages::Model {
             id: 1,
@@ -3245,6 +3339,7 @@ mod tests {
         ]));
         let provider = Arc::new(StubProvider {
             tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            required_permission: None,
         });
         let tool_count = provider.tool_calls.clone();
         let chat_count = ai.chat_calls.clone();
@@ -3290,6 +3385,7 @@ mod tests {
         ])]));
         let provider = Arc::new(StubProvider {
             tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            required_permission: None,
         });
         let chat_count = ai.chat_calls.clone();
         let (svc, tools) = service_with(ai);
@@ -3321,6 +3417,7 @@ mod tests {
         })]));
         let provider = Arc::new(StubProvider {
             tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            required_permission: None,
         });
         let (svc, tools) = service_with(ai);
 
@@ -3375,6 +3472,7 @@ mod tests {
         let ai = Arc::new(ScriptedAi::new(vec![]));
         let provider = Arc::new(StubProvider {
             tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            required_permission: None,
         });
         let chat_count = ai.chat_calls.clone();
         let (svc, tools) = service_with(ai);
@@ -3510,6 +3608,7 @@ mod tests {
         let ai = Arc::new(ScriptedAi::new(rounds));
         let provider = Arc::new(StubProvider {
             tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            required_permission: None,
         });
         let chat_count = ai.chat_calls.clone();
         let (svc, tools) = service_with(ai);
@@ -3541,6 +3640,7 @@ mod tests {
         )])]));
         let provider = Arc::new(StubProvider {
             tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            required_permission: None,
         });
         let (svc, tools) = service_with(ai);
 

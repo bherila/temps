@@ -780,24 +780,10 @@ pub async fn create_conversation(
     }
     ensure_context_read_permission(&auth, &req.context_type)?;
     ensure_enabled(&state, project_id).await?;
-    let runtime = state
+    state
         .service
-        .resolve_get_or_create_runtime(
-            project_id,
-            &req.context_type,
-            &req.context_id,
-            auth.user_id(),
-            req.ai_provider.as_deref(),
-            req.ai_model.as_deref(),
-            req.ai_thinking_level.as_deref(),
-            req.ai_permission_mode.as_deref(),
-        )
+        .authorize_context(project_id, &req.context_type, &req.context_id, &auth)
         .await?;
-    ensure_runtime_permission(
-        &auth,
-        Some(&runtime.provider),
-        Some(&runtime.permission_mode),
-    )?;
     let conv = state
         .service
         .get_or_create(
@@ -847,7 +833,10 @@ pub async fn get_conversation(
         .service
         .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
-    ensure_conversation_read_permission(&auth, &conv)?;
+    state
+        .service
+        .authorize_context(project_id, &conv.context_type, &conv.context_id, &auth)
+        .await?;
     let messages = state
         .service
         .messages(conv.id)
@@ -971,24 +960,10 @@ pub async fn send_message(
         .service
         .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
-    let effective_permission = req
-        .ai_permission_mode
-        .as_deref()
-        .unwrap_or(&conv.ai_permission_mode);
-    ensure_runtime_permission(&auth, Some(&conv.ai_provider), Some(effective_permission))?;
-    ensure_context_read_permission(&auth, &conv.context_type)?;
-    if req.ai_model.is_some() || req.ai_thinking_level.is_some() || req.ai_permission_mode.is_some()
-    {
-        conv = state
-            .service
-            .update_runtime_options(
-                &conv,
-                req.ai_model.as_deref(),
-                req.ai_thinking_level.as_deref(),
-                req.ai_permission_mode.as_deref(),
-            )
-            .await?;
-    }
+    state
+        .service
+        .authorize_context(project_id, &conv.context_type, &conv.context_id, &auth)
+        .await?;
     // Page context is advisory framing, not user content: cap it and silently
     // drop an oversized value rather than failing the message.
     let page_context = req
