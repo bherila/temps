@@ -203,28 +203,18 @@ impl AuthContext {
                 return false;
             };
 
-            let required_dt_perm = match permission {
-                Permission::AnalyticsRead => DeploymentTokenPermission::AnalyticsRead,
-                Permission::AnalyticsWrite => DeploymentTokenPermission::VisitorsEnrich,
-                // Deployed apps inject their deployment token as TEMPS_API_TOKEN
-                // and use it to call POST /emails (guarded by EmailsSend). This
-                // is documented, project-scoped machine access, so map it to the
-                // matching deployment-token permission.
-                Permission::EmailsSend => DeploymentTokenPermission::EmailsSend,
-                // Deployed apps also use TEMPS_API_TOKEN to call the AI gateway
-                // (POST /ai/v1/chat/completions, guarded by AiGatewayExecute).
-                // Same documented machine-access pattern as EmailsSend.
-                Permission::AiGatewayExecute => DeploymentTokenPermission::AiGatewayExecute,
-                // Deployed apps read their own environment's feature-flag
-                // snapshot with TEMPS_API_TOKEN. Read-only: a machine
-                // credential baked into a container must never be able to
-                // flip a flag in production, so FlagsWrite/FlagsDelete are
-                // deliberately absent from this bridge.
-                Permission::FlagsRead => DeploymentTokenPermission::FlagsRead,
-                // No implicit bridge from deployment-token permissions to
-                // general control-plane permissions.
-                _ => return false,
-            };
+                // Map standard Permission to DeploymentTokenPermission
+                let dt_permission = match permission {
+                    Permission::AnalyticsRead => Some(DeploymentTokenPermission::AnalyticsRead),
+                    Permission::AnalyticsWrite => Some(DeploymentTokenPermission::VisitorsEnrich),
+                    Permission::BlobRead => Some(DeploymentTokenPermission::BlobRead),
+                    Permission::BlobWrite => Some(DeploymentTokenPermission::BlobWrite),
+                    Permission::BlobDelete => Some(DeploymentTokenPermission::BlobDelete),
+                    Permission::KvRead => Some(DeploymentTokenPermission::KvRead),
+                    Permission::KvWrite => Some(DeploymentTokenPermission::KvWrite),
+                    Permission::KvDelete => Some(DeploymentTokenPermission::KvDelete),
+                    _ => None,
+                };
 
             return dt_permissions
                 .iter()
@@ -423,6 +413,17 @@ mod tests {
             "test-token".to_string(),
             permissions,
         )
+    }
+
+    #[test]
+    fn deployment_token_storage_permissions_map_to_standard_permissions() {
+        let blob_read = deployment_token_ctx(7, vec![DeploymentTokenPermission::BlobRead]);
+        assert!(blob_read.has_permission(&Permission::BlobRead));
+        assert!(!blob_read.has_permission(&Permission::BlobWrite));
+
+        let kv_write = deployment_token_ctx(7, vec![DeploymentTokenPermission::KvWrite]);
+        assert!(kv_write.has_permission(&Permission::KvWrite));
+        assert!(!kv_write.has_permission(&Permission::KvDelete));
     }
 
     #[test]
