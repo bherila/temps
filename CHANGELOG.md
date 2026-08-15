@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Verified Bun Docker install:** The root `Dockerfile` now downloads a pinned Bun release archive from GitHub and checks its SHA256 before installing it, preventing mutable `curl | bash` installer content from influencing the image build.
+
 
 
 ## [0.1.0-beta.35] - 2026-06-19
