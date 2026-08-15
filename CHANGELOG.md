@@ -608,6 +608,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **tls:** On-demand certs for the console host + sslip.io auto-enable ([#147](https://github.com/gotempsh/temps/issues/147))
+### Security
+- **Recent activity deployment-token environment scope**: `GET /api/analytics/recent-activity` now enforces the environment bound to environment-scoped deployment tokens, preventing callers from omitting or changing `environment_id` to read live activity outside their token scope.
+
 
 ## [0.1.0-beta.35] - 2026-06-19
 
