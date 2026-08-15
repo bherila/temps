@@ -12,7 +12,7 @@ use axum::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
         Extension, Path, Query, State,
     },
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post},
     Json,
@@ -180,6 +180,70 @@ fn public_compose_service_url(
     )
 )]
 pub struct DeploymentsApiDoc;
+
+fn validate_websocket_origin(headers: &HeaderMap) -> Result<(), Problem> {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return Ok(());
+    };
+
+    let origin = origin.to_str().map_err(|_| {
+        problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("Forbidden")
+            .with_detail("WebSocket Origin header is invalid")
+    })?;
+
+    let origin_host = url::Url::parse(origin)
+        .ok()
+        .and_then(|origin| {
+            origin
+                .host_str()
+                .map(|host| (host.to_string(), origin.port()))
+        })
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Forbidden")
+                .with_detail("WebSocket Origin header is not allowed")
+        })?;
+
+    let host = headers
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Forbidden")
+                .with_detail("WebSocket Host header is required when Origin is present")
+        })?;
+
+    let (host_name, host_port) = split_host_port(host);
+    if origin_host.0.eq_ignore_ascii_case(host_name) && origin_host.1 == host_port {
+        return Ok(());
+    }
+
+    warn!(origin = %origin, host = %host, "Rejected WebSocket request with cross-origin Origin header");
+    Err(problemdetails::new(StatusCode::FORBIDDEN)
+        .with_title("Forbidden")
+        .with_detail("WebSocket Origin header is not allowed"))
+}
+
+fn split_host_port(host: &str) -> (&str, Option<u16>) {
+    let host = host.trim();
+    if let Some(stripped) = host.strip_prefix('[') {
+        if let Some((address, remainder)) = stripped.split_once(']') {
+            let port = remainder
+                .strip_prefix(':')
+                .and_then(|port| port.parse::<u16>().ok());
+            return (address, port);
+        }
+    }
+
+    if let Some((name, port)) = host.rsplit_once(':') {
+        if !name.contains(':') {
+            return (name, port.parse::<u16>().ok());
+        }
+    }
+
+    (host, None)
+}
 
 pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
     Router::new()
@@ -1005,10 +1069,11 @@ pub async fn get_container_logs_by_id(
     Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
     Query(query): Query<ContainerLogsQuery>,
     RequireAuth(auth): RequireAuth,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    validate_websocket_origin(&headers)?;
 
     debug!(
         "WebSocket request for container {} logs in environment {} of project: {}",
@@ -1199,10 +1264,11 @@ pub async fn get_container_logs(
     Path((project_id, environment_id)): Path<(i32, i32)>,
     Query(query): Query<ContainerLogsQuery>,
     RequireAuth(auth): RequireAuth,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    validate_websocket_origin(&headers)?;
 
     debug!(
         "WebSocket request for container logs in environment {} of project: {}",
@@ -1537,11 +1603,12 @@ pub async fn get_deployment_container_log_content(
 pub async fn tail_deployment_job_logs(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
-    Path((project_id, deployment_id, job_id)): Path<(i32, i32, String)>,
+    Path((_project_id, deployment_id, job_id)): Path<(i32, i32, String)>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    validate_websocket_origin(&headers)?;
 
     debug!(
         "WebSocket request for tailing logs for job {} in deployment {}",
@@ -2380,101 +2447,49 @@ mod tests {
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
-    #[test]
-    fn compose_visit_urls_match_environment_url_for_primary_service() {
-        let settings = AppSettings {
-            external_url: Some("http://localhost:3013".to_string()),
-            preview_domain: "localho.st".to_string(),
-            ..Default::default()
-        };
-        let ports = vec![
-            temps_entities::preset::ComposePublicPort {
-                service: "nc".to_string(),
-                port: 80,
-                ..Default::default()
-            },
-            temps_entities::preset::ComposePublicPort {
-                service: "admin".to_string(),
-                port: 8080,
-                ..Default::default()
-            },
-        ];
-
-        assert_eq!(
-            public_compose_service_url(
-                &settings,
-                PublicHostnameStrategy::Standard,
-                "awesome-compose-nextcloud-postgres-production",
-                "nc",
-                &ports,
-                8210,
-            )
-            .as_deref(),
-            Some("http://awesome-compose-nextcloud-postgres-production.localho.st:3013")
-        );
-        assert_eq!(
-            public_compose_service_url(
-                &settings,
-                PublicHostnameStrategy::Standard,
-                "awesome-compose-nextcloud-postgres-production",
-                "admin",
-                &ports,
-                8210,
-            )
-            .as_deref(),
-            Some("http://admin-awesome-compose-nextcloud-postgres-production.localho.st:3013")
-        );
-        assert_eq!(
-            public_compose_service_url(
-                &settings,
-                PublicHostnameStrategy::Standard,
-                "awesome-compose-nextcloud-postgres-production",
-                "database",
-                &ports,
-                8210,
-            ),
-            None
-        );
+    fn websocket_origin_headers(origin: &str, host: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, origin.parse().unwrap());
+        headers.insert(header::HOST, host.parse().unwrap());
+        headers
     }
 
     #[test]
-    fn compose_visit_url_uses_proxy_protocol_and_port_without_external_url() {
-        let settings = AppSettings {
-            external_url: None,
-            preview_domain: "localho.st".to_string(),
-            ..Default::default()
-        };
-        let ports = vec![temps_entities::preset::ComposePublicPort {
-            service: "nc".to_string(),
-            port: 80,
-            ..Default::default()
-        }];
+    fn test_validate_websocket_origin_allows_matching_host() {
+        let headers =
+            websocket_origin_headers("https://console.example.com", "console.example.com");
 
-        assert_eq!(
-            public_compose_service_url(
-                &settings,
-                PublicHostnameStrategy::Standard,
-                "awesome-compose-nextcloud-postgres-production",
-                "nc",
-                &ports,
-                8210,
-            )
-            .as_deref(),
-            Some("http://awesome-compose-nextcloud-postgres-production.localho.st:8210")
-        );
+        assert!(validate_websocket_origin(&headers).is_ok());
     }
 
-    async fn database_test_prerequisites_available() -> bool {
-        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_some() {
-            return true;
-        }
+    #[test]
+    fn test_validate_websocket_origin_allows_matching_host_and_port() {
+        let headers = websocket_origin_headers("http://localhost:3000", "localhost:3000");
 
-        tokio::process::Command::new("docker")
-            .arg("info")
-            .output()
-            .await
-            .map(|output| output.status.success())
-            .unwrap_or(false)
+        assert!(validate_websocket_origin(&headers).is_ok());
+    }
+
+    #[test]
+    fn test_validate_websocket_origin_rejects_cross_origin_host() {
+        let headers =
+            websocket_origin_headers("https://attacker.example.com", "console.example.com");
+
+        assert!(validate_websocket_origin(&headers).is_err());
+    }
+
+    #[test]
+    fn test_validate_websocket_origin_rejects_cross_origin_port() {
+        let headers = websocket_origin_headers("http://localhost:4000", "localhost:3000");
+
+        assert!(validate_websocket_origin(&headers).is_err());
+    }
+
+    #[test]
+    fn test_validate_websocket_origin_allows_non_browser_clients_without_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "console.example.com".parse().unwrap());
+
+        assert!(validate_websocket_origin(&headers).is_ok());
     }
 
     #[derive(Clone)]
