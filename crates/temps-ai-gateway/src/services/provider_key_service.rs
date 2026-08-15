@@ -9,6 +9,19 @@ use temps_entities::ai_provider_models;
 
 use crate::error::AiGatewayError;
 
+fn validate_provider_base_url(base_url: Option<&str>) -> Result<Option<String>, AiGatewayError> {
+    base_url
+        .map(|url| {
+            temps_core::url_validation::validate_external_url(url).map_err(|e| {
+                AiGatewayError::InvalidProviderUrl {
+                    reason: e.to_string(),
+                }
+            })?;
+            Ok(url.trim_end_matches('/').to_string())
+        })
+        .transpose()
+}
+
 pub struct ProviderKeyService {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<EncryptionService>,
@@ -53,8 +66,7 @@ impl ProviderKeyService {
             provider: Set(provider.to_string()),
             display_name: Set(display_name.to_string()),
             api_key_encrypted: Set(encrypted_key),
-            base_url: Set(base_url.map(|s| s.to_string())),
-            default_model: Set(default_model.map(|s| s.to_string())),
+            base_url: Set(validate_provider_base_url(base_url)?),
             is_active: Set(true),
             ..Default::default()
         };
@@ -175,10 +187,7 @@ impl ProviderKeyService {
         }
 
         if let Some(url) = base_url {
-            if let Some(url) = url {
-                validate_provider_url(url).await?;
-            }
-            active.base_url = Set(url.map(|s| s.to_string()));
+            active.base_url = Set(validate_provider_base_url(url)?);
         }
 
         if let Some(model) = default_model {
