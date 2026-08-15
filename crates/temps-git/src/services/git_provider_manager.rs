@@ -833,55 +833,10 @@ impl GitProviderManager {
                 .map_err(GitProviderManagerError::from);
         }
 
-        // Fallback: PAT or OAuth connection. There is no provider API
-        // to narrow these tokens to (repo, permission) at runtime, so
-        // we hand back the stored long-lived token. This trades the
-        // per-op blast-radius guarantee for the ability to use git at
-        // all — operators who need the strict guarantee should switch
-        // their project to a GitHub App connection. The trade-off is
-        // logged at WARN so audit reviews can see when it kicked in.
-        let provider = self.get_provider(connection.provider_id).await?;
-        let encrypted_token = connection.access_token.as_ref().ok_or_else(|| {
-            GitProviderManagerError::InvalidConfiguration(format!(
-                "Connection {} has no access_token; cannot mint credential",
-                connection_id
-            ))
-        })?;
-        let token = self.decrypt_string(encrypted_token).await?;
-
-        // Username conventions for HTTP Basic auth on git over HTTPS:
-        //   GitHub: `x-access-token` (works for both App tokens and PATs)
-        //   GitLab: `oauth2` (works for both PATs and OAuth tokens)
-        // Anything else: best-effort `x-access-token`. If we ever add
-        // Bitbucket etc. this needs updating.
-        let username = match provider.provider_type.as_str() {
-            "gitlab" => "oauth2",
-            "gitea" => "x-access-token",
-            "bitbucket" => "x-token-auth",
-            _ => "x-access-token",
-        }
-        .to_string();
-
-        tracing::warn!(
-            connection_id,
-            owner = %owner,
-            repo = %repo,
-            ?operation,
-            provider_type = %provider.provider_type,
-            "Minting non-scoped credential from PAT/OAuth connection — \
-             token is NOT narrowed per-op. Switch the project to a \
-             GitHub App connection if per-op scoping is required."
-        );
-
-        Ok(super::git_provider::ScopedTokenGrant {
-            username,
-            password: token,
-            // Stored tokens may have an expiry on the connection row,
-            // but the daemon doesn't depend on it (it re-mints on every
-            // operation anyway). Surface `None` so the helper protocol
-            // doesn't carry a misleading promise.
-            expires_at: connection.token_expires_at,
-        })
+        Err(GitProviderManagerError::InvalidConfiguration(format!(
+            "Connection {} is not backed by a GitHub App installation; PAT/OAuth connections cannot mint scoped per-op tokens",
+            connection_id
+        )))
     }
 
     /// Get decrypted webhook secret for a provider
@@ -5751,10 +5706,13 @@ impl GitProviderManagerTrait for GitProviderManager {
             }),
             Err(GitProviderManagerError::ProviderError(
                 super::git_provider::GitProviderError::InvalidConfiguration(reason),
-            )) => Err(TraitError::ScopedTokensUnsupported {
-                connection_id,
-                reason,
-            }),
+            ))
+            | Err(GitProviderManagerError::InvalidConfiguration(reason)) => {
+                Err(TraitError::ScopedTokensUnsupported {
+                    connection_id,
+                    reason,
+                })
+            }
             Err(GitProviderManagerError::ConnectionNotFound(_)) => {
                 Err(TraitError::ConnectionNotFound(connection_id))
             }
@@ -6513,6 +6471,104 @@ services:
             .unwrap(),
         );
         Arc::new(temps_config::ConfigService::new(server_config, db))
+    }
+
+    #[tokio::test]
+    async fn mint_scoped_repo_token_refuses_pat_oauth_connections() {
+        use crate::services::git_provider::ScopedTokenOp;
+        use crate::services::git_provider_manager_trait::{
+            GitProviderManagerError as TraitError, GitProviderManagerTrait,
+        };
+        use chrono::Utc;
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let raw_token = "ghp_RAW_LONG_LIVED_PAT_SCOPE_ALL_REPOS";
+        let now = Utc::now();
+        let connection = git_provider_connections::Model {
+            id: 42,
+            provider_id: 7,
+            user_id: Some(1),
+            account_name: "pat-account".to_string(),
+            account_type: "User".to_string(),
+            access_token: Some(raw_token.to_string()),
+            refresh_token: None,
+            token_expires_at: None,
+            refresh_token_expires_at: None,
+            installation_id: None,
+            metadata: None,
+            is_active: true,
+            is_expired: false,
+            syncing: false,
+            last_synced_at: None,
+            synced_repository_count: 0,
+            health_status: "unknown".to_string(),
+            health_message: None,
+            last_health_check_at: None,
+            consecutive_health_failures: 0,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![connection.clone()], vec![connection.clone()]])
+                .into_connection(),
+        );
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+        );
+        let queue_service = Arc::new(MockJobQueue) as Arc<dyn JobQueue>;
+        let config_service = create_test_config_service(db.clone());
+        let manager =
+            GitProviderManager::new(db, encryption_service, queue_service, config_service);
+
+        let direct_error = manager
+            .mint_scoped_repo_token_for_connection(
+                connection.id,
+                "owner",
+                "repo",
+                ScopedTokenOp::Fetch,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                direct_error,
+                GitProviderManagerError::InvalidConfiguration(ref reason)
+                    if reason.contains("PAT/OAuth connections cannot mint scoped per-op tokens")
+            ),
+            "PAT/OAuth connections must be rejected, got {direct_error:?}"
+        );
+        assert!(
+            !direct_error.to_string().contains(raw_token),
+            "error must not leak the stored provider token"
+        );
+
+        let trait_error = GitProviderManagerTrait::mint_scoped_repo_token(
+            &manager,
+            connection.id,
+            "owner",
+            "repo",
+            ScopedTokenOp::Fetch,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                trait_error,
+                TraitError::ScopedTokensUnsupported { connection_id, ref reason }
+                    if connection_id == connection.id
+                        && reason.contains("PAT/OAuth connections cannot mint scoped per-op tokens")
+            ),
+            "trait callers should receive ScopedTokensUnsupported, got {trait_error:?}"
+        );
+        assert!(
+            !trait_error.to_string().contains(raw_token),
+            "trait error must not leak the stored provider token"
+        );
     }
 
     #[tokio::test]
