@@ -14,65 +14,8 @@ use sea_orm::{
     QuerySelect, Set,
 };
 
-use temps_ai::{
-    streaming::{PermissionDecision, PermissionKind},
-    AiRequest, AiService, ChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest, ToolCall,
-};
-
-/// One entry in the pending-permission registry (ADR-038 Phase 2).
-///
-/// Stores the one-shot sender together with the conversation it belongs to and
-/// the kind of permission the CLI is waiting for.  Both fields are checked by
-/// `resolve_permission` before the entry is consumed:
-///
-/// * `conv_public_id` prevents IDOR — an attacker who learns a `permission_id`
-///   from session A cannot resolve it through session B's URL.
-/// * `kind` prevents kind mismatch — a client cannot send an `AnswerQuestion`
-///   decision for a `tool_approval` permission (and vice-versa).
-pub struct PendingPermissionEntry {
-    /// One-shot sender: consuming it (via `remove` + `send`) is the atomic
-    /// claim that prevents double-resolution (409 semantic).
-    pub sender: oneshot::Sender<PermissionDecision>,
-    /// `public_id` of the conversation that registered this permission.
-    pub conv_public_id: String,
-    /// What kind of interaction the CLI subprocess is waiting for.
-    pub kind: PermissionKind,
-    /// The tool name from the original `control_request` (e.g. `"AskUserQuestion"`).
-    /// Kept alongside `input` so a page reload can reconstruct the same
-    /// interactive card instead of leaving the user with only the inert
-    /// "asked" text message and no way to answer (ADR-038 Phase 2).
-    pub tool_name: String,
-    /// The original `control_request`'s `input` payload, verbatim.
-    pub input: serde_json::Value,
-    /// Unique registration generation. A cancelled older request must not
-    /// remove a newer request that reused the same provider-supplied id.
-    pub generation: uuid::Uuid,
-}
-
-/// Removes one exact pending interaction when its waiter is completed or
-/// cancelled. This binds approval-card lifetime to the provider turn instead
-/// of leaving stale, actionable registry entries after Stop/timeout.
-struct PendingPermissionGuard {
-    registry: Arc<Mutex<HashMap<String, PendingPermissionEntry>>>,
-    permission_id: String,
-    generation: uuid::Uuid,
-}
-
-impl Drop for PendingPermissionGuard {
-    fn drop(&mut self) {
-        let mut registry = match self.registry.lock() {
-            Ok(registry) => registry,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if registry
-            .get(&self.permission_id)
-            .is_some_and(|entry| entry.generation == self.generation)
-        {
-            registry.remove(&self.permission_id);
-        }
-    }
-}
-use temps_auth::context::AuthContext;
+use temps_ai::{AiService, ChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest, ToolCall};
+use temps_auth::{context::AuthContext, Permission};
 use temps_entities::{ai_conversations, ai_messages};
 
 use temps_ai_api_tools::{ApiCallScope, WriteApiToolsHandle, WritePrepareOutcome};
@@ -1218,32 +1161,57 @@ impl ConversationService {
         let chat_capable = self.ai.chat_capable_for(Some(&conv.ai_provider)).await;
         let provider = self.providers.get(conv.context_type.as_str()).cloned();
         let mut tools: Vec<ChatTool> = Vec::new();
-        if chat_capable {
-            if let Some(p) = &provider {
-                tools.extend(p.tools(conv.project_id, &conv.context_id).await);
-            }
-            // ADR-024: merge the generic API meta-tools from the sentinel provider.
-            // This is done for EVERY conversation context so the model can always
-            // search/describe/call the read-only REST API, regardless of context_type.
-            if let Some(api_tools_provider) = self.providers.get("__api_tools__") {
-                tools.extend(
-                    api_tools_provider
-                        .tools(conv.project_id, &conv.context_id)
-                        .await,
-                );
-            }
-            // Merge Git-repository exploration tools from the sentinel provider.
-            // Gated only by the project having a Git connection (the provider
-            // returns an empty vec when not connected). Available in every context
-            // (project, alert, deployment, error-group, …) so the model can always
-            // explore the source tree when a repo is connected, regardless of which
-            // context_type seeded the chat.
+        if let Some(p) = &provider {
+            tools.extend(p.tools(conv.project_id, &conv.context_id).await);
+        }
+        // ADR-024: merge the generic API meta-tools from the sentinel provider.
+        // This is done for EVERY conversation context so the model can always
+        // search/describe/call the read-only REST API, regardless of context_type.
+        if let Some(api_tools_provider) = self.providers.get("__api_tools__") {
+            tools.extend(
+                api_tools_provider
+                    .tools(conv.project_id, &conv.context_id)
+                    .await,
+            );
+        }
+        // Merge Git-repository exploration tools from the sentinel provider
+        // only for callers who already hold the repository-read permission.
+        // These tools fetch contents through stored Git credentials and send
+        // results through the AI provider, so ProjectsRead/ProjectsWrite alone
+        // must not expand into source-code access.
+        let repo_tools_allowed = auth.has_permission(&Permission::GitRepositoriesRead);
+        if repo_tools_allowed {
             if let Some(repo_tools_provider) = self.providers.get("__repo_tools__") {
                 tools.extend(
                     repo_tools_provider
                         .tools(conv.project_id, &conv.context_id)
                         .await,
                 );
+            }
+        }
+
+        // Write tool: offered only when write support is wired AND the project
+        // has opted in. Checking `ai_write_actions_enabled` here (once per turn,
+        // from the already-loaded project row) ensures the model cannot stage
+        // write proposals on a project that hasn't enabled the feature.
+        let write_actions_enabled = self
+            .load_write_actions_enabled(conv.project_id)
+            .await
+            .unwrap_or(false);
+        let write_appendix = if write_actions_enabled {
+            self.maybe_add_write_tool(&mut tools, &messages, auth)
+        } else {
+            None
+        };
+        if let Some(appendix) = write_appendix {
+            // Append the write-CLI section map to the system framing so the model
+            // knows what mutations are available and that they require confirmation.
+            match messages.iter_mut().find(|m| m.role == "system") {
+                Some(sys) => {
+                    sys.content.push_str("\n\n");
+                    sys.content.push_str(&appendix);
+                }
+                None => messages.insert(0, ChatMessage::system(appendix)),
             }
 
             // Write tool: offered only when write support is wired AND the project
@@ -1474,7 +1442,11 @@ impl ConversationService {
         let ai = self.ai.clone();
         let db = self.db.clone();
         let api_tools = self.providers.get("__api_tools__").cloned();
-        let repo_tools = self.providers.get("__repo_tools__").cloned();
+        let repo_tools = if auth.has_permission(&Permission::GitRepositoriesRead) {
+            self.providers.get("__repo_tools__").cloned()
+        } else {
+            None
+        };
         let conv_id = conv.id;
         let conv_public_id = conv.public_id.clone();
         let pending_permissions = self.pending_permissions.clone();
@@ -1833,7 +1805,79 @@ impl ConversationService {
                             pending_svc_opt.as_deref(),
                             &mut state,
                         )
-                        .await
+                    } else {
+                        let r = if tc.name == TEMPS_WRITE_TOOL_NAME {
+                            // Write-proposal path: parse the command, validate (no
+                            // execution), stage a pending-action row, return a
+                            // JSON proposal receipt to the model.
+                            dispatch_write_tool(
+                                &tc.arguments,
+                                project_id,
+                                conv_id,
+                                &auth,
+                                write_handle_opt.as_deref(),
+                                pending_svc_opt.as_deref(),
+                                &mut proposed_action_ids,
+                            )
+                            .await
+                        } else if tc.name == "temps" {
+                            if let Some(api_p) = &api_tools {
+                                api_p
+                                    .execute_tool_with_auth(
+                                        project_id,
+                                        &context_id,
+                                        &tc.name,
+                                        &tc.arguments,
+                                        &auth,
+                                    )
+                                    .await
+                            } else {
+                                format!(
+                                    "Tool '{}' is not available (API tools provider absent).",
+                                    tc.name
+                                )
+                            }
+                        } else if matches!(
+                            tc.name.as_str(),
+                            "read_repo_file"
+                                | "list_repo_dir"
+                                | "list_repo_branches"
+                                | "list_repo_tags"
+                        ) {
+                            // Route Git-repo exploration tools to the sentinel
+                            // provider only when the caller has GitRepositoriesRead.
+                            // The tool should not have been advertised otherwise,
+                            // but keep this execution-time guard as defense in depth
+                            // in case a model emits an unadvertised tool call.
+                            if auth.has_permission(&Permission::GitRepositoriesRead) {
+                                if let Some(rt) = &repo_tools {
+                                    rt.execute_tool(
+                                        project_id,
+                                        &context_id,
+                                        &tc.name,
+                                        &tc.arguments,
+                                    )
+                                    .await
+                                } else {
+                                    format!(
+                                        "Tool '{}' is not available (repo tools provider absent).",
+                                        tc.name
+                                    )
+                                }
+                            } else {
+                                format!(
+                                    "Tool '{}' requires the git_repositories:read permission.",
+                                    tc.name
+                                )
+                            }
+                        } else if let Some(p) = &provider {
+                            p.execute_tool(project_id, &context_id, &tc.name, &tc.arguments)
+                                .await
+                        } else {
+                            format!("Tool '{}' is not available in this context.", tc.name)
+                        };
+                        seen_calls.insert(call_key, r.clone());
+                        r
                     };
                     let display_arguments = redact_json_string(&tc.arguments);
                     let display_result = redact_json_string(&result);

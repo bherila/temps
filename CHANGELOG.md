@@ -410,6 +410,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **analytics:** Stop fabricating +/-100% dashboard trend when there's no baseline
 - **providers:** Harden postgres major upgrades ([#151](https://github.com/gotempsh/temps/issues/151))
 - **deployer:** Make cluster DNS injection opt-in (experimental beta) ([#194](https://github.com/gotempsh/temps/issues/194))
+### Fixed
+
+- **ai-chat repo tools authorization**: Require `git_repositories:read` before exposing or executing AI repository exploration tools, so chat access cannot disclose connected repository contents through stored Git provider credentials.
 
 ## [0.1.0-beta.41] - 2026-07-02
 
