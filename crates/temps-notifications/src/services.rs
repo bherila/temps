@@ -17,6 +17,7 @@ use temps_core::notifications::{
     EmailMessage, NotificationData, NotificationError as CoreNotificationError,
     NotificationService as CoreNotificationService,
 };
+use temps_core::url_validation::{validate_domain_async, validate_external_url};
 use temps_entities::types::RoleType;
 use temps_entities::{
     notification_preferences, notification_providers, notifications, roles, user_roles, users,
@@ -117,6 +118,29 @@ pub struct WebhookProvider {
     /// Request timeout in seconds. Defaults to 30.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+async fn validate_webhook_url(url: &str) -> Result<()> {
+    let parsed = validate_external_url(url)
+        .map_err(|e| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, e))?;
+
+    if let Some(domain) = parsed
+        .host_str()
+        .filter(|host| host.parse::<std::net::IpAddr>().is_err())
+    {
+        validate_domain_async(domain)
+            .await
+            .map_err(|e| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, e))?;
+    }
+
+    Ok(())
+}
+
+fn webhook_http_client(timeout_secs: u64) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
 }
 
 #[async_trait]
@@ -804,8 +828,7 @@ impl NotificationProvider for WebhookProvider {
     async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
         // Validate webhook URL with full SSRF protection (blocks private IPs,
         // loopback, cloud metadata, link-local, etc.)
-        temps_core::url_validation::validate_external_url(&self.url)
-            .map_err(|e| anyhow::anyhow!("Invalid webhook URL '{}': {}", self.url, e))?;
+        validate_webhook_url(&self.url).await?;
 
         // Validate HTTP method
         let method = self.method.to_uppercase();
@@ -820,9 +843,8 @@ impl NotificationProvider for WebhookProvider {
     }
 
     async fn send(&self, notification: &Notification) -> Result<()> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .build()?;
+        validate_webhook_url(&self.url).await?;
+        let client = webhook_http_client(self.timeout_secs)?;
 
         // Build the payload with all notification data
         let payload = serde_json::json!({
@@ -869,9 +891,8 @@ impl NotificationProvider for WebhookProvider {
     }
 
     async fn health_check(&self) -> Result<bool> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .build()?;
+        validate_webhook_url(&self.url).await?;
+        let client = webhook_http_client(self.timeout_secs)?;
 
         // Send a test payload
         let test_payload = serde_json::json!({
@@ -1927,18 +1948,17 @@ mod tests {
         assert!(config.headers.is_empty()); // default empty
     }
 
-    #[test]
-    fn test_webhook_url_validation() {
-        // Test valid URLs
-        let valid_https = "https://example.com/webhook";
-        let valid_http = "http://localhost:8080/webhook";
-
-        assert!(valid_https.starts_with("http://") || valid_https.starts_with("https://"));
-        assert!(valid_http.starts_with("http://") || valid_http.starts_with("https://"));
-
-        // Test invalid URLs
-        let invalid_url = "ftp://example.com/webhook";
-        assert!(!invalid_url.starts_with("http://") && !invalid_url.starts_with("https://"));
+    #[tokio::test]
+    async fn test_webhook_url_validation() {
+        assert!(validate_webhook_url("https://93.184.216.34/webhook")
+            .await
+            .is_ok());
+        assert!(validate_webhook_url("http://localhost:8080/webhook")
+            .await
+            .is_err());
+        assert!(validate_webhook_url("ftp://example.com/webhook")
+            .await
+            .is_err());
     }
 
     #[test]
@@ -2395,7 +2415,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_ssrf_allows_public_https() {
-        let mut webhook = create_webhook("https://hooks.example.com/webhook");
+        let mut webhook = create_webhook("https://93.184.216.34/webhook");
         let db = Arc::new(MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection());
         let result = webhook.initialize(db).await;
         assert!(result.is_ok(), "Must allow public HTTPS URLs");
@@ -2404,7 +2424,7 @@ mod tests {
     #[tokio::test]
     async fn test_webhook_invalid_method_rejected() {
         let mut webhook = WebhookProvider {
-            url: "https://hooks.example.com/webhook".to_string(),
+            url: "https://93.184.216.34/webhook".to_string(),
             method: "DELETE".to_string(),
             headers: std::collections::HashMap::new(),
             timeout_secs: 30,
