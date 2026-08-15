@@ -14,7 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Postgres WAL archive-mode probe no longer runs third-party helper images**:
+  `temps-providers` now checks `/var/lib/postgresql/walg.env` through Docker's
+  archive API on the existing service container instead of pulling and running
+  `busybox:latest` with the Postgres data volume mounted, so the reconciliation
+  path does not expose WAL-G credentials or database files to a mutable external
+  image.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
