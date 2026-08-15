@@ -424,6 +424,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Miscellaneous
 
 - **changelog:** Generate CHANGELOG.md with git-cliff instead of hand-editing
+### Fixed
+
+- **ai-api-tools:** Reject project-scoped AI tool calls for API operations that do not expose a project selector, preventing global audit or backup metadata from being replayed into project chat context.
 
 ## [0.1.0-beta.40] - 2026-07-01
 
