@@ -134,6 +134,18 @@ pub enum DeploymentTokenPermission {
     EventsWrite,
     /// Read error tracking data
     ErrorsRead,
+    /// Read Blob storage data
+    BlobRead,
+    /// Write Blob storage data
+    BlobWrite,
+    /// Delete Blob storage data
+    BlobDelete,
+    /// Read KV store data
+    KvRead,
+    /// Write KV store data
+    KvWrite,
+    /// Delete KV store data
+    KvDelete,
     /// Full access (all permissions)
     FullAccess,
 }
@@ -147,6 +159,12 @@ impl DeploymentTokenPermission {
             DeploymentTokenPermission::AnalyticsRead => "analytics:read",
             DeploymentTokenPermission::EventsWrite => "events:write",
             DeploymentTokenPermission::ErrorsRead => "errors:read",
+            DeploymentTokenPermission::BlobRead => "blob:read",
+            DeploymentTokenPermission::BlobWrite => "blob:write",
+            DeploymentTokenPermission::BlobDelete => "blob:delete",
+            DeploymentTokenPermission::KvRead => "kv:read",
+            DeploymentTokenPermission::KvWrite => "kv:write",
+            DeploymentTokenPermission::KvDelete => "kv:delete",
             DeploymentTokenPermission::FullAccess => "*",
         }
     }
@@ -160,6 +178,12 @@ impl DeploymentTokenPermission {
             "analytics:read" => Some(DeploymentTokenPermission::AnalyticsRead),
             "events:write" => Some(DeploymentTokenPermission::EventsWrite),
             "errors:read" => Some(DeploymentTokenPermission::ErrorsRead),
+            "blob:read" => Some(DeploymentTokenPermission::BlobRead),
+            "blob:write" => Some(DeploymentTokenPermission::BlobWrite),
+            "blob:delete" => Some(DeploymentTokenPermission::BlobDelete),
+            "kv:read" => Some(DeploymentTokenPermission::KvRead),
+            "kv:write" => Some(DeploymentTokenPermission::KvWrite),
+            "kv:delete" => Some(DeploymentTokenPermission::KvDelete),
             "*" | "full_access" => Some(DeploymentTokenPermission::FullAccess),
             _ => None,
         }
@@ -173,6 +197,12 @@ impl DeploymentTokenPermission {
             DeploymentTokenPermission::AnalyticsRead,
             DeploymentTokenPermission::EventsWrite,
             DeploymentTokenPermission::ErrorsRead,
+            DeploymentTokenPermission::BlobRead,
+            DeploymentTokenPermission::BlobWrite,
+            DeploymentTokenPermission::BlobDelete,
+            DeploymentTokenPermission::KvRead,
+            DeploymentTokenPermission::KvWrite,
+            DeploymentTokenPermission::KvDelete,
             DeploymentTokenPermission::FullAccess,
         ]
     }

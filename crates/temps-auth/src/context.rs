@@ -178,7 +178,12 @@ impl AuthContext {
                 let dt_permission = match permission {
                     Permission::AnalyticsRead => Some(DeploymentTokenPermission::AnalyticsRead),
                     Permission::AnalyticsWrite => Some(DeploymentTokenPermission::VisitorsEnrich),
-                    // Add other mappings as needed
+                    Permission::BlobRead => Some(DeploymentTokenPermission::BlobRead),
+                    Permission::BlobWrite => Some(DeploymentTokenPermission::BlobWrite),
+                    Permission::BlobDelete => Some(DeploymentTokenPermission::BlobDelete),
+                    Permission::KvRead => Some(DeploymentTokenPermission::KvRead),
+                    Permission::KvWrite => Some(DeploymentTokenPermission::KvWrite),
+                    Permission::KvDelete => Some(DeploymentTokenPermission::KvDelete),
                     _ => None,
                 };
 
@@ -341,6 +346,17 @@ mod tests {
             "test-token".to_string(),
             permissions,
         )
+    }
+
+    #[test]
+    fn deployment_token_storage_permissions_map_to_standard_permissions() {
+        let blob_read = deployment_token_ctx(7, vec![DeploymentTokenPermission::BlobRead]);
+        assert!(blob_read.has_permission(&Permission::BlobRead));
+        assert!(!blob_read.has_permission(&Permission::BlobWrite));
+
+        let kv_write = deployment_token_ctx(7, vec![DeploymentTokenPermission::KvWrite]);
+        assert!(kv_write.has_permission(&Permission::KvWrite));
+        assert!(!kv_write.has_permission(&Permission::KvDelete));
     }
 
     #[test]

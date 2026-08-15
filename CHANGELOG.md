@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Blob and KV deployment-token permissions**: The `/blob` and `/kv/*` data-plane endpoints now enforce `blob:*` and `kv:*` permissions before serving project data, and deployment tokens can explicitly carry those scopes. This prevents low-privileged project tokens such as `emails:send` or `analytics:read` from reading, writing, or deleting Blob/KV data.
+
 
 
 ## [0.1.0-beta.35] - 2026-06-19

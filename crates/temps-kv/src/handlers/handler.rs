@@ -108,6 +108,8 @@ pub async fn kv_get(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<GetRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, KvRead);
+
     let project_id = extract_project_id(&auth, request.project_id)?;
 
     let value = state.kv_service.get(project_id, &request.key).await?;
@@ -133,6 +135,8 @@ pub async fn kv_set(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<SetRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, KvWrite);
+
     let project_id = extract_project_id(&auth, request.project_id)?;
 
     info!(
@@ -183,6 +187,8 @@ pub async fn kv_del(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<DelRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, KvDelete);
+
     let project_id = extract_project_id(&auth, request.project_id)?;
 
     let deleted = state.kv_service.del(project_id, request.keys).await?;
@@ -208,6 +214,8 @@ pub async fn kv_incr(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<IncrRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, KvWrite);
+
     let project_id = extract_project_id(&auth, request.project_id)?;
 
     let value = match request.amount {
@@ -241,6 +249,8 @@ pub async fn kv_expire(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<ExpireRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, KvWrite);
+
     let project_id = extract_project_id(&auth, request.project_id)?;
 
     let success = state
@@ -269,6 +279,8 @@ pub async fn kv_ttl(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<TtlRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, KvRead);
+
     let project_id = extract_project_id(&auth, request.project_id)?;
 
     let ttl = state.kv_service.ttl(project_id, &request.key).await?;
@@ -294,6 +306,8 @@ pub async fn kv_keys(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<KeysRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, KvRead);
+
     let project_id = extract_project_id(&auth, request.project_id)?;
 
     let keys = state.kv_service.keys(project_id, &request.pattern).await?;
