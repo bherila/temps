@@ -9,10 +9,9 @@ use bollard::Docker;
 use futures::{StreamExt, TryStreamExt};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_yaml::Value as YamlValue;
-use serde_yaml::{Mapping, Value};
-use std::collections::{HashMap, HashSet};
-use std::path::{Component, Path, PathBuf};
+use serde_yaml::Value;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -91,8 +90,8 @@ pub enum ComposeError {
     #[error("Failed to discover containers for project '{project}': {reason}")]
     DiscoveryFailed { project: String, reason: String },
 
-    #[error("Invalid compose override for project '{project}': {reason}")]
-    InvalidOverride { project: String, reason: String },
+    #[error("Unsafe compose build configuration for project '{project}': {reason}")]
+    UnsafeBuild { project: String, reason: String },
 
     #[error("Docker API error: {0}")]
     Docker(String),
@@ -350,8 +349,13 @@ impl ComposeExecutor {
             .clone()
             .unwrap_or_else(|| project_dir.clone());
 
+        if has_build {
+            Self::validate_build_contexts(&project_name, &effective_dir, &request.compose_content)?;
+        }
+
         // 1. Write compose files + env overrides to disk
-        self.write_compose_files(&effective_dir, &request).await?;
+        self.write_compose_files(&effective_dir, &project_dir, &request)
+            .await?;
 
         let compose_file = request
             .compose_path
@@ -403,6 +407,7 @@ impl ComposeExecutor {
         // containers outside this Temps project boundary.
         self.compose_up(
             &effective_dir,
+            &project_dir,
             &project_name,
             compose_file,
             &request.environment_vars,
@@ -668,11 +673,18 @@ impl ComposeExecutor {
     async fn write_compose_files(
         &self,
         project_dir: &Path,
+        support_dir: &Path,
         request: &ComposeDeployRequest,
     ) -> Result<(), ComposeError> {
         tokio::fs::create_dir_all(project_dir).await.map_err(|e| {
             ComposeError::FileWriteFailed {
                 path: project_dir.display().to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+        tokio::fs::create_dir_all(support_dir).await.map_err(|e| {
+            ComposeError::FileWriteFailed {
+                path: support_dir.display().to_string(),
                 reason: e.to_string(),
             }
         })?;
@@ -772,9 +784,13 @@ impl ComposeExecutor {
         // Write Temps system env vars to .env.temps
         // These include SENTRY_DSN, TEMPS_API_URL, TEMPS_API_TOKEN, OTEL vars, etc.
         if !request.environment_vars.is_empty() {
-            let temps_env = render_env_file(&request.environment_vars)?;
-            let temps_env_path =
-                Self::confined_write_path(project_dir, Path::new(".env.temps"), ".env.temps")?;
+            let temps_env: String = request
+                .environment_vars
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let temps_env_path = support_dir.join(".env.temps");
             tokio::fs::write(&temps_env_path, &temps_env)
                 .await
                 .map_err(|e| ComposeError::FileWriteFailed {
@@ -783,16 +799,9 @@ impl ComposeExecutor {
                 })?;
 
             // Write Temps env override (auto-generated, injects .env.temps into every service)
-            let temps_override_path = Self::confined_write_path(
-                project_dir,
-                Path::new("docker-compose.temps-env.yml"),
-                "docker-compose.temps-env.yml",
-            )?;
-            let override_content = self.generate_env_override(
-                &request.compose_content,
-                ".env.temps",
-                &request.environment_vars,
-            );
+            let temps_override_path = support_dir.join("docker-compose.temps-env.yml");
+            let override_content = self
+                .generate_env_override(&request.compose_content, &temps_env_path.to_string_lossy());
             tokio::fs::write(&temps_override_path, &override_content)
                 .await
                 .map_err(|e| ComposeError::FileWriteFailed {
@@ -851,11 +860,7 @@ impl ComposeExecutor {
 
         // Write Temps labels override (injects sh.temps.* labels into every service for log collection)
         if !request.labels.is_empty() {
-            let labels_override_path = Self::confined_write_path(
-                project_dir,
-                Path::new("docker-compose.temps-labels.yml"),
-                "docker-compose.temps-labels.yml",
-            )?;
+            let labels_override_path = support_dir.join("docker-compose.temps-labels.yml");
             let labels_content =
                 self.generate_labels_override(&request.compose_content, &request.labels);
             if !labels_content.is_empty() {
@@ -873,17 +878,7 @@ impl ComposeExecutor {
         // host Docker daemon — defense-in-depth alongside the value-level policy above.
         if let Some(ref user_override) = request.compose_override {
             if !user_override.trim().is_empty() {
-                Self::validate_compose_override(
-                    &request.project_name,
-                    &request.compose_content,
-                    user_override,
-                )?;
-
-                let override_path = Self::confined_write_path(
-                    project_dir,
-                    Path::new("docker-compose.temps-override.yml"),
-                    "docker-compose.temps-override.yml",
-                )?;
+                let override_path = support_dir.join("docker-compose.temps-override.yml");
                 tokio::fs::write(&override_path, user_override)
                     .await
                     .map_err(|e| ComposeError::FileWriteFailed {
@@ -2744,6 +2739,119 @@ impl ComposeExecutor {
         false
     }
 
+    /// Validate that every compose build context and Dockerfile stays inside the
+    /// checked-out repository before handing the compose file to Docker. Docker
+    /// itself accepts absolute or `..`-traversing contexts, which would let an
+    /// attacker-controlled compose file expose host/control-plane files to the
+    /// image build.
+    fn validate_build_contexts(
+        project_name: &str,
+        repo_dir: &Path,
+        compose_content: &str,
+    ) -> Result<(), ComposeError> {
+        let repo_dir = repo_dir
+            .canonicalize()
+            .map_err(|e| ComposeError::UnsafeBuild {
+                project: project_name.to_string(),
+                reason: format!(
+                    "repository directory '{}' could not be canonicalized: {}",
+                    repo_dir.display(),
+                    e
+                ),
+            })?;
+
+        let compose: Value =
+            serde_yaml::from_str(compose_content).map_err(|e| ComposeError::UnsafeBuild {
+                project: project_name.to_string(),
+                reason: format!(
+                    "compose YAML could not be parsed for build validation: {}",
+                    e
+                ),
+            })?;
+
+        let services = compose
+            .get("services")
+            .and_then(Value::as_mapping)
+            .ok_or_else(|| ComposeError::UnsafeBuild {
+                project: project_name.to_string(),
+                reason: "compose file with build directives must define a services map".to_string(),
+            })?;
+
+        for (service_name, service) in services {
+            let Some(build) = service.get("build") else {
+                continue;
+            };
+            let service_name = service_name.as_str().unwrap_or("<unknown>");
+            let (context, dockerfile) = match build {
+                Value::String(context) => (context.as_str(), None),
+                Value::Mapping(build_map) => {
+                    let context = build_map
+                        .get("context")
+                        .and_then(Value::as_str)
+                        .unwrap_or(".");
+                    let dockerfile = build_map.get("dockerfile").and_then(Value::as_str);
+                    (context, dockerfile)
+                }
+                _ => {
+                    return Err(ComposeError::UnsafeBuild {
+                        project: project_name.to_string(),
+                        reason: format!(
+                            "service '{}' has an unsupported build value; expected string or map",
+                            service_name
+                        ),
+                    });
+                }
+            };
+
+            let context_path =
+                Self::canonical_build_path(&repo_dir, context).map_err(|reason| {
+                    ComposeError::UnsafeBuild {
+                        project: project_name.to_string(),
+                        reason: format!(
+                            "service '{}' build.context '{}' is not allowed: {}",
+                            service_name, context, reason
+                        ),
+                    }
+                })?;
+
+            if let Some(dockerfile) = dockerfile {
+                Self::canonical_build_path(&context_path, dockerfile).map_err(|reason| {
+                    ComposeError::UnsafeBuild {
+                        project: project_name.to_string(),
+                        reason: format!(
+                            "service '{}' build.dockerfile '{}' is not allowed: {}",
+                            service_name, dockerfile, reason
+                        ),
+                    }
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn canonical_build_path(root: &Path, candidate: &str) -> Result<PathBuf, String> {
+        let candidate_path = Path::new(candidate);
+        let joined = if candidate_path.is_absolute() {
+            candidate_path.to_path_buf()
+        } else {
+            root.join(candidate_path)
+        };
+        let canonical = joined
+            .canonicalize()
+            .map_err(|e| format!("'{}' could not be canonicalized: {}", joined.display(), e))?;
+
+        if canonical.starts_with(root) {
+            Ok(canonical)
+        } else {
+            Err(format!(
+                "resolved path '{}' escapes allowed root '{}'",
+                canonical.display(),
+                root.display()
+            ))
+        }
+    }
+
     /// Run docker compose build for services with build: directives
     async fn compose_build(
         &self,
@@ -2863,14 +2971,44 @@ impl ComposeExecutor {
     async fn compose_up(
         &self,
         project_dir: &Path,
+        support_dir: &Path,
         project_name: &str,
         compose_file: &str,
         env_vars: &HashMap<String, String>,
     ) -> Result<(), ComposeError> {
-        let mut cmd = isolated_docker_command();
-        cmd.args(["compose", "-p", project_name]);
-        Self::append_compose_file_args(&mut cmd, project_dir, compose_file);
-        Self::append_compose_env_file_args(&mut cmd, project_dir);
+        let mut cmd = tokio::process::Command::new("docker");
+        cmd.args(["compose", "-p", project_name])
+            .args(["-f", compose_file]);
+
+        // Include Temps env override (auto-generated)
+        let temps_override = support_dir.join("docker-compose.temps-env.yml");
+        if temps_override.exists() {
+            cmd.args(["-f", &temps_override.to_string_lossy()]);
+        }
+
+        // Include Temps labels override (injects sh.temps.* labels for log collection)
+        let labels_override = support_dir.join("docker-compose.temps-labels.yml");
+        if labels_override.exists() {
+            cmd.args(["-f", &labels_override.to_string_lossy()]);
+        }
+
+        // Include user-provided override (ports, volumes, etc.)
+        let user_override = support_dir.join("docker-compose.temps-override.yml");
+        if user_override.exists() {
+            cmd.args(["-f", &user_override.to_string_lossy()]);
+        }
+
+        // Load .env.temps for YAML variable substitution (${VAR} in compose file)
+        let temps_env_path = support_dir.join(".env.temps");
+        if temps_env_path.exists() {
+            cmd.args(["--env-file", &temps_env_path.to_string_lossy()]);
+        }
+
+        // Also load repo .env if it exists
+        let repo_env_path = project_dir.join(".env");
+        if repo_env_path.exists() {
+            cmd.args(["--env-file", ".env"]);
+        }
 
         cmd.args([
             "up",
@@ -4540,6 +4678,57 @@ networks:
         assert!(executor.has_build_directives(
             "services:\n  web:\n    build:\n      context: .\n      dockerfile: Dockerfile\n"
         ));
+    }
+
+    #[test]
+    fn test_validate_build_context_rejects_absolute_escape() {
+        let repo = tempfile::tempdir().unwrap();
+        let compose = r#"
+services:
+  web:
+    build:
+      context: /
+      dockerfile_inline: |
+        FROM scratch
+"#;
+
+        let err = ComposeExecutor::validate_build_contexts("temps-test", repo.path(), compose)
+            .unwrap_err();
+        assert!(matches!(err, ComposeError::UnsafeBuild { .. }));
+        assert!(err.to_string().contains("build.context '/' is not allowed"));
+    }
+
+    #[test]
+    fn test_validate_build_context_rejects_parent_escape() {
+        let repo = tempfile::tempdir().unwrap();
+        let compose = r#"
+services:
+  web:
+    build: ..
+"#;
+
+        let err = ComposeExecutor::validate_build_contexts("temps-test", repo.path(), compose)
+            .unwrap_err();
+        assert!(matches!(err, ComposeError::UnsafeBuild { .. }));
+        assert!(err
+            .to_string()
+            .contains("build.context '..' is not allowed"));
+    }
+
+    #[test]
+    fn test_validate_build_context_accepts_repo_local_context() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join("app")).unwrap();
+        std::fs::write(repo.path().join("app").join("Dockerfile"), "FROM scratch\n").unwrap();
+        let compose = r#"
+services:
+  web:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+"#;
+
+        ComposeExecutor::validate_build_contexts("temps-test", repo.path(), compose).unwrap();
     }
 
     #[test]
