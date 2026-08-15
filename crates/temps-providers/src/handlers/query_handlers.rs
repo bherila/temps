@@ -832,9 +832,16 @@ pub async fn query_data(
                 }
             };
 
+            let detail = match &e {
+                temps_query::DataError::QueryFailed(_) => {
+                    "Query failed; check server logs for details".to_string()
+                }
+                _ => e.to_string(),
+            };
+
             temps_core::problemdetails::new(status)
                 .with_title(title)
-                .with_detail(e.to_string()) // Use to_string() instead of format! to avoid extra nesting
+                .with_detail(detail)
         })?;
 
     let response = QueryDataResponse {

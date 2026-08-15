@@ -532,7 +532,9 @@ impl Queryable for MariaDbSource {
             .await
             .map_err(|e| {
                 error!("MariaDB query failed: {}", e);
-                DataError::QueryFailed(format!("{}\n\nQuery: {}", e, sql))
+                DataError::QueryFailed(
+                    "MariaDB data query failed; check server logs for details".to_string(),
+                )
             })?;
 
         let data_rows: Result<Vec<DataRow>> = rows.iter().map(Self::row_to_datarow).collect();
@@ -777,6 +779,38 @@ fn strip_sql_string_literals(sql: &str) -> String {
     result
 }
 
+fn contains_sql_keyword(sql: &str, keyword: &str) -> bool {
+    sql.match_indices(keyword).any(|(start, _)| {
+        let first_needs_boundary = keyword
+            .as_bytes()
+            .first()
+            .map(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .unwrap_or(false);
+        let last_needs_boundary = keyword
+            .as_bytes()
+            .last()
+            .map(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .unwrap_or(false);
+
+        let before = first_needs_boundary
+            && start
+                .checked_sub(1)
+                .and_then(|idx| sql.as_bytes().get(idx).copied())
+                .map(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                .unwrap_or(false);
+        let after_index = start + keyword.len();
+        let after = last_needs_boundary
+            && sql
+                .as_bytes()
+                .get(after_index)
+                .copied()
+                .map(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                .unwrap_or(false);
+
+        !before && !after
+    })
+}
+
 fn validate_where_clause(sql: &str) -> Result<()> {
     let sql_lower = sql.trim().to_ascii_lowercase();
 
@@ -837,10 +871,13 @@ fn validate_where_clause(sql: &str) -> Result<()> {
         "commit ",
         "rollback ",
         "savepoint ",
+        "select",
+        "extractvalue",
+        "updatexml",
     ];
 
     for keyword in &dangerous_keywords {
-        if without_strings.contains(keyword) {
+        if contains_sql_keyword(&without_strings, keyword.trim()) {
             return Err(DataError::InvalidQuery(format!(
                 "SQL operation '{}' is not allowed in the data browser",
                 keyword.trim()
@@ -888,6 +925,10 @@ mod tests {
         assert!(validate_where_clause("name LIKE '%drop table%'").is_ok());
         assert!(validate_where_clause("1=1; DROP TABLE users").is_err());
         assert!(validate_where_clause("id = 1 UNION SELECT password FROM users").is_err());
+        assert!(validate_where_clause("exists(select 1 from mysql.user)").is_err());
+        assert!(validate_where_clause("1=extractvalue(1, concat(0x7e, user(), 0x7e))").is_err());
+        assert!(validate_where_clause("1=updatexml(1, concat(0x7e, user(), 0x7e), 1)").is_err());
+        assert!(validate_where_clause("sleep(1) = 0").is_err());
         assert!(validate_where_clause("name = 'x' -- comment").is_err());
     }
 
