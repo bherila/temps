@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Deployment teardown no longer removes slug-matched containers**: Previous-deployment cleanup now skips orphaned deployments that lack `deployment_containers` records instead of treating `deployment.slug` as a Docker container identifier, preventing crafted or colliding slugs from stopping unrelated host containers.
 
 
 ## [0.1.0-beta.35] - 2026-06-19

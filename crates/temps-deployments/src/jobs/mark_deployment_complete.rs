@@ -1480,27 +1480,18 @@ impl MarkDeploymentCompleteJob {
             };
 
             if containers.is_empty() {
-                // Fallback: no deployment_containers records (pre-migration deployments).
-                // Try to stop the container by its slug name convention: {slug}
-                let slug = &deployment.slug;
+                // Do not fall back to deployment.slug as a Docker identifier here.
+                // Slugs are derived from project/environment names and deployment counts,
+                // so Docker name collisions could make us stop or remove a container that
+                // Temps did not create for this deployment. Only containers recorded in
+                // deployment_containers are proven to be managed by this deployment.
                 self.log(format!(
-                    "No container records for deployment {} — trying slug-based cleanup: {}",
-                    deployment_id, slug
+                    "No container records for deployment {} — skipping container teardown because ownership cannot be verified",
+                    deployment_id
                 ))
                 .await
                 .ok();
-
-                // Try stop + remove by container name (slug)
-                if let Err(e) = self.container_deployer.stop_container(slug).await {
-                    debug!("Could not stop container by slug {}: {}", slug, e);
-                }
-                if let Err(e) = self.container_deployer.remove_container(slug).await {
-                    debug!("Could not remove container by slug {}: {}", slug, e);
-                } else {
-                    self.log(format!("Removed orphaned container {}", slug))
-                        .await
-                        .ok();
-                }
+                continue;
             }
 
             for container in containers {
