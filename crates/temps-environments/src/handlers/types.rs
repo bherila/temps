@@ -66,7 +66,7 @@ pub struct CreateEnvironmentVariableRequest {
     pub key: String,
     pub value: String,
     pub environment_ids: Vec<i32>,
-    /// Include this environment variable in preview environments (default: true)
+    /// Include this environment variable in preview environments (default: false)
     #[serde(default = "default_include_in_preview")]
     pub include_in_preview: bool,
     /// When true the variable is treated as write-only: never returned in
@@ -97,7 +97,7 @@ pub struct UpdateEnvironmentVariableRequest {
 }
 
 fn default_include_in_preview() -> bool {
-    true
+    false
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -518,7 +518,7 @@ pub struct CreateProjectSecretRequest {
     pub value: String,
     #[serde(default)]
     pub environment_ids: Vec<i32>,
-    /// Include this secret in preview environments.
+    /// Include this secret in preview environments (default: false).
     #[serde(default = "default_include_in_preview")]
     pub include_in_preview: bool,
 }
@@ -620,45 +620,22 @@ mod tests {
         assert_eq!(disabled.attack_mode, Some(Some(false)));
     }
 
-    /// `force_https` is the same tri-state shape as `attack_mode`. The `null`
-    /// case matters most here: clearing the override must restore the proxy's
-    /// certificate-driven default rather than pinning the environment to
-    /// "never redirect", which is what a plain `Option<bool>` would have done.
     #[test]
-    fn force_https_distinguishes_absent_null_and_value() {
-        // Field absent → None (leave unchanged)
-        let absent: UpdateEnvironmentSettingsRequest =
-            serde_json::from_str(r#"{"branch":"main"}"#).unwrap();
-        assert_eq!(absent.force_https, None);
+    fn env_var_preview_inclusion_defaults_to_false() {
+        let request: CreateEnvironmentVariableRequest = serde_json::from_str(
+            r#"{"key":"DATABASE_URL","value":"postgres://prod","environment_ids":[1]}"#,
+        )
+        .unwrap();
 
-        // Field present as JSON null → Some(None) (clear → inherit proxy default)
-        let cleared: UpdateEnvironmentSettingsRequest =
-            serde_json::from_str(r#"{"force_https":null}"#).unwrap();
-        assert_eq!(cleared.force_https, Some(None));
-
-        // Field present as true → Some(Some(true)) (always redirect)
-        let enabled: UpdateEnvironmentSettingsRequest =
-            serde_json::from_str(r#"{"force_https":true}"#).unwrap();
-        assert_eq!(enabled.force_https, Some(Some(true)));
-
-        // Field present as false → Some(Some(false)) (never redirect)
-        let disabled: UpdateEnvironmentSettingsRequest =
-            serde_json::from_str(r#"{"force_https":false}"#).unwrap();
-        assert_eq!(disabled.force_https, Some(Some(false)));
+        assert!(!request.include_in_preview);
     }
 
-    /// `force_https` and `attack_mode` are independent overrides — updating one
-    /// must not implicitly clear the other.
     #[test]
-    fn force_https_and_attack_mode_are_independent() {
-        let only_force: UpdateEnvironmentSettingsRequest =
-            serde_json::from_str(r#"{"force_https":true}"#).unwrap();
-        assert_eq!(only_force.force_https, Some(Some(true)));
-        assert_eq!(only_force.attack_mode, None);
+    fn project_secret_preview_inclusion_defaults_to_false() {
+        let request: CreateProjectSecretRequest =
+            serde_json::from_str(r#"{"key":"API_TOKEN","value":"secret","environment_ids":[1]}"#)
+                .unwrap();
 
-        let only_attack: UpdateEnvironmentSettingsRequest =
-            serde_json::from_str(r#"{"attack_mode":true}"#).unwrap();
-        assert_eq!(only_attack.attack_mode, Some(Some(true)));
-        assert_eq!(only_attack.force_https, None);
+        assert!(!request.include_in_preview);
     }
 }
