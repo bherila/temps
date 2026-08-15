@@ -502,17 +502,41 @@ pub struct ProxyContext {
     /// Set when the request matched a workspace preview hostname and passed
     /// auth — `upstream_peer` will route it to the local preview gateway.
     pub preview_route: Option<PreviewHost>,
-    /// The upstream confirmed a long-lived stream (SSE `text/event-stream`, or
-    /// a `101` WebSocket upgrade). Such a session's total duration is a
-    /// connection lifetime, not a latency, so `logging` keeps it out of the
-    /// duration histograms — see [`crate::metrics::ProxyMetrics::record`].
-    pub streaming_session: bool,
-    /// Reserved in-flight slot for this request's project/environment, held
-    /// for the whole request lifetime and released when dropped in
-    /// `logging()`. `None` when no cap applies (unlimited, or no
-    /// project/environment resolved for this request — e.g. console/preview
-    /// traffic).
-    pub connection_permit: Option<crate::connection_limiter::ConnectionPermit>,
+}
+
+impl ProxyContext {
+    /// Build a ProjectContext from the individual fields if all are present
+    fn get_project_context(&self) -> Option<ProjectContext> {
+        if let (Some(project), Some(environment), Some(deployment)) =
+            (&self.project, &self.environment, &self.deployment)
+        {
+            Some(ProjectContext {
+                project: project.clone(),
+                environment: environment.clone(),
+                deployment: deployment.clone(),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Return the identifiers that scope static-asset CAS lookups to the
+    /// currently routed project, environment, and deployment.
+    fn static_asset_scope_ids(&self) -> Option<(i32, i32, i32)> {
+        Some((
+            self.project.as_ref()?.id,
+            self.environment.as_ref()?.id,
+            self.deployment.as_ref()?.id,
+        ))
+    }
+
+    /// Check that a deployment-prefixed asset URL is for the currently routed
+    /// deployment before using its path for a CAS lookup.
+    fn matches_current_deployment_slug(&self, deployment_slug: &str) -> bool {
+        self.deployment
+            .as_ref()
+            .is_some_and(|deployment| deployment.slug == deployment_slug)
+    }
 }
 
 /// Main load balancer proxy implementation using traits
@@ -2056,16 +2080,26 @@ impl LoadBalancer {
         ctx: &mut ProxyContext,
         url_path: &str,
     ) -> Result<bool> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use temps_entities::static_asset_cache;
+
         let file_store = match &self.file_store {
             Some(fs) => fs,
             None => return Ok(false),
         };
 
-        // Resolve project_id, then look up the content hash via cache (no DB on hit/cached-miss).
-        let content_hash = match ctx.project.as_ref().map(|p| p.id) {
-            Some(pid) => match self
-                .static_asset_lookup
-                .get_content_hash(pid, url_path)
+        // Look up content hash only within the currently routed deployment.
+        // Static asset paths can collide across environments and deployments in
+        // the same project, so every CAS read must be scoped by all three IDs.
+        let cache_entry = if let Some((project_id, environment_id, deployment_id)) =
+            ctx.static_asset_scope_ids()
+        {
+            static_asset_cache::Entity::find()
+                .filter(static_asset_cache::Column::ProjectId.eq(project_id))
+                .filter(static_asset_cache::Column::EnvironmentId.eq(environment_id))
+                .filter(static_asset_cache::Column::DeploymentId.eq(deployment_id))
+                .filter(static_asset_cache::Column::UrlPath.eq(url_path))
+                .one(self.db.as_ref())
                 .await
             {
                 Some(hash) => hash,
@@ -4660,8 +4694,11 @@ impl ProxyHttp for LoadBalancer {
         if ctx.path.starts_with("/_temps/assets/") {
             let after_prefix = &ctx.path["/_temps/assets/".len()..];
             if let Some(slash_pos) = after_prefix.find('/') {
+                let deployment_slug = &after_prefix[..slash_pos];
                 let asset_path = after_prefix[slash_pos + 1..].to_string();
-                if Self::is_cacheable_static_asset(&asset_path) {
+                if ctx.matches_current_deployment_slug(deployment_slug)
+                    && Self::is_cacheable_static_asset(&asset_path)
+                {
                     if let Ok(true) = self.serve_asset_from_store(session, ctx, &asset_path).await {
                         ctx.routing_status = "prefixed_asset".to_string();
                         return Ok(true);
