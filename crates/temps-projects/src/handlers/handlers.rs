@@ -556,6 +556,22 @@ pub async fn create_project(
             ));
     }
 
+    if let Some(connection_id) = project.git_provider_connection_id {
+        state
+            .project_service
+            .git_provider_manager
+            .ensure_connection_access(connection_id, auth.user_id(), auth.is_admin())
+            .await
+            .map_err(|_| {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Git Connection Forbidden")
+                    .with_detail(format!(
+                        "Git provider connection {} is not available to the authenticated user",
+                        connection_id
+                    ))
+            })?;
+    }
+
     let project_req = crate::services::types::CreateProjectRequest {
         name: project.name,
         repo_name: project.repo_name,
@@ -2056,6 +2072,20 @@ pub async fn create_project_from_template(
         let (create_request, repository_url, deploy_mode) = match request.git_provider_connection_id
         {
             Some(connection_id) => {
+                state
+                    .project_service
+                    .git_provider_manager
+                    .ensure_connection_access(connection_id, auth.user_id(), auth.is_admin())
+                    .await
+                    .map_err(|_| {
+                        problemdetails::new(StatusCode::FORBIDDEN)
+                            .with_title("Git Connection Forbidden")
+                            .with_detail(format!(
+                                "Git provider connection {} is not available to the authenticated user",
+                                connection_id
+                            ))
+                    })?;
+
                 // Fork mode requires a repository name to create under the account.
                 let repository_name = request.repository_name.as_deref().filter(|s| !s.is_empty());
                 let Some(repository_name) = repository_name else {

@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **web:** date/time range picker (15m/1h/24h/7d + custom) on the service Logs screen, and a `temps services logs --id <id>` CLI command with `--from`/`--to` filtering ([#460](https://github.com/gotempsh/temps/pull/460))
 
 ### Fixed
+- **Git provider connection authorization**: Setup-created GitHub PAT connections are now assigned to the admin user, and project creation/template fork flows verify that authenticated users can only use their own git provider connections unless they are administrators. This prevents low-privileged users from enumerating or deploying with an operator setup token.
+-
 
 - **Platform-admin code-execution boundary**: Remove container, sandbox creation/exec, and pipeline execution permissions from `PlatformAdmin` so the role cannot run caller-selected code inside customer workloads.
 - **PostgreSQL data-explorer query isolation**: Reject function calls and every PostgreSQL subquery form in user-supplied WHERE clauses, and parse PostgreSQL string and quoted-identifier boundaries safely, so expressions cannot read other tables through XML helpers or `IN (TABLE ...)` query expressions.
