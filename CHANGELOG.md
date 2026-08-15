@@ -25,7 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can get a local build working without trial and error.
 
 ### Fixed
--
+- **Local Docker image deployment integrity**: Locally uploaded Docker image deployments now fail closed when the mutable Docker tag no longer resolves to the image ID imported for that deployment, preventing a tag overwrite from deploying the wrong image with another deployment's configuration.
+
 
 
 ## [0.1.0-beta.39] - 2026-06-25
