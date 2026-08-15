@@ -1,6 +1,8 @@
 use crate::services::workflow_execution_service::WorkflowExecutionService;
 use crate::services::workflow_planner::WorkflowPlanner;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
+};
 use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -601,6 +603,10 @@ fn is_automatic_deploy_enabled(
     }
 }
 
+fn should_skip_git_push_for_auto_deploy(auto_deploy_enabled: bool, manual_trigger: bool) -> bool {
+    !auto_deploy_enabled && !manual_trigger
+}
+
 // Extracted free function for testing
 async fn process_git_push_event(
     workflow_planner: Arc<WorkflowPlanner>,
@@ -670,43 +676,19 @@ async fn process_git_push_event(
     // regardless of the auto-deploy setting. The flag exists for
     // webhook-driven flows, not user-driven ones.
     //
-    // Exception for the webhook path: the FIRST deployment for an
-    // environment always runs even when automatic_deploy=false. Without
-    // this, a freshly-created opt-out project would never get a baseline
-    // deployment from the first push.
-    use sea_orm::{EntityTrait, PaginatorTrait, QueryOrder};
+    // Webhook events never infer trust from deployment count: a new
+    // environment or preview branch can have zero deployments, but that
+    // must not bypass the deploy-on-push opt-out.
     let auto_deploy_enabled = is_automatic_deploy_enabled(
         project.deployment_config.as_ref(),
         environment.deployment_config.as_ref(),
     );
-    if !auto_deploy_enabled && !job.manual_trigger {
-        let existing_count = match deployments::Entity::find()
-            .filter(deployments::Column::EnvironmentId.eq(environment.id))
-            .count(db.as_ref())
-            .await
-        {
-            Ok(n) => n,
-            Err(e) => {
-                error!(
-                    "Failed to count existing deployments for environment {}: {}",
-                    environment.id, e
-                );
-                return;
-            }
-        };
-
-        if existing_count > 0 {
-            info!(
-                "Skipping push event for project {} environment {} ({}): automatic_deploy is disabled",
-                project.id, environment.id, environment.name
-            );
-            return;
-        }
-
+    if should_skip_git_push_for_auto_deploy(auto_deploy_enabled, job.manual_trigger) {
         info!(
-            "Allowing initial deployment for project {} environment {} ({}) despite automatic_deploy=false (no prior deployments)",
+            "Skipping push event for project {} environment {} ({}): automatic_deploy is disabled",
             project.id, environment.id, environment.name
         );
+        return;
     } else if job.manual_trigger && !auto_deploy_enabled {
         info!(
             "Manual trigger for project {} environment {} ({}) — bypassing automatic_deploy=false",
@@ -2045,5 +2027,20 @@ mod tests {
     fn auto_deploy_enabled_when_only_env_set_on() {
         let env_cfg = cfg_with_auto_deploy(true);
         assert!(is_automatic_deploy_enabled(None, Some(&env_cfg)));
+    }
+
+    #[test]
+    fn webhook_push_is_skipped_when_auto_deploy_disabled() {
+        assert!(should_skip_git_push_for_auto_deploy(false, false));
+    }
+
+    #[test]
+    fn manual_trigger_bypasses_auto_deploy_disabled() {
+        assert!(!should_skip_git_push_for_auto_deploy(false, true));
+    }
+
+    #[test]
+    fn auto_deploy_enabled_allows_webhook_push() {
+        assert!(!should_skip_git_push_for_auto_deploy(true, false));
     }
 }

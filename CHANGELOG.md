@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **`automatic_deploy=false` webhook enforcement**: Git provider webhooks now
+  respect the deploy-on-push opt-out even when the target environment has no
+  existing deployments, preventing first pushes to new environments or preview
+  branches from bypassing deployment approval.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
