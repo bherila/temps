@@ -8011,7 +8011,7 @@ export type GatewayStatus = {
     host_port?: number | null;
     /**
      * Image reference the container was created with (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway:latest`).
+     * `ghcr.io/gotempsh/temps-preview-gateway:0.1.0`).
      */
     image?: string | null;
     /**
@@ -19638,7 +19638,7 @@ export type UpgradeExternalServiceRequest = {
 export type UpgradeRequest = {
     /**
      * Image reference to pull and run (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway:latest`). Empty resets to default.
+     * `ghcr.io/gotempsh/temps-preview-gateway:0.1.0`). Empty resets to default.
      */
     image: string;
 };
