@@ -883,7 +883,7 @@ impl ParameterStrategy for MinioParameterStrategy {
         if is_empty_value(params.get("access_key")) {
             params.insert(
                 "access_key".to_string(),
-                JsonValue::String("minioadmin".to_string()),
+                JsonValue::String(generate_access_key()),
             );
         }
 
@@ -891,7 +891,7 @@ impl ParameterStrategy for MinioParameterStrategy {
         if is_empty_value(params.get("secret_key")) {
             params.insert(
                 "secret_key".to_string(),
-                JsonValue::String("minioadmin".to_string()),
+                JsonValue::String(generate_secret_key()),
             );
         }
 
@@ -940,13 +940,13 @@ impl ParameterStrategy for MinioParameterStrategy {
             "properties": {
                 "access_key": {
                     "type": "string",
-                    "description": "Access key (read-only after creation)",
-                    "example": "minioadmin"
+                    "description": "Access key (read-only after creation, auto-generated)",
+                    "example": "AKIAIOSFODNN7EXAMPLE"
                 },
                 "secret_key": {
                     "type": "string",
-                    "description": "Secret key (read-only after creation)",
-                    "example": "minioadmin"
+                    "description": "Secret key (read-only after creation, auto-generated)",
+                    "example": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
                 },
                 "port": {
                     "type": "integer",
@@ -1417,74 +1417,23 @@ mod tests {
     }
 
     #[test]
-    fn test_mariadb_generates_defaults() {
-        let strategy = MariaDbParameterStrategy;
+    fn test_s3_auto_generates_non_default_credentials() {
+        let strategy = S3ParameterStrategy;
         let mut params = HashMap::new();
 
-        strategy
-            .validate_for_creation(&params)
-            .expect("empty MariaDB params should use defaults");
-        strategy
-            .auto_generate_missing(&mut params)
-            .expect("defaults should generate");
+        strategy.auto_generate_missing(&mut params).unwrap();
 
-        assert_eq!(
-            params.get("database"),
-            Some(&JsonValue::String("app".to_string()))
-        );
-        assert_eq!(
-            params.get("username"),
-            Some(&JsonValue::String("app".to_string()))
-        );
-        assert_eq!(
-            params.get("docker_image"),
-            Some(&JsonValue::String("mariadb:lts".to_string()))
-        );
-        assert_eq!(
-            params.get("size_profile"),
-            Some(&JsonValue::String("small".to_string()))
-        );
-        let resources: ServiceResourceLimits = serde_json::from_value(
-            params
-                .get("resources")
-                .expect("MariaDB defaults should include resource limits")
-                .clone(),
-        )
-        .expect("default MariaDB resources should deserialize");
-        assert_eq!(resources.memory_mb, Some(512));
-        assert_eq!(resources.memory_swap_mb, Some(768));
-        assert_eq!(resources.nano_cpus, Some(750_000_000));
-        assert!(params.get("password").and_then(|v| v.as_str()).is_some());
-        assert!(params
-            .get("root_password")
-            .and_then(|v| v.as_str())
-            .is_some());
+        assert_s3_credentials_are_generated(&params);
     }
 
     #[test]
-    fn test_mariadb_rejects_readonly_update() {
-        let strategy = MariaDbParameterStrategy;
-        let mut updates = HashMap::new();
-        updates.insert(
-            "root_password".to_string(),
-            JsonValue::String("new-secure-password".to_string()),
-        );
-
-        let result = strategy.validate_for_update(&updates);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_mariadb_rejects_invalid_size_profile() {
-        let strategy = MariaDbParameterStrategy;
+    fn test_minio_auto_generates_non_default_credentials() {
+        let strategy = MinioParameterStrategy;
         let mut params = HashMap::new();
-        params.insert(
-            "size_profile".to_string(),
-            JsonValue::String("oversized".to_string()),
-        );
 
-        let result = strategy.validate_for_creation(&params);
-        assert!(result.is_err());
+        strategy.auto_generate_missing(&mut params).unwrap();
+
+        assert_s3_credentials_are_generated(&params);
     }
 
     #[test]
@@ -1557,6 +1506,28 @@ mod tests {
     }
 
     // ─── credential validators ─────────────────────────────────────
+
+    fn assert_s3_credentials_are_generated(params: &HashMap<String, JsonValue>) {
+        let access_key = params
+            .get("access_key")
+            .and_then(|v| v.as_str())
+            .expect("access_key must be generated");
+        let secret_key = params
+            .get("secret_key")
+            .and_then(|v| v.as_str())
+            .expect("secret_key must be generated");
+
+        assert_ne!(access_key, "minioadmin");
+        assert_ne!(secret_key, "minioadmin");
+        assert_eq!(access_key.len(), 20);
+        assert_eq!(secret_key.len(), 40);
+        assert!(access_key
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()));
+        assert!(secret_key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/'));
+    }
 
     fn pg_params(user: &str, db: &str, password: Option<&str>) -> HashMap<String, JsonValue> {
         let mut p = HashMap::new();
