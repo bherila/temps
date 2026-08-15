@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **AI gateway provider URL SSRF guard**: `crates/temps-ai-gateway` now validates BYOK and stored provider `base_url` values before use, rejects private/link-local/provider-metadata targets, strips trailing slashes on persistence, and disables upstream redirect following so authenticated gateway requests cannot be redirected into internal control-plane networks.
+
 
 
 ## [0.1.0-beta.35] - 2026-06-19
