@@ -191,8 +191,40 @@ fn default_ssl_mode_string() -> String {
     "disable".to_string()
 }
 
+const ALLOWED_POSTGRES_DOCKER_IMAGES: &[&str] = &[
+    "gotempsh/postgres-walg:15-bookworm",
+    "gotempsh/postgres-walg:16-bookworm",
+    "gotempsh/postgres-walg:17-bookworm",
+    "gotempsh/postgres-walg:18-bookworm",
+    "timescale/timescaledb-ha:pg17",
+    "timescale/timescaledb-ha:pg18",
+];
+
 fn default_docker_image() -> Option<String> {
     Some("gotempsh/postgres-walg:18-bookworm".to_string())
+}
+
+fn validate_postgres_docker_image(docker_image: &str) -> Result<()> {
+    if ALLOWED_POSTGRES_DOCKER_IMAGES.contains(&docker_image) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "PostgreSQL Docker image '{}' is not supported. Allowed images: {}",
+            docker_image,
+            ALLOWED_POSTGRES_DOCKER_IMAGES.join(", ")
+        ))
+    }
+}
+
+fn parse_postgres_config(service_config: ServiceConfig) -> Result<PostgresConfig> {
+    // Parse input config and transform to runtime config
+    // First deserialize to PostgresInputConfig to apply defaults and custom handling
+    let input_config: PostgresInputConfig = serde_json::from_value(service_config.parameters)
+        .map_err(|e| anyhow::anyhow!("Failed to parse PostgreSQL configuration: {}", e))?;
+    // Then convert to PostgresConfig which applies additional transformations
+    let postgres_config = PostgresConfig::from(input_config);
+    validate_postgres_docker_image(&postgres_config.docker_image)?;
+    Ok(postgres_config)
 }
 
 // Schema example functions
@@ -258,13 +290,7 @@ impl PostgresService {
     }
 
     fn get_postgres_config(&self, service_config: ServiceConfig) -> Result<PostgresConfig> {
-        // Parse input config and transform to runtime config
-        // First deserialize to PostgresInputConfig to apply defaults and custom handling
-        let input_config: PostgresInputConfig =
-            serde_json::from_value(service_config.parameters)
-                .map_err(|e| anyhow::anyhow!("Failed to parse PostgreSQL configuration: {}", e))?;
-        // Then convert to PostgresConfig which applies additional transformations
-        Ok(PostgresConfig::from(input_config))
+        parse_postgres_config(service_config)
     }
     fn get_container_name(&self) -> String {
         format!("postgres-{}", self.name)
@@ -277,6 +303,8 @@ impl PostgresService {
         resource_limits: &ServiceResourceLimits,
         enable_archiving: bool,
     ) -> Result<()> {
+        validate_postgres_docker_image(&config.docker_image)?;
+
         // Pull image first
         info!("Pulling PostgreSQL image {}", config.docker_image);
 
@@ -3851,6 +3879,35 @@ mod tests {
         let runtime_config: PostgresConfig = config.into();
 
         assert_eq!(runtime_config.docker_image, "timescale/timescaledb-ha:pg18");
+    }
+
+    #[test]
+    fn test_postgres_config_rejects_unsupported_docker_image() {
+        let service_config = ServiceConfig {
+            name: "test-unsupported-image".to_string(),
+            service_type: ServiceType::Postgres,
+            version: Some("18".to_string()),
+            parameters: serde_json::json!({
+                "docker_image": "attacker/backdoored-postgres:latest"
+            }),
+        };
+
+        let err = parse_postgres_config(service_config).unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "PostgreSQL Docker image 'attacker/backdoored-postgres:latest' is not supported"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_postgres_docker_image_allowlist_accepts_supported_images() {
+        for docker_image in ALLOWED_POSTGRES_DOCKER_IMAGES {
+            validate_postgres_docker_image(docker_image)
+                .unwrap_or_else(|err| panic!("{docker_image} should be allowed: {err}"));
+        }
     }
 
     #[test]

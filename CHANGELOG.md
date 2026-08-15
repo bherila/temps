@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **PostgreSQL service image allowlist**: Managed PostgreSQL services now reject
+  unsupported `docker_image` values before Docker pulls or starts a container,
+  preventing authenticated service creation from becoming arbitrary container
+  execution while preserving the supported Postgres/Timescale images.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
