@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Next.js runtime image secret leakage**: The `temps-presets` Next.js Dockerfile generator now stages a minimal runtime tree instead of copying the entire build workspace into the final image, preventing `.git/config`, `.env*`, tests, and other build-only files from being retained in production images while preserving required Next.js runtime artifacts and common runtime config/data directories.
+
 
 
 ## [0.1.0-beta.35] - 2026-06-19
