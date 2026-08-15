@@ -4,15 +4,22 @@ use std::path::PathBuf;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
-use temps_auth::context::{AuthContext, AuthSource};
-use temps_core::external_plugin::actor::ActorPrincipal;
-use temps_core::external_plugin::headers;
-use temps_core::external_plugin::{PLUGIN_CHANNEL_PATH, PLUGIN_EVENTS_PATH};
-use temps_core::problemdetails;
-use tracing::{debug, error, warn};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use temps_auth::AuthContext;
+use tracing::{debug, error};
+
+type HmacSha256 = Hmac<Sha256>;
+
+const HEADER_PLUGIN: &str = "x-temps-plugin";
+const HEADER_USER_ID: &str = "x-temps-user-id";
+const HEADER_USER_EMAIL: &str = "x-temps-user-email";
+const HEADER_USER_ROLE: &str = "x-temps-user-role";
+const HEADER_REQUEST_ID: &str = "x-temps-request-id";
+const HEADER_AUTH_SIGNATURE: &str = "x-temps-auth-signature";
 
 /// Proxy configuration for a single external plugin.
 #[derive(Debug, Clone)]
@@ -228,14 +235,90 @@ async fn forward_to_unix_socket(
         }
     });
 
+    let auth = original_request
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .ok_or_else(|| "Authentication required for external plugin proxy".to_string())?;
+
+    let request_id = uuid::Uuid::new_v4().to_string();
     let (mut parts, body) = original_request.into_parts();
 
-    inject_temps_headers(&mut parts.headers, proxy, auth);
+    // Never forward caller-controlled Temps protocol headers. They are trusted
+    // by plugin SDKs, so the proxy must derive them only from Temps auth state.
+    parts.headers.remove(HEADER_USER_ID);
+    parts.headers.remove(HEADER_USER_EMAIL);
+    parts.headers.remove(HEADER_USER_ROLE);
+    parts.headers.remove(HEADER_REQUEST_ID);
+    parts.headers.remove(HEADER_AUTH_SIGNATURE);
+    parts.headers.remove(HEADER_PLUGIN);
+
+    parts.headers.insert(
+        HEADER_PLUGIN,
+        proxy
+            .plugin_name
+            .parse()
+            .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("unknown")),
+    );
+    if let Some(user) = auth.user.as_ref() {
+        parts.headers.insert(
+            HEADER_USER_ID,
+            HeaderValue::from_str(&user.id.to_string()).map_err(|e| {
+                format!(
+                    "Invalid authenticated user ID header for plugin proxy: {}",
+                    e
+                )
+            })?,
+        );
+        parts.headers.insert(
+            HEADER_USER_EMAIL,
+            HeaderValue::from_str(&user.email).map_err(|e| {
+                format!(
+                    "Invalid authenticated user email header for plugin proxy: {}",
+                    e
+                )
+            })?,
+        );
+    }
+    let role = auth.effective_role.to_string();
+    parts.headers.insert(
+        HEADER_USER_ROLE,
+        HeaderValue::from_str(&role).map_err(|e| {
+            format!(
+                "Invalid authenticated user role header for plugin proxy: {}",
+                e
+            )
+        })?,
+    );
+    parts.headers.insert(
+        HEADER_REQUEST_ID,
+        HeaderValue::from_str(&request_id)
+            .map_err(|e| format!("Invalid request ID header for plugin proxy: {}", e))?,
+    );
 
     let target_uri: hyper::Uri = path_and_query
         .parse()
         .map_err(|e| format!("Invalid URI '{}': {}", path_and_query, e))?;
     parts.uri = target_uri;
+
+    let user_id = auth
+        .user
+        .as_ref()
+        .map(|user| user.id.to_string())
+        .unwrap_or_default();
+    let signature = sign_plugin_request(
+        &proxy.auth_secret,
+        parts.method.as_str(),
+        path_and_query,
+        &request_id,
+        &user_id,
+        &role,
+    )?;
+    parts.headers.insert(
+        HEADER_AUTH_SIGNATURE,
+        HeaderValue::from_str(&signature)
+            .map_err(|e| format!("Invalid auth signature header for plugin proxy: {}", e))?,
+    );
 
     parts.headers.insert(
         hyper::header::HOST,
@@ -254,218 +337,26 @@ async fn forward_to_unix_socket(
     Ok(Response::from_parts(parts, body))
 }
 
-/// The re-checkable principal behind an `AuthContext`, if the actor-token
-/// format can represent one.
-///
-/// Only credentials backed by a row that redemption can independently
-/// re-query (a session, an API key) get a principal. `CliToken` is dead code
-/// in this repo today, and `DeploymentToken` has no user to act as, so both
-/// fall through to `None` — the plugin then gets no actor token at all rather
-/// than one redemption would have to trust blindly.
-fn actor_principal(auth: &AuthContext) -> Option<ActorPrincipal> {
-    match &auth.source {
-        AuthSource::Session {
-            session_id: Some(session_id),
-            ..
-        } => Some(ActorPrincipal::Session {
-            session_id: *session_id,
-        }),
-        AuthSource::ApiKey { key_id, .. } => Some(ActorPrincipal::ApiKey { key_id: *key_id }),
-        AuthSource::Session {
-            session_id: None, ..
-        }
-        | AuthSource::CliToken { .. }
-        | AuthSource::DeploymentToken { .. } => None,
-    }
-}
-
-/// Replace the `x-temps-*` header namespace with Temps' own assertions.
-///
-/// Stripping first is the security-relevant half: these headers are the
-/// plugin's only source of identity, so a caller who can set them can pick
-/// their own user id and role. An authenticated `reader` sending
-/// `x-temps-user-role: admin` would otherwise be an admin inside every
-/// plugin. Removing the whole prefix — rather than only the names we are
-/// about to set — means a header added to the protocol later cannot be
-/// spoofed by a Temps build that predates it.
-fn inject_temps_headers(
-    headers: &mut hyper::HeaderMap,
-    proxy: &PluginProxy,
-    auth: Option<&AuthContext>,
-) {
-    // The browser's session cookie and any Authorization header are the
-    // caller's real platform credential — good for far more than this one
-    // plugin. Installed plugins are trusted host code running under the same
-    // OS user as Temps, so this is defense in depth and least credential
-    // disclosure, not a process-isolation boundary: the plugin should receive
-    // only the scoped, single-plugin actor token it needs. Identity arrives via
-    // `x-temps-*` headers and that actor token, never the caller's credential.
-    for name in [
-        hyper::header::COOKIE,
-        hyper::header::AUTHORIZATION,
-        hyper::header::PROXY_AUTHORIZATION,
-    ] {
-        if headers.remove(&name).is_some() {
-            debug!(
-                plugin = %proxy.plugin_name,
-                header = %name,
-                "Stripping platform credential header before proxying to plugin"
-            );
-        }
-    }
-
-    let spoofed: Vec<_> = headers
-        .keys()
-        .filter(|name| name.as_str().starts_with(headers::PREFIX))
-        .cloned()
-        .collect();
-    for name in spoofed {
-        warn!(
-            plugin = %proxy.plugin_name,
-            header = %name,
-            "Stripping client-supplied Temps header before proxying to plugin"
-        );
-        headers.remove(&name);
-    }
-
-    let mut set = |name: &'static str, value: String| match value.parse() {
-        Ok(parsed) => {
-            headers.insert(name, parsed);
-        }
-        Err(e) => {
-            // Only reachable if a value contains bytes illegal in a header
-            // (a user email, realistically). Dropping the header is right:
-            // the plugin then sees the field as absent rather than as some
-            // silently mangled substitute.
-            warn!(
-                plugin = %proxy.plugin_name,
-                header = %name,
-                "Skipping unencodable Temps header value: {}", e
-            );
-        }
-    };
-
-    set(headers::PLUGIN_NAME, proxy.plugin_name.clone());
-    set(headers::REQUEST_ID, uuid::Uuid::new_v4().to_string());
-    set(headers::AUTH_SIGNATURE, proxy.auth_secret.clone());
-
-    // No context on a self-authenticating route (see `public_paths`). The
-    // absence of every identity header is the signal: a plugin must not be
-    // able to mistake an anonymous caller for a reader we vouched for.
-    let Some(auth) = auth else {
-        return;
-    };
-
-    // `Role`'s Display is the wire form the SDK's `TempsAuth` parses back.
-    set(headers::USER_ROLE, auth.effective_role.to_string());
-    let effective_permissions = temps_auth::permissions::Permission::all()
-        .into_iter()
-        .filter(|permission| auth.has_permission(permission))
-        .map(|permission| permission.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    set(headers::USER_PERMISSIONS, effective_permissions);
-
-    // Absent for credentials not bound to a user (deployment tokens). The
-    // plugin decides what to do with a roled-but-anonymous caller; we do not
-    // invent an id for it.
-    if let Some(user) = auth.user.as_ref() {
-        set(headers::USER_ID, user.id.to_string());
-        set(headers::USER_EMAIL, user.email.clone());
-
-        // Mint the proof the plugin echoes back on channel API calls. Bound
-        // to this plugin, this user, and a specific principal (a browser
-        // session or an API key) that redemption re-checks — see
-        // `temps_core::external_plugin::actor` for why the principal exists
-        // at all: without it, redemption could only rebuild the *user's*
-        // full role, silently discarding whatever a restricted API key had
-        // scoped the caller down to.
-        if proxy.wants_api {
-            match actor_principal(auth) {
-                Some(principal) => {
-                    if let Some(crypto) = proxy.actor_crypto.get() {
-                        match temps_core::external_plugin::actor::encode_plugin_actor_token(
-                            &crypto,
-                            &proxy.plugin_name,
-                            user.id,
-                            principal,
-                            temps_core::external_plugin::actor::PLUGIN_ACTOR_TOKEN_TTL,
-                            std::time::SystemTime::now(),
-                        ) {
-                            Ok((token, _exp)) => set(headers::ACTOR_TOKEN, token),
-                            Err(e) => warn!(
-                                plugin = %proxy.plugin_name,
-                                "Could not mint an actor token; this plugin's platform API \
-                                 calls will be refused: {e}"
-                            ),
-                        }
-                    } else {
-                        // Say it once per request rather than never: a plugin
-                        // that declared a capability and gets no token will
-                        // fail every API call, and "no actor" on the plugin
-                        // side gives no clue that the platform simply had no
-                        // key to sign with.
-                        warn!(
-                            plugin = %proxy.plugin_name,
-                            "This plugin declared an API capability but the platform has no \
-                             actor signing key installed, so its platform API calls will be \
-                             refused"
-                        );
-                    }
-                }
-                None => {
-                    // Not a bug — a credential that authenticated this
-                    // request but has no revocable row to re-check at
-                    // redemption (today: a CLI token). Minting anyway would
-                    // hand the plugin an unlinkable grant no "sign out" or
-                    // "deactivate" could ever reach; refusing is the correct
-                    // failure. Debug, not warn: this is the expected shape
-                    // for every such request, not an operator-actionable
-                    // problem.
-                    debug!(
-                        plugin = %proxy.plugin_name,
-                        "No actor token minted: this request's credential has no principal \
-                         the token format can represent, so this plugin's platform API calls \
-                         will be refused for it"
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// Shared, late-filled slot for the instance's actor-token signing key.
-///
-/// See [`PluginProxy::actor_crypto`] for why this is shared rather than
-/// copied: the writer runs after every reader has already been constructed.
-#[derive(Clone, Default)]
-pub struct ActorCryptoSlot(
-    std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<temps_core::CookieCrypto>>>>,
-);
-
-/// Debug never reveals whether a key is present, let alone the key: the
-/// proxy is `Debug`-printed in request-path logs.
-impl std::fmt::Debug for ActorCryptoSlot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ActorCryptoSlot(..)")
-    }
-}
-
-impl ActorCryptoSlot {
-    pub fn set(&self, crypto: std::sync::Arc<temps_core::CookieCrypto>) {
-        if let Ok(mut slot) = self.0.write() {
-            *slot = Some(crypto);
-        }
-    }
-
-    /// The key, if one has been installed.
-    ///
-    /// A poisoned lock reads as "no key", which fails closed: no token is
-    /// minted and the plugin's API calls are refused, rather than a panic on
-    /// the request path.
-    pub fn get(&self) -> Option<std::sync::Arc<temps_core::CookieCrypto>> {
-        self.0.read().ok().and_then(|slot| slot.clone())
-    }
+fn sign_plugin_request(
+    auth_secret: &str,
+    method: &str,
+    path_and_query: &str,
+    request_id: &str,
+    user_id: &str,
+    role: &str,
+) -> Result<String, String> {
+    let mut mac = HmacSha256::new_from_slice(auth_secret.as_bytes())
+        .map_err(|e| format!("Invalid plugin auth secret for HMAC signing: {}", e))?;
+    mac.update(method.as_bytes());
+    mac.update(b"\n");
+    mac.update(path_and_query.as_bytes());
+    mac.update(b"\n");
+    mac.update(request_id.as_bytes());
+    mac.update(b"\n");
+    mac.update(user_id.as_bytes());
+    mac.update(b"\n");
+    mac.update(role.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
 #[cfg(test)]

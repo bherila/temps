@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::extract::Request;
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Router;
 use temps_core::plugin::{
@@ -130,6 +131,14 @@ impl TempsPlugin for ExternalPluginsPlugin {
         let dynamic_proxy = Router::new().fallback(move |request: Request| {
             let router_ref = router_ref.clone();
             async move {
+                if request
+                    .extensions()
+                    .get::<temps_auth::AuthContext>()
+                    .is_none()
+                {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+
                 let router = router_ref.read().await.clone();
                 router.oneshot(request).await.into_response()
             }
