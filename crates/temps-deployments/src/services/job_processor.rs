@@ -1,8 +1,7 @@
 use crate::services::workflow_execution_service::WorkflowExecutionService;
 use crate::services::workflow_planner::WorkflowPlanner;
 use sea_orm::{
-    sea_query::{Expr, Query},
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set,
+    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
 };
 use serde_json;
 use std::collections::HashMap;
@@ -1193,6 +1192,10 @@ fn is_automatic_deploy_enabled(
     effective.unwrap_or(false)
 }
 
+fn should_skip_git_push_for_auto_deploy(auto_deploy_enabled: bool, manual_trigger: bool) -> bool {
+    !auto_deploy_enabled && !manual_trigger
+}
+
 // Extracted free function for testing
 async fn process_git_push_event(
     workflow_planner: Arc<WorkflowPlanner>,
@@ -1233,14 +1236,103 @@ async fn process_git_push_event(
         }
     };
 
-    // Resolve the deploy target(s). A manual trigger that names an explicit
-    // environment (`target_environment_id`) deploys to exactly that environment,
-    // bypassing branch → environment matching. Otherwise (webhook push, or a
-    // manual trigger with no explicit target) find every environment tracking
-    // this branch; each is deployed independently per its own automatic_deploy
-    // policy (env-wins semantics).
-    let environments = match resolve_target_environments(db.clone(), &project, &job).await {
-        Ok(envs) => envs,
+    // Find environment matching the branch, or fallback to preview environment.
+    // Multiple environments can track the same branch, but auto-deploy only
+    // targets the first match. Users promote to other environments via redeploy.
+    let environment =
+        match find_or_create_environment_for_branch(db.clone(), &project, job.branch.as_deref())
+            .await
+        {
+            Ok(env) => env,
+            Err(e) => {
+                error!(
+                    "Failed to find or create environment for project {}: {}",
+                    project.id, e
+                );
+                return;
+            }
+        };
+
+    // ── Auto-deploy gate ─────────────────────────────────────────────────
+    //
+    // Respect the user's "deploy on push" setting before doing any work.
+    // The effective value is computed by merging project + environment
+    // deployment configs (env overrides project). When both sides have
+    // automatic_deploy=false, webhook push events must NOT trigger a
+    // deployment — the user has explicitly opted out of auto-deploy.
+    //
+    // Manual triggers (the "Deploy" button, `trigger_pipeline` API,
+    // initial deployment on project creation) bypass this gate entirely:
+    // the user just clicked deploy, so they unambiguously want a deploy
+    // regardless of the auto-deploy setting. The flag exists for
+    // webhook-driven flows, not user-driven ones.
+    //
+    // Webhook events never infer trust from deployment count: a new
+    // environment or preview branch can have zero deployments, but that
+    // must not bypass the deploy-on-push opt-out.
+    let auto_deploy_enabled = is_automatic_deploy_enabled(
+        project.deployment_config.as_ref(),
+        environment.deployment_config.as_ref(),
+    );
+    if should_skip_git_push_for_auto_deploy(auto_deploy_enabled, job.manual_trigger) {
+        info!(
+            "Skipping push event for project {} environment {} ({}): automatic_deploy is disabled",
+            project.id, environment.id, environment.name
+        );
+        return;
+    } else if job.manual_trigger && !auto_deploy_enabled {
+        info!(
+            "Manual trigger for project {} environment {} ({}) — bypassing automatic_deploy=false",
+            project.id, environment.id, environment.name
+        );
+    }
+
+    // Check for duplicate deployment (same project, environment, and commit)
+    // This prevents duplicate deployments from being created if:
+    // - Multiple webhook URLs are configured in GitHub (both /webhook/git/github/events and /webhook/source/github/events)
+    // - GitHub sends duplicate webhooks
+    // - Race condition between concurrent push events
+    let existing_deployment = deployments::Entity::find()
+        .filter(deployments::Column::ProjectId.eq(project.id))
+        .filter(deployments::Column::EnvironmentId.eq(environment.id))
+        .filter(deployments::Column::CommitSha.eq(&job.commit))
+        .filter(deployments::Column::State.is_in(vec!["pending", "running", "deploying", "ready"]))
+        .order_by_desc(deployments::Column::CreatedAt)
+        .one(db.as_ref())
+        .await;
+
+    if let Ok(Some(existing)) = existing_deployment {
+        info!(
+            "Deployment already exists for project {} environment {} commit {} (deployment #{}, state: {}). Skipping duplicate.",
+            project.id, environment.id, job.commit, existing.id, existing.state
+        );
+        return;
+    }
+
+    // ── Cancel-on-supersede ──────────────────────────────────────────────
+    //
+    // Cancel any in-flight deployments for this environment before starting
+    // a new one. This is the standard PaaS behaviour (Vercel, Railway, etc.):
+    // the newest push always wins. Benefits:
+    //   - Prevents race conditions between concurrent mark_complete() calls
+    //   - Saves Docker build resources (no wasted builds)
+    //   - Avoids container name/port conflicts during deploy phase
+    //
+    // The cancelled deployments will stop at the next workflow checkpoint
+    // (between job batches) via the DatabaseCancellationProvider.
+    cancel_in_flight_deployments(&db, &queue, project.id, environment.id).await;
+
+    // Create deployment record directly (no more pipeline)
+    // Note: Previous deployment teardown happens AFTER this deployment succeeds (zero-downtime)
+    use chrono::Utc;
+
+    // Get the next deployment number for this project
+    let paginator = deployments::Entity::find()
+        .filter(deployments::Column::ProjectId.eq(project.id))
+        .paginate(db.as_ref(), 1);
+
+    let deployment_count = match paginator.num_items().await {
+        Ok(count) => count,
         Err(e) => {
             error!(
                 "Failed to resolve target environments for project {}: {}",
@@ -2843,27 +2935,17 @@ mod tests {
     }
 
     #[test]
-    fn auto_deploy_env_false_overrides_project_true() {
-        // Env explicitly opts out even though project is on — env wins.
-        let project_cfg = cfg_with_auto_deploy(true);
-        let env_cfg = cfg_with_auto_deploy(false);
-        assert!(!is_automatic_deploy_enabled(
-            Some(&project_cfg),
-            Some(&env_cfg)
-        ));
+    fn webhook_push_is_skipped_when_auto_deploy_disabled() {
+        assert!(should_skip_git_push_for_auto_deploy(false, false));
     }
 
     #[test]
-    fn auto_deploy_env_none_inherits_project_true() {
-        // Env has no explicit setting — inherits project's true.
-        let project_cfg = cfg_with_auto_deploy(true);
-        let env_cfg = temps_entities::deployment_config::DeploymentConfig {
-            automatic_deploy: None,
-            ..Default::default()
-        };
-        assert!(is_automatic_deploy_enabled(
-            Some(&project_cfg),
-            Some(&env_cfg)
-        ));
+    fn manual_trigger_bypasses_auto_deploy_disabled() {
+        assert!(!should_skip_git_push_for_auto_deploy(false, true));
+    }
+
+    #[test]
+    fn auto_deploy_enabled_allows_webhook_push() {
+        assert!(!should_skip_git_push_for_auto_deploy(true, false));
     }
 }

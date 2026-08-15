@@ -2885,8 +2885,7 @@ impl AgentExecutor {
             project_id: run.project_id,
             // The agent just pushed real commits to open a PR. Treat
             // identically to a git webhook so preview-env auto-deploy
-            // rules apply. The first-deploy exception covers a freshly
-            // created preview env.
+            // rules apply, even for freshly created preview envs.
             manual_trigger: false,
             rollback_from_deployment_id: None,
             // Webhook-like: infer the target environment from the branch.
