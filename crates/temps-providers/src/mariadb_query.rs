@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use futures::TryStreamExt;
-use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
-use sqlx::Row;
-use std::collections::HashMap;
+use base64::Engine;
+use sqlx::mysql::{MySqlArguments, MySqlPool, MySqlPoolOptions, MySqlRow};
+use sqlx::{Column, MySql, Row, TypeInfo};
+use std::collections::{HashMap, HashSet};
 use temps_query::{
     BoundedRows, Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType,
     DataError, DataRow, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef,
@@ -539,18 +539,18 @@ impl Queryable for MariaDbSource {
         let columns = self.query_columns(database_name, entity_name).await?;
 
         let start = std::time::Instant::now();
+        let schema = self.get_schema(container_path, entity_name).await?;
+        let allowed_fields = schema_field_names(&schema);
         let mut sql = format!(
             "SELECT * FROM {}.{}",
             quote_identifier(database_name),
             quote_identifier(entity_name)
         );
+        let filter = build_filter_clause(filters.as_ref(), &allowed_fields)?;
 
-        if let Some(filter_json) = filters {
-            if let Some(where_clause) = filter_json.get("where").and_then(|v| v.as_str()) {
-                validate_where_clause(where_clause)?;
-                sql.push_str(" WHERE ");
-                sql.push_str(where_clause);
-            }
+        if let Some(filter) = &filter {
+            sql.push_str(" WHERE ");
+            sql.push_str(&filter.sql);
         }
 
         if let Some(sort_by) = &options.sort_by {
@@ -576,26 +576,12 @@ impl Queryable for MariaDbSource {
             limit, offset, "executing MariaDB data query"
         );
 
-        // SECURITY / AVAILABILITY: bound the query server-side.
-        //
-        // The caller's tokio deadline frees the control-plane task, but dropping
-        // the future does not stop the server: it keeps executing and keeps
-        // holding its share of the operator's database. That matters here
-        // because this backend accepts a caller-supplied WHERE clause and a
-        // caller-supplied OFFSET, whose cost is O(offset) regardless of LIMIT.
-        //
-        // See `apply_statement_timeout` for why both spellings are tried and
-        // why this must share the query's connection.
-        let timeout_ms = options.timeout_ms.unwrap_or(30_000);
-        let mut conn = self.pool.acquire().await.map_err(|e| {
-            DataError::ConnectionFailed(format!(
-                "Failed to acquire a MariaDB connection for query on {}.{}: {}",
-                database_name, entity_name, e
-            ))
-        })?;
-        apply_statement_timeout(&mut conn, timeout_ms, database_name).await;
+        let mut query = sqlx::query(&sql);
+        if let Some(filter) = &filter {
+            query = bind_filter_params(query, &filter.params);
+        }
 
-        let mut stream = sqlx::query(&sql)
+        let rows = query
             .bind(limit as i64)
             .bind(offset as i64)
             .fetch(&mut *conn);
@@ -683,7 +669,8 @@ impl Queryable for MariaDbSource {
         drop(stream);
         drop(conn);
 
-        let (data_rows, truncated) = bounded.into_parts();
+        let data_rows: Result<Vec<DataRow>> = rows.iter().map(Self::row_to_datarow).collect();
+        let data_rows = data_rows?;
         let row_count = data_rows.len();
 
         Ok(QueryResult {
@@ -709,41 +696,27 @@ impl Queryable for MariaDbSource {
         let database_name = database_from_path(container_path, &self.database_name)?;
         validate_identifier("table", entity_name)?;
 
+        let schema = self.get_schema(container_path, entity_name).await?;
+        let allowed_fields = schema_field_names(&schema);
         let mut sql = format!(
             "SELECT COUNT(*) AS row_count FROM {}.{}",
             quote_identifier(database_name),
             quote_identifier(entity_name)
         );
+        let filter = build_filter_clause(filters.as_ref(), &allowed_fields)?;
 
-        if let Some(filter_json) = filters {
-            if let Some(where_clause) = filter_json.get("where").and_then(|v| v.as_str()) {
-                validate_where_clause(where_clause)?;
-                sql.push_str(" WHERE ");
-                sql.push_str(where_clause);
-            }
+        if let Some(filter) = &filter {
+            sql.push_str(" WHERE ");
+            sql.push_str(&filter.sql);
         }
 
-        // SECURITY: bound this the way `query` is bounded.
-        //
-        // The timeout work originally covered the row-reading path only, which
-        // left the more expensive operation unbounded. `COUNT(*)` is a full
-        // index scan, it takes a caller-supplied WHERE clause, and
-        // `get_entity_info` falls through to it whenever `TABLE_ROWS` is null
-        // or below the estimate threshold — true for every view and every table
-        // whose stats were never gathered, regardless of real size. Since
-        // `get_entity_info` is in the AI read allowlist, "check the row count of
-        // every table" would otherwise be a denial of service against the
-        // customer's production database.
-        let mut conn = self.pool.acquire().await.map_err(|e| {
-            DataError::ConnectionFailed(format!(
-                "Failed to acquire a MariaDB connection to count {}.{}: {}",
-                database_name, entity_name, e
-            ))
-        })?;
-        apply_statement_timeout(&mut conn, COUNT_TIMEOUT_MS, database_name).await;
+        let mut query = sqlx::query(&sql);
+        if let Some(filter) = &filter {
+            query = bind_filter_params(query, &filter.params);
+        }
 
-        let row = sqlx::query(&sql)
-            .fetch_one(&mut *conn)
+        let row = query
+            .fetch_one(&self.pool)
             .await
             .map_err(|e| DataError::QueryFailed(format!("Count query failed: {}", e)))?;
 
@@ -787,22 +760,39 @@ impl QuerySchemaProvider for MariaDbSource {
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "title": "MariaDB Query Filters",
-            "description": "Filter data using SQL WHERE clause syntax",
+            "description": "Filter data with structured, parameterized conditions",
             "properties": {
-                "where": {
+                "logic": {
                     "type": "string",
-                    "title": "WHERE Clause",
-                    "description": "SQL WHERE clause (without 'WHERE' keyword). Example: status = 'active' AND created_at > '2025-01-01'",
-                    "examples": [
-                        "status = 'active'",
-                        "created_at > '2025-01-01'",
-                        "age >= 18 AND country = 'US'",
-                        "name LIKE '%test%'",
-                        "id IN (1, 2, 3)"
-                    ],
-                    "x-ui-widget": "textarea",
-                    "x-ui-placeholder": "status = 'active' AND created_at > NOW() - INTERVAL 7 DAY",
-                    "x-ui-rows": 3
+                    "title": "Condition Logic",
+                    "description": "How multiple conditions are combined",
+                    "enum": ["and", "or"],
+                    "default": "and"
+                },
+                "conditions": {
+                    "type": "array",
+                    "title": "Conditions",
+                    "items": {
+                        "type": "object",
+                        "required": ["field", "op", "value"],
+                        "properties": {
+                            "field": {
+                                "type": "string",
+                                "title": "Column"
+                            },
+                            "op": {
+                                "type": "string",
+                                "title": "Operator",
+                                "enum": ["eq", "ne", "gt", "gte", "lt", "lte", "like", "in"],
+                                "default": "eq"
+                            },
+                            "value": {
+                                "title": "Value",
+                                "description": "Scalar value for comparisons, or an array when op is in"
+                            }
+                        },
+                        "additionalProperties": false
+                    }
                 }
             },
             "additionalProperties": false
@@ -1024,314 +1014,208 @@ fn normalize_sort_field(sort_by: &str) -> Result<&str> {
     Ok(trimmed)
 }
 
-/// Server-side ceiling for `count`, which takes no `QueryOptions` and so has no
-/// caller-supplied deadline to honour. See the call site for why it needs one.
-const COUNT_TIMEOUT_MS: u64 = 10_000;
-
-/// Apply a server-side statement timeout to one pooled connection.
-///
-/// The knob is spelled differently on the two engines this backend serves —
-/// MySQL 5.7.8+ has `max_execution_time` (milliseconds), MariaDB has
-/// `max_statement_time` (seconds, fractional) — and setting the one the server
-/// does not know is an error, so both are tried and whichever lands wins. Must
-/// run on the SAME connection as the statement it is meant to bound; a session
-/// variable set on some other connection in the pool bounds some other request.
-///
-/// Best-effort by design: failing to set a ceiling should not fail the query,
-/// but it must be visible, because it means only the control-plane deadline is
-/// in play and the server will keep working after the client gives up.
-async fn apply_statement_timeout(
-    conn: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
-    timeout_ms: u64,
-    database_name: &str,
-) {
-    let mysql_set = sqlx::query(&format!("SET SESSION max_execution_time = {timeout_ms}"))
-        .execute(&mut **conn)
-        .await
-        .is_ok();
-    let mariadb_set = sqlx::query(&format!(
-        "SET SESSION max_statement_time = {}",
-        timeout_ms as f64 / 1000.0
-    ))
-    .execute(&mut **conn)
-    .await
-    .is_ok();
-
-    if !mysql_set && !mariadb_set {
-        warn!(
-            database = %database_name,
-            "Neither max_execution_time nor max_statement_time is supported by this server; \
-             data browser statements are bounded only by the control-plane deadline"
-        );
-    }
+#[derive(Debug, Clone, PartialEq)]
+enum FilterParam {
+    Bool(bool),
+    F64(f64),
+    I64(i64),
+    Null,
+    String(String),
 }
 
-fn strip_sql_string_literals(sql: &str) -> Result<String> {
-    let mut result = String::with_capacity(sql.len());
-    let mut in_string = false;
-    let mut chars = sql.chars().peekable();
+#[derive(Debug, Clone, PartialEq)]
+struct FilterClause {
+    sql: String,
+    params: Vec<FilterParam>,
+}
 
-    while let Some(c) = chars.next() {
-        // SECURITY: backtick-quoted identifiers must be normalised before the
-        // shared structural check runs, and they must collapse to the *same*
-        // placeholder the PostgreSQL stripper emits for `"..."`.
-        //
-        // `reject_subqueries_and_function_calls` was written against PostgreSQL
-        // lexing: it recognises a function call either by a quote character
-        // (`"` or `'`) immediately before `(`, or by walking back over
-        // identifier characters. A backtick is neither — it is not a quote it
-        // knows about, and it terminates the identifier walk — so the guard saw
-        // an empty identifier before the paren and allowed the call through.
-        // The `sleep(`/`benchmark(` denylist entries missed it independently,
-        // because a backticked call contains "sleep`(" rather than "sleep(".
-        // One character defeated both layers, yielding a CPU/connection-hold
-        // primitive on the operator's database reachable from the agent's
-        // documented `--filter`.
-        //
-        // Emitting `""` means `` `benchmark`(...) `` reaches the shared check as
-        // `""(...)`, which it already rejects as a quoted function call. A
-        // backtick-quoted identifier in ordinary use (`` `order` = 1 ``) becomes
-        // `"" = 1` and still validates. Only the validator sees this rewrite;
-        // the server is always sent the caller's original text.
-        if c == '`' && !in_string {
-            let mut terminated = false;
-            while let Some(inner) = chars.next() {
-                if inner == '`' {
-                    // MySQL escapes a literal backtick inside a quoted
-                    // identifier by doubling it.
-                    if chars.peek() == Some(&'`') {
-                        chars.next();
-                        continue;
-                    }
-                    terminated = true;
-                    break;
-                }
-            }
-            if !terminated {
-                return Err(DataError::InvalidQuery(
-                    "Unterminated backtick-quoted identifier in the data browser filter"
-                        .to_string(),
-                ));
-            }
-            result.push_str("\"\"");
-            continue;
-        }
+fn schema_field_names(schema: &DatasetSchema) -> HashSet<String> {
+    schema
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect()
+}
 
-        // SECURITY: refuse double quotes rather than guess what they mean.
-        //
-        // Under MySQL/MariaDB's default sql_mode `"..."` is a *string literal*;
-        // under ANSI_QUOTES it is a quoted identifier. The server's mode is not
-        // knowable from here, and the two readings disagree about where the
-        // literal ends — so any stripper that picks one desynchronises from the
-        // server whenever the other applies. That is exactly the class of bug
-        // the backslash rule below was added for: the stripper swallows a span
-        // the server executes, and every later check runs on a sanitised
-        // remainder.
-        //
-        // Single quotes delimit strings in both modes and backticks delimit
-        // identifiers in both modes, so a legitimate filter never needs `"`.
-        if c == '"' && !in_string {
+fn build_filter_clause(
+    filters: Option<&serde_json::Value>,
+    allowed_fields: &HashSet<String>,
+) -> Result<Option<FilterClause>> {
+    let Some(filters) = filters else {
+        return Ok(None);
+    };
+
+    if filters.get("where").is_some() {
+        return Err(DataError::InvalidQuery(
+            "Raw SQL WHERE filters are not supported for MariaDB; use structured conditions"
+                .to_string(),
+        ));
+    }
+
+    let Some(conditions) = filters.get("conditions") else {
+        return Ok(None);
+    };
+    let conditions = conditions.as_array().ok_or_else(|| {
+        DataError::InvalidQuery("MariaDB filter 'conditions' must be an array".to_string())
+    })?;
+    if conditions.is_empty() {
+        return Ok(None);
+    }
+
+    let logic = filters
+        .get("logic")
+        .and_then(|value| value.as_str())
+        .unwrap_or("and")
+        .to_ascii_lowercase();
+    let joiner = match logic.as_str() {
+        "and" => " AND ",
+        "or" => " OR ",
+        _ => {
             return Err(DataError::InvalidQuery(
-                "Double quotes are not allowed in the data browser filter — use single quotes \
-                 for string values and backticks for identifiers"
-                    .to_string(),
+                "MariaDB filter 'logic' must be 'and' or 'or'".to_string(),
             ));
         }
+    };
 
-        if in_string {
-            // SECURITY: MySQL/MariaDB honour backslash escapes inside string
-            // literals unless NO_BACKSLASH_ESCAPES is set, and the server's
-            // sql_mode is not knowable from here. This stripper only
-            // understood the doubled-quote form, so `'\''` desynchronised it
-            // from the server: it read the escaped quote as the first half of
-            // a `''` pair, stayed "inside" the string, and discarded the rest
-            // of the clause — including the payload. Every downstream check
-            // then ran against a sanitised remainder and passed.
-            //
-            //   1='\'' union select 1 from mysql.user where 'a'='a'
-            //
-            // Rather than emulate a mode we cannot observe, refuse the input.
-            // A legitimate data-browser filter has no need of one.
-            if c == '\\' {
-                return Err(DataError::InvalidQuery(
-                    "Backslash escapes are not allowed inside string literals in the data \
-                     browser filter"
-                        .to_string(),
-                ));
-            }
-            if c == '\'' {
-                if chars.peek() == Some(&'\'') {
-                    chars.next();
+    let mut sql_parts = Vec::with_capacity(conditions.len());
+    let mut params = Vec::new();
+
+    for condition in conditions {
+        let field = condition
+            .get("field")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                DataError::InvalidQuery(
+                    "MariaDB filter condition requires a string 'field'".to_string(),
+                )
+            })?;
+        validate_identifier("filter field", field)?;
+        if !allowed_fields.contains(field) {
+            return Err(DataError::InvalidQuery(format!(
+                "Filter field '{}' does not exist on the selected MariaDB table",
+                field
+            )));
+        }
+
+        let op = condition
+            .get("op")
+            .and_then(|value| value.as_str())
+            .unwrap_or("eq")
+            .to_ascii_lowercase();
+        let value = condition.get("value").ok_or_else(|| {
+            DataError::InvalidQuery("MariaDB filter condition requires a 'value'".to_string())
+        })?;
+        let ident = quote_identifier(field);
+
+        match op.as_str() {
+            "eq" | "=" => {
+                if value.is_null() {
+                    sql_parts.push(format!("{ident} IS NULL"));
                 } else {
-                    in_string = false;
-                    result.push('\'');
+                    sql_parts.push(format!("{ident} = ?"));
+                    params.push(filter_param(value)?);
                 }
             }
-        } else if c == '\'' {
-            in_string = true;
-            result.push('\'');
-        } else {
-            result.push(c);
+            "ne" | "!=" | "<>" => {
+                if value.is_null() {
+                    sql_parts.push(format!("{ident} IS NOT NULL"));
+                } else {
+                    sql_parts.push(format!("{ident} <> ?"));
+                    params.push(filter_param(value)?);
+                }
+            }
+            "gt" | ">" | "gte" | ">=" | "lt" | "<" | "lte" | "<=" | "like" => {
+                let sql_op = match op.as_str() {
+                    "gt" | ">" => ">",
+                    "gte" | ">=" => ">=",
+                    "lt" | "<" => "<",
+                    "lte" | "<=" => "<=",
+                    "like" => "LIKE",
+                    _ => unreachable!(),
+                };
+                if value.is_null() {
+                    return Err(DataError::InvalidQuery(format!(
+                        "MariaDB filter operator '{}' cannot compare against null",
+                        op
+                    )));
+                }
+                sql_parts.push(format!("{ident} {sql_op} ?"));
+                params.push(filter_param(value)?);
+            }
+            "in" => {
+                let values = value.as_array().ok_or_else(|| {
+                    DataError::InvalidQuery(
+                        "MariaDB 'in' filter value must be an array".to_string(),
+                    )
+                })?;
+                if values.is_empty() {
+                    return Err(DataError::InvalidQuery(
+                        "MariaDB 'in' filter requires at least one value".to_string(),
+                    ));
+                }
+                sql_parts.push(format!(
+                    "{ident} IN ({})",
+                    vec!["?"; values.len()].join(", ")
+                ));
+                for value in values {
+                    if value.is_null() {
+                        return Err(DataError::InvalidQuery(
+                            "MariaDB 'in' filter values cannot be null".to_string(),
+                        ));
+                    }
+                    params.push(filter_param(value)?);
+                }
+            }
+            _ => {
+                return Err(DataError::InvalidQuery(format!(
+                    "Unsupported MariaDB filter operator '{}'",
+                    op
+                )));
+            }
         }
     }
 
-    if in_string {
-        return Err(DataError::InvalidQuery(
-            "Unterminated string literal in the data browser filter".to_string(),
-        ));
-    }
-
-    Ok(result)
+    Ok(Some(FilterClause {
+        sql: sql_parts.join(joiner),
+        params,
+    }))
 }
 
-fn validate_where_clause(sql: &str) -> Result<()> {
-    let sql_lower = sql.trim().to_ascii_lowercase();
-
-    if sql_lower.is_empty() {
-        return Err(DataError::InvalidQuery(
-            "WHERE clause cannot be empty".to_string(),
-        ));
+fn filter_param(value: &serde_json::Value) -> Result<FilterParam> {
+    if let Some(value) = value.as_bool() {
+        return Ok(FilterParam::Bool(value));
     }
-
-    // SECURITY: normalise whitespace before any keyword matching. The list
-    // below matches literal prefixes like `"union "`, so a separator it does
-    // not enumerate (\r, \f, \v — all whitespace to MySQL's lexer) walked
-    // straight past it.
-    let without_strings =
-        temps_query_postgres::normalize_sql_whitespace(&strip_sql_string_literals(&sql_lower)?);
-
-    if without_strings.contains(';') {
-        return Err(DataError::InvalidQuery(
-            "Multiple SQL statements are not allowed".to_string(),
-        ));
+    if let Some(value) = value.as_i64() {
+        return Ok(FilterParam::I64(value));
     }
-
-    if without_strings.contains("--")
-        || without_strings.contains("/*")
-        || without_strings.contains('#')
-    {
-        return Err(DataError::InvalidQuery(
-            "SQL comments are not allowed in the data browser".to_string(),
-        ));
+    if let Some(value) = value.as_f64() {
+        return Ok(FilterParam::F64(value));
     }
+    if let Some(value) = value.as_str() {
+        return Ok(FilterParam::String(value.to_string()));
+    }
+    if value.is_null() {
+        return Ok(FilterParam::Null);
+    }
+    Err(DataError::InvalidQuery(
+        "MariaDB filter values must be strings, numbers, booleans, or null".to_string(),
+    ))
+}
 
-    // STRUCTURAL CHECKS — shared with the PostgreSQL validator rather than
-    // reimplemented. The local copy drifted: it inspected only the byte
-    // immediately before `(` (so `sleep (5)` and `extractvalue (1, user ())`
-    // passed) and treated `select` as the only subquery starter (so
-    // `id IN (TABLE mysql.user)` passed on MySQL 8.0.19+, which this backend
-    // also serves). One implementation, one set of tests.
-    temps_query_postgres::reject_subqueries_and_function_calls(&without_strings)?;
-
-    let dangerous_keywords = [
-        "drop ",
-        "truncate ",
-        "alter ",
-        "create ",
-        "grant ",
-        "revoke ",
-        "insert ",
-        "update ",
-        "delete ",
-        "replace ",
-        "load ",
-        // One space suffices now that whitespace is normalised above.
-        "union ",
-        "intersect ",
-        "except ",
-        // These two keep the paren attached deliberately. The real guard for
-        // function calls is the structural check above, which rejects *any*
-        // identifier before `(` — including the backtick-quoted form, now that
-        // the stripper normalises it. Matching bare "sleep"/"benchmark" here
-        // would add nothing the structural check does not already catch, while
-        // rejecting ordinary columns like `sleep_minutes` or `benchmark_id`.
-        "sleep(",
-        "benchmark(",
-        "load_file",
-        " into ",
-        "outfile",
-        "dumpfile",
-        "execute ",
-        "prepare ",
-        "call ",
-        "handler ",
-        "lock ",
-        "unlock ",
-        "set ",
-        "begin ",
-        "commit ",
-        "rollback ",
-        "savepoint ",
-    ];
-
-    // Match on token boundaries rather than raw substrings. The trailing space
-    // in each entry was doing that job badly: `payload = 'x'` matched `"load "`
-    // and `charset = 'utf8'` matched `"set "`, so two very ordinary column
-    // names were unfilterable. A validator that blocks legitimate queries is a
-    // validator someone eventually switches off.
-    for keyword in &dangerous_keywords {
-        let keyword = keyword.trim();
-        // `sleep(`/`benchmark(` keep their paren and stay substring matches —
-        // they are not identifiers, and the structural check above is the real
-        // guard for the function-call forms.
-        let hit = if keyword.ends_with('(') {
-            without_strings.contains(keyword)
-        } else {
-            temps_query_postgres::contains_sql_token(&without_strings, keyword)
+fn bind_filter_params<'q>(
+    mut query: sqlx::query::Query<'q, MySql, MySqlArguments>,
+    params: &'q [FilterParam],
+) -> sqlx::query::Query<'q, MySql, MySqlArguments> {
+    for param in params {
+        query = match param {
+            FilterParam::Bool(value) => query.bind(*value),
+            FilterParam::F64(value) => query.bind(*value),
+            FilterParam::I64(value) => query.bind(*value),
+            FilterParam::Null => query.bind(None::<String>),
+            FilterParam::String(value) => query.bind(value),
         };
-        if hit {
-            return Err(DataError::InvalidQuery(format!(
-                "SQL operation '{}' is not allowed in the data browser",
-                keyword
-            )));
-        }
     }
-
-    // SECURITY: no regex operators.
-    //
-    // The denylist runs on string-stripped input, so a regex pattern — which
-    // lives entirely inside a string literal — is invisible to it.
-    // `1=1 and 'aaaaaaaaaaaaaaaaaaaa' regexp '(a+)+b'` strips to
-    // `1=1 and '' regexp ''` and passes every check. MariaDB's engine is PCRE,
-    // which backtracks, so that is the same CPU-burn primitive on the
-    // operator's database that the `benchmark(`/backtick fix closed, reached
-    // through a door the fix cannot see. Not fixable by inspecting the payload:
-    // the payload is opaque to us by construction.
-    for operator in ["regexp", "rlike"] {
-        if temps_query_postgres::contains_sql_token(&without_strings, operator) {
-            return Err(DataError::InvalidQuery(
-                "Regular-expression operators (REGEXP, RLIKE) are not allowed in the data \
-                 browser — use LIKE instead"
-                    .to_string(),
-            ));
-        }
-    }
-
-    // SECURITY: no system-variable reads.
-    //
-    // `@@datadir`, `@@version`, `@@secure_file_priv` and friends need no
-    // parentheses, so the function-call guard never sees them, and they give
-    // blind boolean extraction of the server's configuration through an
-    // ordinary filter. Same for the parenless information functions.
-    if without_strings.contains("@@") {
-        return Err(DataError::InvalidQuery(
-            "System variables (@@...) are not allowed in the data browser".to_string(),
-        ));
-    }
-    for token in [
-        "current_user",
-        "session_user",
-        "system_user",
-        "current_role",
-    ] {
-        if temps_query_postgres::contains_sql_token(&without_strings, token) {
-            return Err(DataError::InvalidQuery(format!(
-                "'{token}' is not allowed in the data browser"
-            )));
-        }
-    }
-
-    Ok(())
+    query
 }
 
 pub(crate) fn is_mariadb_compatible_image(image: &str) -> bool {
@@ -1737,13 +1621,50 @@ mod tests {
     }
 
     #[test]
-    fn validates_where_clause() {
-        assert!(validate_where_clause("status = 'active' AND age >= 18").is_ok());
-        assert!(validate_where_clause("id IN (1, 2, 3)").is_ok());
-        assert!(validate_where_clause("name LIKE '%drop table%'").is_ok());
-        assert!(validate_where_clause("1=1; DROP TABLE users").is_err());
-        assert!(validate_where_clause("id = 1 UNION SELECT password FROM users").is_err());
-        assert!(validate_where_clause("name = 'x' -- comment").is_err());
+    fn builds_structured_filter_clause_with_bound_params() {
+        let allowed_fields =
+            HashSet::from(["status".to_string(), "age".to_string(), "id".to_string()]);
+        let filter = serde_json::json!({
+            "logic": "and",
+            "conditions": [
+                {"field": "status", "op": "eq", "value": "active"},
+                {"field": "age", "op": "gte", "value": 18},
+                {"field": "id", "op": "in", "value": [1, 2, 3]}
+            ]
+        });
+
+        let clause = build_filter_clause(Some(&filter), &allowed_fields)
+            .expect("structured filter should be valid")
+            .expect("filter clause should be present");
+
+        assert_eq!(
+            clause.sql,
+            "`status` = ? AND `age` >= ? AND `id` IN (?, ?, ?)"
+        );
+        assert_eq!(
+            clause.params,
+            vec![
+                FilterParam::String("active".to_string()),
+                FilterParam::I64(18),
+                FilterParam::I64(1),
+                FilterParam::I64(2),
+                FilterParam::I64(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_raw_where_and_unknown_filter_fields() {
+        let allowed_fields = HashSet::from(["status".to_string()]);
+        let raw_filter = serde_json::json!({
+            "where": "EXISTS(SELECT 1 FROM other_db.secret_table)"
+        });
+        let unknown_field_filter = serde_json::json!({
+            "conditions": [{"field": "other_table_secret", "op": "eq", "value": "x"}]
+        });
+
+        assert!(build_filter_clause(Some(&raw_filter), &allowed_fields).is_err());
+        assert!(build_filter_clause(Some(&unknown_field_filter), &allowed_fields).is_err());
     }
 
     #[test]
