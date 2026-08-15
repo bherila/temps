@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **SECURITY: remote deployment endpoints now enforce deployment-token project scope**: `crates/temps-deployments` now applies `project_scope_guard!` to the remote image/static deploy and artifact endpoints so a project-scoped deployment token cannot target another project by changing the path `project_id`, preventing attacker-controlled Docker images from receiving another project's deployment secrets.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
