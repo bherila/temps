@@ -1641,6 +1641,8 @@ impl GitProviderManager {
     /// so teammates can share and reuse each other's git connections.
     pub async fn get_user_connections_paginated(
         &self,
+        user_id: i32,
+        include_unowned_connections: bool,
         page: u64,
         per_page: u64,
         sort: &str,
@@ -1650,6 +1652,10 @@ impl GitProviderManager {
 
         let mut query = git_provider_connections::Entity::find()
             .filter(git_provider_connections::Column::IsActive.eq(true));
+
+        if !include_unowned_connections {
+            query = query.filter(git_provider_connections::Column::UserId.eq(user_id));
+        }
 
         // Apply sorting - default to created_at desc
         query = match (sort, direction) {
@@ -1743,6 +1749,24 @@ impl GitProviderManager {
                 owner, name, connection_id
             ))
         })
+    }
+
+    /// Ensure a connection is owned by the requesting user, unless the caller is an administrator.
+    pub async fn ensure_connection_access(
+        &self,
+        connection_id: i32,
+        user_id: i32,
+        is_admin: bool,
+    ) -> Result<(), GitProviderManagerError> {
+        let connection = self.get_connection(connection_id).await?;
+
+        if is_admin || connection.user_id == Some(user_id) {
+            Ok(())
+        } else {
+            Err(GitProviderManagerError::ConnectionNotFound(
+                connection_id.to_string(),
+            ))
+        }
     }
 
     /// Get a specific connection
