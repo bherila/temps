@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use sea_orm::{DatabaseConnection, EntityTrait};
 
 use temps_ai::ChatTool;
+use temps_auth::{context::AuthContext, permissions::Permission};
 use temps_entities::projects;
 use temps_git::GitProviderManager;
 
@@ -372,7 +373,16 @@ impl ConversationContextProvider for RepoToolsProvider {
         None
     }
 
-    async fn tools(&self, project_id: i32, _context_id: &str) -> Vec<ChatTool> {
+    async fn tools_with_auth(
+        &self,
+        project_id: i32,
+        _context_id: &str,
+        auth: &AuthContext,
+    ) -> Vec<ChatTool> {
+        if !auth.has_permission(&Permission::GitRepositoriesRead) {
+            return Vec::new();
+        }
+
         // No git manager → no tools.
         if self.git.is_none() {
             return Vec::new();
@@ -430,13 +440,18 @@ impl ConversationContextProvider for RepoToolsProvider {
         ]
     }
 
-    async fn execute_tool(
+    async fn execute_tool_with_auth(
         &self,
         project_id: i32,
         _context_id: &str,
         name: &str,
         arguments: &str,
+        auth: &AuthContext,
     ) -> String {
+        if !auth.has_permission(&Permission::GitRepositoriesRead) {
+            return "Repository tools require the git_repositories:read permission.".to_string();
+        }
+
         // Parse the JSON args. On failure return a readable message so the
         // model can self-correct rather than receiving a raw Rust error.
         let args: serde_json::Value = match serde_json::from_str(arguments) {
@@ -491,6 +506,7 @@ impl ConversationContextProvider for RepoToolsProvider {
 mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
+    use temps_auth::permissions::Role;
 
     /// Verify that `validate_repo_path` still rejects traversal / absolute paths
     /// (the shared helper is tested more exhaustively in repo_common, but we want
@@ -624,7 +640,9 @@ mod tests {
     async fn execute_tool_unknown_name() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let provider = RepoToolsProvider::new(Arc::new(db), None);
-        let result = provider.execute_tool(1, "", "nonexistent_tool", "{}").await;
+        let result = provider
+            .execute_tool_with_auth(1, "", "nonexistent_tool", "{}", &auth_with_git_read())
+            .await;
         assert!(
             result.contains("Unknown repo tool"),
             "expected unknown-tool message, got: {result}"
@@ -637,7 +655,13 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let provider = RepoToolsProvider::new(Arc::new(db), None);
         let result = provider
-            .execute_tool(1, "", "read_repo_file", "not json {{{")
+            .execute_tool_with_auth(
+                1,
+                "",
+                "read_repo_file",
+                "not json {{{",
+                &auth_with_git_read(),
+            )
             .await;
         assert!(
             result.contains("not valid JSON") || result.contains("Invalid"),
@@ -651,7 +675,9 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let provider = RepoToolsProvider::new(Arc::new(db), None);
         // Arguments have no "path" key at all.
-        let result = provider.execute_tool(1, "", "read_repo_file", "{}").await;
+        let result = provider
+            .execute_tool_with_auth(1, "", "read_repo_file", "{}", &auth_with_git_read())
+            .await;
         // The missing-path guard fires before any git access.
         assert!(
             result.contains("path"),
@@ -659,10 +685,69 @@ mod tests {
         );
     }
 
+    /// Repo tools deny execution when the caller lacks GitRepositoriesRead, even
+    /// if a tool call is forced through dispatch.
+    #[tokio::test]
+    async fn execute_tool_requires_git_repositories_read() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let provider = RepoToolsProvider::new(Arc::new(db), None);
+        let result = provider
+            .execute_tool_with_auth(
+                1,
+                "",
+                "read_repo_file",
+                r#"{"path":"README.md"}"#,
+                &auth_without_git_read(),
+            )
+            .await;
+
+        assert!(
+            result.contains("git_repositories:read"),
+            "expected permission denial, got: {result}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Helper — build a minimal projects::Model with safe defaults.
     // Mirrors the helper in project.rs tests.
     // ---------------------------------------------------------------------------
+
+    fn test_user() -> temps_entities::users::Model {
+        let now = chrono::Utc::now();
+        temps_entities::users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn auth_with_git_read() -> AuthContext {
+        AuthContext::new_api_key(
+            test_user(),
+            None,
+            Some(vec![Permission::GitRepositoriesRead]),
+            "test".to_string(),
+            1,
+        )
+    }
+
+    fn auth_without_git_read() -> AuthContext {
+        AuthContext::new_api_key(test_user(), Some(Role::Mcp), None, "test".to_string(), 1)
+    }
 
     fn build_project_model(id: i32, connection_id: Option<i32>) -> projects::Model {
         let now = chrono::Utc::now();

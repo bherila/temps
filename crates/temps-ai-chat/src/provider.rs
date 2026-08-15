@@ -93,6 +93,19 @@ pub trait ConversationContextProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Like [`Self::tools`], but with the calling user's [`AuthContext`]
+    /// available. Providers that expose tools backed by separately-protected
+    /// resources should override this to ensure the model only sees tools the
+    /// caller could use directly.
+    async fn tools_with_auth(
+        &self,
+        project_id: i32,
+        context_id: &str,
+        _auth: &AuthContext,
+    ) -> Vec<ChatTool> {
+        self.tools(project_id, context_id).await
+    }
+
     /// Execute a tool the model requested. `arguments` is the raw JSON string the
     /// model emitted. Returns a string fed back to the model — surface failures
     /// as readable text (e.g. "file not found"), never as an error, so the model

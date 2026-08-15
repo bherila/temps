@@ -523,20 +523,21 @@ impl ConversationService {
         if let Some(api_tools_provider) = self.providers.get("__api_tools__") {
             tools.extend(
                 api_tools_provider
-                    .tools(conv.project_id, &conv.context_id)
+                    .tools_with_auth(conv.project_id, &conv.context_id, auth)
                     .await,
             );
         }
         // Merge Git-repository exploration tools from the sentinel provider.
-        // Gated only by the project having a Git connection (the provider
-        // returns an empty vec when not connected). Available in every context
+        // Gated by the caller's GitRepositoriesRead permission and the project
+        // having a Git connection (the provider returns an empty vec otherwise).
+        // Available in every context
         // (project, alert, deployment, error-group, …) so the model can always
         // explore the source tree when a repo is connected, regardless of which
         // context_type seeded the chat.
         if let Some(repo_tools_provider) = self.providers.get("__repo_tools__") {
             tools.extend(
                 repo_tools_provider
-                    .tools(conv.project_id, &conv.context_id)
+                    .tools_with_auth(conv.project_id, &conv.context_id, auth)
                     .await,
             );
         }
@@ -988,8 +989,14 @@ impl ConversationService {
                             // provider rather than the context provider, so the
                             // model can explore the source tree in any context.
                             if let Some(rt) = &repo_tools {
-                                rt.execute_tool(project_id, &context_id, &tc.name, &tc.arguments)
-                                    .await
+                                rt.execute_tool_with_auth(
+                                    project_id,
+                                    &context_id,
+                                    &tc.name,
+                                    &tc.arguments,
+                                    &auth,
+                                )
+                                .await
                             } else {
                                 format!(
                                     "Tool '{}' is not available (repo tools provider absent).",
