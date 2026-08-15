@@ -12,7 +12,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Extension, Path, Query, State,
     },
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post},
     Json,
@@ -98,6 +98,70 @@ use temps_core::problemdetails::Problem;
     )
 )]
 pub struct DeploymentsApiDoc;
+
+fn validate_websocket_origin(headers: &HeaderMap) -> Result<(), Problem> {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return Ok(());
+    };
+
+    let origin = origin.to_str().map_err(|_| {
+        problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("Forbidden")
+            .with_detail("WebSocket Origin header is invalid")
+    })?;
+
+    let origin_host = url::Url::parse(origin)
+        .ok()
+        .and_then(|origin| {
+            origin
+                .host_str()
+                .map(|host| (host.to_string(), origin.port()))
+        })
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Forbidden")
+                .with_detail("WebSocket Origin header is not allowed")
+        })?;
+
+    let host = headers
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Forbidden")
+                .with_detail("WebSocket Host header is required when Origin is present")
+        })?;
+
+    let (host_name, host_port) = split_host_port(host);
+    if origin_host.0.eq_ignore_ascii_case(host_name) && origin_host.1 == host_port {
+        return Ok(());
+    }
+
+    warn!(origin = %origin, host = %host, "Rejected WebSocket request with cross-origin Origin header");
+    Err(problemdetails::new(StatusCode::FORBIDDEN)
+        .with_title("Forbidden")
+        .with_detail("WebSocket Origin header is not allowed"))
+}
+
+fn split_host_port(host: &str) -> (&str, Option<u16>) {
+    let host = host.trim();
+    if let Some(stripped) = host.strip_prefix('[') {
+        if let Some((address, remainder)) = stripped.split_once(']') {
+            let port = remainder
+                .strip_prefix(':')
+                .and_then(|port| port.parse::<u16>().ok());
+            return (address, port);
+        }
+    }
+
+    if let Some((name, port)) = host.rsplit_once(':') {
+        if !name.contains(':') {
+            return (name, port.parse::<u16>().ok());
+        }
+    }
+
+    (host, None)
+}
 
 pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
     Router::new()
@@ -927,9 +991,11 @@ pub async fn get_container_logs_by_id(
     Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
     Query(query): Query<ContainerLogsQuery>,
     RequireAuth(auth): RequireAuth,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    validate_websocket_origin(&headers)?;
 
     debug!(
         "WebSocket request for container {} logs in environment {} of project: {}",
@@ -1090,9 +1156,11 @@ pub async fn get_container_logs(
     Path((project_id, environment_id)): Path<(i32, i32)>,
     Query(query): Query<ContainerLogsQuery>,
     RequireAuth(auth): RequireAuth,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    validate_websocket_origin(&headers)?;
 
     debug!(
         "WebSocket request for container logs in environment {} of project: {}",
@@ -1418,9 +1486,11 @@ pub async fn tail_deployment_job_logs(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((_project_id, deployment_id, job_id)): Path<(i32, i32, String)>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    validate_websocket_origin(&headers)?;
 
     debug!(
         "WebSocket request for tailing logs for job {} in deployment {}",
@@ -2118,6 +2188,51 @@ mod tests {
     use temps_logs::{DockerLogService, LogService};
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+
+    fn websocket_origin_headers(origin: &str, host: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, origin.parse().unwrap());
+        headers.insert(header::HOST, host.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn test_validate_websocket_origin_allows_matching_host() {
+        let headers =
+            websocket_origin_headers("https://console.example.com", "console.example.com");
+
+        assert!(validate_websocket_origin(&headers).is_ok());
+    }
+
+    #[test]
+    fn test_validate_websocket_origin_allows_matching_host_and_port() {
+        let headers = websocket_origin_headers("http://localhost:3000", "localhost:3000");
+
+        assert!(validate_websocket_origin(&headers).is_ok());
+    }
+
+    #[test]
+    fn test_validate_websocket_origin_rejects_cross_origin_host() {
+        let headers =
+            websocket_origin_headers("https://attacker.example.com", "console.example.com");
+
+        assert!(validate_websocket_origin(&headers).is_err());
+    }
+
+    #[test]
+    fn test_validate_websocket_origin_rejects_cross_origin_port() {
+        let headers = websocket_origin_headers("http://localhost:4000", "localhost:3000");
+
+        assert!(validate_websocket_origin(&headers).is_err());
+    }
+
+    #[test]
+    fn test_validate_websocket_origin_allows_non_browser_clients_without_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "console.example.com".parse().unwrap());
+
+        assert!(validate_websocket_origin(&headers).is_ok());
+    }
 
     #[derive(Clone)]
     struct MockAuditLogger;
