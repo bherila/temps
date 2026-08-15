@@ -226,11 +226,8 @@ impl ProjectContextResolverImpl {
     pub fn new(route_table: Arc<CachedPeerTable>) -> Self {
         Self { route_table }
     }
-}
 
-#[async_trait]
-impl ProjectContextResolver for ProjectContextResolverImpl {
-    async fn resolve_context(&self, host: &str) -> Option<ProjectContext> {
+    fn project_context_from_route(&self, host: &str) -> Option<ProjectContext> {
         // Get route info from O(1) route table lookup with cached models
         let route_info = self.route_table.get_route(host)?;
 
@@ -240,6 +237,35 @@ impl ProjectContextResolver for ProjectContextResolverImpl {
             environment: route_info.environment?,
             deployment: route_info.deployment?,
         })
+    }
+}
+
+#[async_trait]
+impl ProjectContextResolver for ProjectContextResolverImpl {
+    async fn resolve_context(&self, host: &str) -> Option<ProjectContext> {
+        if let Some(context) = self.project_context_from_route(host) {
+            return Some(context);
+        }
+
+        // Keep project-scoped request_filter protections in lockstep with
+        // upstream selection during proxy cold start. Upstream resolution waits
+        // for the first route-table load before retrying a missing host; if the
+        // context resolver returned None immediately, attack mode and password
+        // walls would be skipped for requests that later become routable in
+        // resolve_peer. Wait here too, but only before the first successful load
+        // so ordinary unknown hosts still fall through without delay afterwards.
+        if !self.route_table.has_loaded() {
+            debug!(
+                "Route table not loaded yet; waiting up to {:?} before resolving project context (host: {})",
+                FIRST_LOAD_WAIT, host
+            );
+            self.route_table.wait_until_loaded(FIRST_LOAD_WAIT).await;
+            if let Some(context) = self.project_context_from_route(host) {
+                return Some(context);
+            }
+        }
+
+        None
     }
 
     async fn is_static_deployment(&self, host: &str) -> bool {

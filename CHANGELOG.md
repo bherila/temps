@@ -14,7 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Proxy cold-start access controls**: `temps-proxy` now waits for the first
+  route-table load while resolving project context, matching the upstream
+  resolver's cold-start retry path so attack-mode CAPTCHA and environment
+  password walls cannot be skipped by requests that arrive before routes are
+  populated.
 
 
 ## [0.1.0-beta.35] - 2026-06-19
