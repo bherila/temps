@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- **Random MinIO credentials by default**: Deprecated `minio` external services now generate unique `access_key` and `secret_key` values when credentials are omitted, preventing new MinIO containers from starting with the well-known `minioadmin`/`minioadmin` defaults.
+
 
 
 ## [0.1.0-beta.35] - 2026-06-19

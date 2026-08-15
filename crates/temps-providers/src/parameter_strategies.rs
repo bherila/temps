@@ -553,7 +553,7 @@ impl ParameterStrategy for MinioParameterStrategy {
         if is_empty_value(params.get("access_key")) {
             params.insert(
                 "access_key".to_string(),
-                JsonValue::String("minioadmin".to_string()),
+                JsonValue::String(generate_access_key()),
             );
         }
 
@@ -561,7 +561,7 @@ impl ParameterStrategy for MinioParameterStrategy {
         if is_empty_value(params.get("secret_key")) {
             params.insert(
                 "secret_key".to_string(),
-                JsonValue::String("minioadmin".to_string()),
+                JsonValue::String(generate_secret_key()),
             );
         }
 
@@ -610,13 +610,13 @@ impl ParameterStrategy for MinioParameterStrategy {
             "properties": {
                 "access_key": {
                     "type": "string",
-                    "description": "Access key (read-only after creation)",
-                    "example": "minioadmin"
+                    "description": "Access key (read-only after creation, auto-generated)",
+                    "example": "AKIAIOSFODNN7EXAMPLE"
                 },
                 "secret_key": {
                     "type": "string",
-                    "description": "Secret key (read-only after creation)",
-                    "example": "minioadmin"
+                    "description": "Secret key (read-only after creation, auto-generated)",
+                    "example": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
                 },
                 "port": {
                     "type": "integer",
@@ -1087,6 +1087,26 @@ mod tests {
     }
 
     #[test]
+    fn test_s3_auto_generates_non_default_credentials() {
+        let strategy = S3ParameterStrategy;
+        let mut params = HashMap::new();
+
+        strategy.auto_generate_missing(&mut params).unwrap();
+
+        assert_s3_credentials_are_generated(&params);
+    }
+
+    #[test]
+    fn test_minio_auto_generates_non_default_credentials() {
+        let strategy = MinioParameterStrategy;
+        let mut params = HashMap::new();
+
+        strategy.auto_generate_missing(&mut params).unwrap();
+
+        assert_s3_credentials_are_generated(&params);
+    }
+
+    #[test]
     fn test_mongodb_updateable_docker_image() {
         let strategy = MongodbParameterStrategy;
         let mut updates = HashMap::new();
@@ -1156,6 +1176,28 @@ mod tests {
     }
 
     // ─── credential validators ─────────────────────────────────────
+
+    fn assert_s3_credentials_are_generated(params: &HashMap<String, JsonValue>) {
+        let access_key = params
+            .get("access_key")
+            .and_then(|v| v.as_str())
+            .expect("access_key must be generated");
+        let secret_key = params
+            .get("secret_key")
+            .and_then(|v| v.as_str())
+            .expect("secret_key must be generated");
+
+        assert_ne!(access_key, "minioadmin");
+        assert_ne!(secret_key, "minioadmin");
+        assert_eq!(access_key.len(), 20);
+        assert_eq!(secret_key.len(), 40);
+        assert!(access_key
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()));
+        assert!(secret_key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/'));
+    }
 
     fn pg_params(user: &str, db: &str, password: Option<&str>) -> HashMap<String, JsonValue> {
         let mut p = HashMap::new();
