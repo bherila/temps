@@ -410,6 +410,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **analytics:** Stop fabricating +/-100% dashboard trend when there's no baseline
 - **providers:** Harden postgres major upgrades ([#151](https://github.com/gotempsh/temps/issues/151))
 - **deployer:** Make cluster DNS injection opt-in (experimental beta) ([#194](https://github.com/gotempsh/temps/issues/194))
+### Fixed
+
+- **Redacted AI tool results**: Stop streaming or persisting raw AI tool outputs in chat transcripts so repository file contents fetched with server-side Git credentials are not exposed through `tool_result` SSE events or reloadable message metadata.
 
 ## [0.1.0-beta.41] - 2026-07-02
 

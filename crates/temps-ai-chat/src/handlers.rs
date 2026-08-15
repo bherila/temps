@@ -272,8 +272,8 @@ pub struct ToolCallEvent {
 }
 
 /// Payload for the `tool_result` SSE event: a tool finished running. Serialized
-/// as compact single-line JSON; `content` is JSON-string-escaped so it stays on
-/// one `data:` line even when long.
+/// as compact single-line JSON; `content` is a client-safe status string, not
+/// the raw tool output.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ToolResultEvent {
     pub id: String,
