@@ -1989,8 +1989,41 @@ pub async fn create_project_from_template(
         })?;
     let template_provenance = temps_core::templates::template_provenance(&template).to_string();
 
-    // 2. Build the environment variables from the request (shared by both modes).
-    let env_vars: Option<Vec<CreateProjectEnvVar>> = if request.environment_variables.is_empty() {
+    // 2. Create the repository on the git provider and push template code
+    info!(
+        "Creating repository {} from template {}",
+        request.repository_name, request.template_slug
+    );
+
+    let new_repo = state
+        .project_service
+        .git_provider_manager
+        .create_repository_and_push_template(
+            request.git_provider_connection_id,
+            auth.user_id(),
+            &request.repository_name,
+            request.repository_owner.as_deref(),
+            Some(&format!("Created from template: {}", template.name)),
+            request.private,
+            &template.git.url,
+            &template.git.r#ref,
+            template.git.path.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to create repository from template: {:?}", e);
+            // Forward the typed Problem (e.g. 409 for "name already exists",
+            // 401 for auth failures) instead of flattening everything to 500.
+            Problem::from(e)
+        })?;
+
+    info!(
+        "Successfully created repository {} from template",
+        new_repo.full_name
+    );
+
+    // 3. Build the environment variables from the request
+    let env_vars: Option<Vec<(String, String)>> = if request.environment_variables.is_empty() {
         None
     } else {
         Some(
