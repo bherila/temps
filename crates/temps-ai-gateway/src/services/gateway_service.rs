@@ -14,6 +14,15 @@ use crate::providers::{external_http_client, route_model_to_provider, AiProvider
 use crate::services::provider_key_service::ProviderKeyService;
 use crate::types::*;
 
+fn validate_provider_base_url(base_url: &str) -> Result<(), AiGatewayError> {
+    temps_core::url_validation::validate_external_url(base_url).map_err(|e| {
+        AiGatewayError::InvalidProviderUrl {
+            reason: e.to_string(),
+        }
+    })?;
+    Ok(())
+}
+
 /// Indicates how the provider API key was resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialType {
@@ -230,11 +239,7 @@ impl GatewayService {
             // An authenticated user must not be able to point the gateway at
             // internal services (cloud metadata, Docker daemon, private subnets, etc.).
             if let Some(ref base_url) = byok.base_url {
-                temps_core::url_validation::validate_external_url(base_url).map_err(|e| {
-                    AiGatewayError::InvalidProviderUrl {
-                        reason: e.to_string(),
-                    }
-                })?;
+                validate_provider_base_url(base_url)?;
             }
 
             debug!(
@@ -299,6 +304,10 @@ impl GatewayService {
             credential_type = "system",
             "Routing request to provider"
         );
+
+        if let Some(ref base_url) = key_record.base_url {
+            validate_provider_base_url(base_url)?;
+        }
 
         Ok((
             provider.as_ref(),
