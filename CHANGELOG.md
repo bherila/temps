@@ -424,6 +424,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Miscellaneous
 
 - **changelog:** Generate CHANGELOG.md with git-cliff instead of hand-editing
+### Fixed
+
+- **ai-chat:** Require provider-specific read permissions before AI chat seeds or replays deployment logs and alert context, preventing `projects:write` callers from bypassing `deployments:read` or `otel:read` through hidden system prompts.
 
 ## [0.1.0-beta.40] - 2026-07-01
 
