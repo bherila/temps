@@ -11,7 +11,7 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::providers::sentry::SentryProvider;
 use crate::sentry::{DSNService, SentryIngestionService};
-use crate::services::{ErrorAlertService, ErrorTrackingService, SourceMapService};
+use crate::services::{ErrorAlertService, ErrorTrackingService, MonitorService, SourceMapService};
 
 /// Error Tracking Plugin for capturing and managing application errors
 pub struct ErrorTrackingPlugin;
@@ -67,6 +67,45 @@ impl ErrorTrackingPlugin {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(6 * 3600)).await;
             alert_service.cleanup_old_fires(retention_days).await;
+        }
+    }
+
+    /// Minute-aligned detection of missed check-ins and overrunning runs.
+    async fn monitor_detection_loop(monitor_service: Arc<MonitorService>) {
+        use chrono::{Timelike, Utc};
+        loop {
+            // Sleep until the start of the next minute.
+            let now = Utc::now();
+            let next_minute = now
+                .with_second(0)
+                .and_then(|dt| dt.with_nanosecond(0))
+                .map(|dt| dt + chrono::Duration::minutes(1));
+            let sleep_secs = next_minute
+                .and_then(|nm| (nm - now).to_std().ok())
+                .unwrap_or(tokio::time::Duration::from_secs(60));
+            tokio::time::sleep(sleep_secs).await;
+
+            match monitor_service.detect_unhealthy().await {
+                Ok(n) if n > 0 => {
+                    tracing::info!("Monitor detection: {} monitor(s) became unhealthy", n)
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!("Monitor detection failed: {}", e),
+            }
+        }
+    }
+
+    /// Daily enforcement of per-monitor check-in retention.
+    async fn monitor_cleanup_loop(monitor_service: Arc<MonitorService>) {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(24 * 3600)).await;
+            match monitor_service.cleanup_expired_check_ins().await {
+                Ok(n) if n > 0 => {
+                    tracing::info!("Monitor retention: deleted {} expired check-in row(s)", n)
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!("Monitor check-in cleanup failed: {}", e),
+            }
         }
     }
 }
@@ -219,6 +258,57 @@ impl TempsPlugin for ErrorTrackingPlugin {
             let sentry_provider = Arc::new(SentryProvider::new(dsn_service.clone()));
             context.register_service(sentry_provider);
 
+            // Register monitor (cron check-in) service and wire its notifications.
+            let monitor_service = Arc::new(MonitorService::new(db.clone()));
+            if let Some(notification_service) =
+                context.get_service::<temps_notifications::services::NotificationService>()
+            {
+                let ns = notification_service.clone();
+                monitor_service.set_notification_callback(Arc::new(move |alert| {
+                    let ns = ns.clone();
+                    Box::pin(async move {
+                        use temps_notifications::types::{Notification, NotificationPriority};
+                        // A failed/timed-out/missed scheduled job is operationally
+                        // important — default to High.
+                        let priority = match alert.status.as_str() {
+                            "missed" | "timeout" => NotificationPriority::High,
+                            _ => NotificationPriority::Normal,
+                        };
+                        let subject = format!(
+                            "Monitor {}: {}",
+                            alert.name.as_deref().unwrap_or(&alert.slug),
+                            alert.status
+                        );
+                        let mut notification = Notification::new(subject, alert.message.clone())
+                            .with_priority(priority)
+                            .with_metadata("monitor", alert.slug.clone())
+                            .with_metadata("status", alert.status.clone());
+                        if let Some(env) = alert.environment_id {
+                            notification =
+                                notification.with_metadata("environment_id", env.to_string());
+                        }
+                        if let Err(e) = ns.send_notification(notification).await {
+                            tracing::error!("Failed to send monitor notification: {}", e);
+                        }
+                    })
+                }));
+            } else {
+                tracing::warn!(
+                    "Error tracking: NotificationService not found — monitor alerts will be disabled"
+                );
+            }
+            context.register_service(monitor_service.clone());
+
+            // Background detection (minute-aligned) + retention cleanup (daily).
+            let detection_service = monitor_service.clone();
+            tokio::spawn(async move {
+                Self::monitor_detection_loop(detection_service).await;
+            });
+            let cleanup_service = monitor_service.clone();
+            tokio::spawn(async move {
+                Self::monitor_cleanup_loop(cleanup_service).await;
+            });
+
             // Start job listener for project lifecycle events (auto-create default alert rules)
             if let Some(queue_service) = context.get_service::<dyn JobQueue>() {
                 let job_receiver = queue_service.subscribe();
@@ -278,15 +368,26 @@ impl TempsPlugin for ErrorTrackingPlugin {
         let source_map_state = Arc::new(crate::handlers::source_map_handlers::SourceMapAppState {
             source_map_service: source_map_service.clone(),
             audit_service: audit_service.clone(),
-            project_access_checker,
+            project_access_checker: project_access_checker.clone(),
         });
         let source_map_routes = crate::handlers::source_map_handlers::configure_source_map_routes()
             .with_state(source_map_state);
 
+        // Admin: cron monitor management
+        let monitor_service = context.require_service::<MonitorService>();
+        let monitor_state = Arc::new(crate::handlers::monitor_handlers::MonitorAppState {
+            monitor_service,
+            audit_service: audit_service.clone(),
+            project_access_checker,
+        });
+        let monitor_routes =
+            crate::handlers::monitor_handlers::configure_monitor_routes().with_state(monitor_state);
+
         let routes = error_tracking_routes
             .merge(alert_rules_routes)
             .merge(dsn_routes)
-            .merge(source_map_routes);
+            .merge(source_map_routes)
+            .merge(monitor_routes);
 
         Some(PluginRoutes::new(routes))
     }
@@ -304,8 +405,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
 
-        let route_table = context.require_service::<temps_proxy::CachedPeerTable>();
-
+        let monitor_service = context.get_service::<MonitorService>();
         let sentry_state = Arc::new(crate::sentry::handlers::AppState {
             sentry_provider: sentry_provider.clone(),
             error_tracking_service: error_tracking_service.clone(),
@@ -313,8 +413,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
             ip_address_service,
             db: sentry_db,
             telemetry,
-            route_table,
-            rate_limiter: crate::sentry::rate_limiter::IngestRateLimiter::new(),
+            monitor_service,
         });
         let sentry_routes = crate::sentry::handlers::configure_routes().with_state(sentry_state);
 
@@ -382,6 +481,16 @@ impl TempsPlugin for ErrorTrackingPlugin {
             );
         schema.paths.paths.extend(sentry_compat_schema.paths.paths);
         if let Some(components) = &sentry_compat_schema.components {
+            if let Some(base_components) = &mut schema.components {
+                base_components.schemas.extend(components.schemas.clone());
+            }
+        }
+
+        // Merge monitor (cron check-in) routes schema
+        let monitor_schema =
+            <crate::handlers::monitor_handlers::MonitorApiDoc as OpenApiTrait>::openapi();
+        schema.paths.paths.extend(monitor_schema.paths.paths);
+        if let Some(components) = &monitor_schema.components {
             if let Some(base_components) = &mut schema.components {
                 base_components.schemas.extend(components.schemas.clone());
             }

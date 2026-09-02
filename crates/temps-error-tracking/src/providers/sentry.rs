@@ -17,6 +17,27 @@ impl SentryProvider {
     pub fn new(dsn_service: Arc<DSNService>) -> Self {
         Self { dsn_service }
     }
+
+    /// Extract monitor check-in items from a Sentry envelope.
+    ///
+    /// Unlike [`ErrorProvider::parse_events`], this never errors on an envelope
+    /// without check-ins — it simply returns an empty vector. A malformed envelope
+    /// still surfaces a parse error so the caller can return `400`.
+    pub fn parse_check_ins(
+        &self,
+        payload: &[u8],
+    ) -> Result<Vec<crate::sentry::envelope::CheckIn>, ProviderError> {
+        let envelope =
+            Envelope::from_slice(payload).map_err(|e| ProviderError::Parsing(e.to_string()))?;
+
+        Ok(envelope
+            .items()
+            .filter_map(|item| match item {
+                EnvelopeItem::CheckIn(ci) => Some(ci.clone()),
+                _ => None,
+            })
+            .collect())
+    }
 }
 
 #[async_trait]
@@ -107,6 +128,10 @@ impl ErrorProvider for SentryProvider {
                 }
                 EnvelopeItem::Transaction(_) => {
                     tracing::debug!("Sentry transaction item (not yet implemented)");
+                }
+                EnvelopeItem::CheckIn(_) => {
+                    // Check-ins are handled separately via `parse_check_ins`; they
+                    // are not error events.
                 }
             }
         }
