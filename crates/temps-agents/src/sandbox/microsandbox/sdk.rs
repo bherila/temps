@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The SDK-backed microsandbox provider (ADR-050). Compiled for every
-//! target except musl; see the parent module.
+//! target except musl and Intel macOS; see the parent module.
 
 use async_trait::async_trait;
 use std::collections::HashMap;

@@ -220,7 +220,7 @@ fn default_sandbox_backend(
 }
 
 /// The microsandbox backend (ADR-050) if this host can run it right now.
-#[cfg(not(target_env = "musl"))]
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 fn microsandbox_provider(data_dir: &std::path::Path) -> Option<Arc<dyn SandboxProvider>> {
     use crate::sandbox::microsandbox::{MicrosandboxSandboxConfig, MicrosandboxSandboxProvider};
 
@@ -245,8 +245,9 @@ fn microsandbox_provider(data_dir: &std::path::Path) -> Option<Arc<dyn SandboxPr
     }
 }
 
-/// musl builds don't link the microsandbox SDK; the status API reports why.
-#[cfg(target_env = "musl")]
+/// musl and Intel macOS builds don't link the microsandbox SDK; the status
+/// API reports why.
+#[cfg(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64")))]
 fn microsandbox_provider(data_dir: &std::path::Path) -> Option<Arc<dyn SandboxProvider>> {
     let capability = crate::sandbox::microsandbox::microsandbox_capability(data_dir);
     tracing::debug!(
