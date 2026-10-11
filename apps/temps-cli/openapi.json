@@ -79423,6 +79423,62 @@
         ]
       }
     },
+    "/emails/{id}/resend": {
+      "post": {
+        "description": "Delivers a `captured` email again under the same ID, re-running the\ndomain, project-authorization, suppression and provider checks. Use it\nonce whatever captured the email is fixed (e.g. sending was enabled for\nits domain). The response `status` is the new outcome and can be\n`captured` again if the cause is still present. Deployment tokens retry by\nrepeating the send with the same `Idempotency-Key` instead.",
+        "operationId": "resend_email",
+        "parameters": [
+          {
+            "description": "Email ID (UUID)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendEmailResponseBody"
+                }
+              }
+            },
+            "description": "Delivery attempted; `status` is the new outcome"
+          },
+          "400": {
+            "description": "Invalid email ID"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions, or a deployment token"
+          },
+          "404": {
+            "description": "Email not found"
+          },
+          "409": {
+            "description": "The email cannot be resent in its current state (already sent, delivery outcome unknown, still sending, or suppressed recipients)"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Resend a captured email",
+        "tags": [
+          "Emails"
+        ]
+      }
+    },
     "/emails/{id}/tracking": {
       "get": {
         "operationId": "get_email_tracking",

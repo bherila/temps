@@ -107,7 +107,12 @@ import {
   type DetailFact,
   type StatusTone,
 } from '@temps-sdk/ds'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -335,6 +340,7 @@ export function ServiceDetail() {
     data: serviceBackupsData,
     isLoading: isLoadingBackups,
     isFetching: isFetchingBackups,
+    isPlaceholderData: isBackupsPlaceholderData,
     refetch: refetchBackups,
   } = useQuery({
     ...listExternalServiceBackupsOptions(
@@ -343,6 +349,10 @@ export function ServiceDetail() {
       BACKUPS_PAGE_SIZE
     ),
     enabled: !!serviceId,
+    // Keep the previous page (and its `total`) on screen while the next page
+    // loads; without it `data` is undefined mid-navigation and the page-range
+    // clamp below would read total=0 and bounce the user back to page 1.
+    placeholderData: keepPreviousData,
   })
 
   const serviceBackups = serviceBackupsData?.backups ?? []
@@ -361,13 +371,22 @@ export function ServiceDetail() {
   )
 
   useEffect(() => {
+    // Only trust the total once the requested page has actually loaded: before
+    // that (initial load, deep link, or placeholder data from the previous
+    // page) the total is unknown or stale and must not clamp the page.
+    if (!serviceBackupsData || isBackupsPlaceholderData) return
     if (backupsPage > backupsTotalPages) {
       // The server total can shrink after a backup is removed while this page
       // is open; synchronize the requested page back into the valid range.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setBackupsPage(backupsTotalPages)
     }
-  }, [backupsPage, backupsTotalPages])
+  }, [
+    backupsPage,
+    backupsTotalPages,
+    serviceBackupsData,
+    isBackupsPlaceholderData,
+    setBackupsPage,
+  ])
 
   const paginatedBackups = serviceBackups
 

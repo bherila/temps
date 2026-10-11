@@ -39385,6 +39385,54 @@ export type GetEmailResponses = {
 
 export type GetEmailResponse = GetEmailResponses[keyof GetEmailResponses];
 
+export type ResendEmailData = {
+    body?: never;
+    path: {
+        /**
+         * Email ID (UUID)
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/emails/{id}/resend';
+};
+
+export type ResendEmailErrors = {
+    /**
+     * Invalid email ID
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions, or a deployment token
+     */
+    403: unknown;
+    /**
+     * Email not found
+     */
+    404: unknown;
+    /**
+     * The email cannot be resent in its current state (already sent, delivery outcome unknown, still sending, or suppressed recipients)
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ResendEmailResponses = {
+    /**
+     * Delivery attempted; `status` is the new outcome
+     */
+    200: SendEmailResponseBody;
+};
+
+export type ResendEmailResponse = ResendEmailResponses[keyof ResendEmailResponses];
+
 export type GetEmailTrackingData = {
     body?: never;
     path: {

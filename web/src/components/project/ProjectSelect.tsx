@@ -37,6 +37,9 @@ interface ProjectSelectProps {
   placeholder?: string
   disabled?: boolean
   className?: string
+  /** Controls the dropdown, e.g. to open it from a call-to-action elsewhere. */
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
 }
 
 /**
@@ -55,8 +58,15 @@ export function ProjectSelect({
   placeholder = 'Select project…',
   disabled,
   className,
+  open: openProp,
+  onOpenChange,
 }: ProjectSelectProps) {
-  const [open, setOpen] = React.useState(false)
+  const [uncontrolledOpen, setUncontrolledOpen] = React.useState(false)
+  const open = openProp ?? uncontrolledOpen
+  const setOpen = (next: boolean) => {
+    if (openProp === undefined) setUncontrolledOpen(next)
+    onOpenChange?.(next)
+  }
   const queryClient = useQueryClient()
 
   const projectsQuery = useQuery({
