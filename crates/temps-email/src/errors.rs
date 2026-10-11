@@ -56,6 +56,14 @@ pub enum EmailError {
         reason: String,
     },
 
+    /// The background task delivering a console resend ended without a
+    /// result (it panicked, or the runtime shut down underneath it).
+    #[error("Resend of email {email_id} was interrupted: {reason}")]
+    ResendInterrupted {
+        email_id: uuid::Uuid,
+        reason: String,
+    },
+
     #[error("Invalid provider type: {0}")]
     InvalidProviderType(String),
 

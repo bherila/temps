@@ -161,9 +161,12 @@ const DOMAIN_STATUS_VERDICT: Record<string, { tone: StatusTone; label: string }>
 }
 
 function domainVerdict(
-  status: string,
+  status: string | undefined,
   isSmtp: boolean
 ): { tone: StatusTone; label: string } {
+  if (status === undefined) {
+    return { tone: 'idle', label: 'Status unknown' }
+  }
   // Temps verifies nothing for SMTP domains; the stored status only says
   // whether the domain may send yet.
   if (isSmtp) {
@@ -353,7 +356,7 @@ export function EmailDomainDetail() {
     enabled: !!id,
   })
 
-  const { data: providers } = useQuery({
+  const { data: providers, isLoading: isLoadingProviders } = useQuery({
     queryKey: ['email-providers'],
     queryFn: fetchProviders,
   })
@@ -361,8 +364,13 @@ export function EmailDomainDetail() {
   // The detail endpoint reports the provider's live status, which for SMTP is
   // always "verified" since Temps checks no DNS for it. Sending is gated on
   // the *stored* status (still "pending" after creation or a credentials
-  // change), which only the list endpoint returns.
-  const { data: storedDomains } = useQuery({
+  // change), which only the list endpoint returns. Never fall back to the
+  // live status for SMTP: that would report a paused domain as sending.
+  const {
+    data: storedDomains,
+    isLoading: isLoadingStoredDomains,
+    refetch: refetchStoredDomains,
+  } = useQuery({
     queryKey: ['email-domains'],
     queryFn: fetchStoredDomains,
   })
@@ -549,7 +557,7 @@ export function EmailDomainDetail() {
     </Button>
   )
 
-  if (isLoading) {
+  if (isLoading || isLoadingProviders || (isSmtp && isLoadingStoredDomains)) {
     return <EmailDomainDetailSkeleton backAction={backAction} />
   }
 
@@ -567,8 +575,9 @@ export function EmailDomainDetail() {
 
   const hasDnsProviders = dnsProviders && dnsProviders.length > 0
   const status = isSmtp
-    ? (storedDomains?.find((d) => d.id === domain.id)?.status ?? domain.status)
+    ? storedDomains?.find((d) => d.id === domain.id)?.status
     : domain.status
+  const isSmtpStatusUnknown = isSmtp && status === undefined
   const isVerified = status === 'verified'
   const noAuthorizedProjects =
     !isLoadingAuthorizations && !authorizationsError && authorizedProjects.length === 0
@@ -631,7 +640,25 @@ export function EmailDomainDetail() {
         facts={domainFacts(domain, provider, verifiedCount, totalCount, isSmtp)}
         main={
           <>
-            {isSmtp && !isVerified && (
+            {isSmtpStatusUnknown && (
+              <Callout tone="error" title="Couldn't load whether sending is enabled">
+                <p>
+                  Emails from {domain.domain} may be captured instead of delivered. Reload the
+                  domain&apos;s status to see whether sending is enabled.
+                </p>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="mt-2"
+                  onClick={() => void refetchStoredDomains()}
+                >
+                  <RefreshCw className="mr-2 size-4" />
+                  Retry
+                </Button>
+              </Callout>
+            )}
+
+            {isSmtp && !isSmtpStatusUnknown && !isVerified && (
               <Callout tone="warning" title="Sending is paused">
                 <p>
                   Emails from {domain.domain} are captured, not delivered. Temps doesn&apos;t check DNS
