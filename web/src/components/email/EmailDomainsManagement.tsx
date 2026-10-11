@@ -13,6 +13,8 @@ import {
   type EmailProviderResponse,
 } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
+import { isAdvisoryDnsRecord } from '@/lib/email-dns-records'
+import { isSmtpProvider, smtpVerifyToast } from '@/lib/email-smtp-domains'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
@@ -49,6 +51,7 @@ import {
   EllipsisVertical,
   Globe,
   HelpCircle,
+  Info,
   RefreshCw,
 } from 'lucide-react'
 import { useMemo } from 'react'
@@ -143,7 +146,14 @@ function StatusDot({
 
 // Inline status dot + label for the sub-row — matches the Storage page's
 // ServiceStatusDot visual so status reads the same across the app.
-function DomainStatusInline({ status }: { status: string }) {
+function DomainStatusInline({
+  status,
+  label,
+}: {
+  status: string
+  /** Overrides the status text (e.g. SMTP's "Sending paused"). */
+  label?: string
+}) {
   const tone =
     status === 'verified'
       ? 'bg-success'
@@ -155,8 +165,10 @@ function DomainStatusInline({ status }: { status: string }) {
   return (
     <span className="flex items-center gap-1.5">
       <span className={cn('size-1.5 rounded-full', tone)} />
-      <span className="text-xs capitalize text-muted-foreground">
-        {status || 'unknown'}
+      <span
+        className={cn('text-xs text-muted-foreground', !label && 'capitalize')}
+      >
+        {label ?? (status || 'unknown')}
       </span>
     </span>
   )
@@ -194,7 +206,27 @@ export function StatusPill({ status }: { status: string }) {
   }
 }
 
-function DnsRecordStatusBadge({ status }: { status?: DnsRecordStatus }) {
+function DnsRecordStatusBadge({
+  status,
+  advisory = false,
+}: {
+  status?: DnsRecordStatus
+  advisory?: boolean
+}) {
+  // An unset advisory record does not block sending, so an amber "Pending"
+  // would contradict a domain that is already verified. Verified and failed
+  // checks still show their real result.
+  if (advisory && status !== 'verified' && status !== 'failed') {
+    return (
+      <div
+        className="flex items-center gap-1.5 text-muted-foreground"
+        title="Not required to send email; recommended for deliverability."
+      >
+        <Info className="size-4" />
+        <span className="text-xs font-medium">Recommended</span>
+      </div>
+    )
+  }
   switch (status) {
     case 'verified':
       return (
@@ -239,16 +271,11 @@ export function DnsVerificationSummary({
    */
   awaitingProvider?: boolean
 }) {
-  // MX and DMARC are both excluded from the "required" count, matching the
-  // backend's are_all_records_verified gate exactly: MX is a deliverability
-  // aid rather than a sending/auth prerequisite, and DMARC is a plain TXT
-  // record the domain owner sets independently (no provider API manages it),
-  // so requiring it here would report a domain as unverified even though the
-  // backend already considers SPF+DKIM sufficient and marked it "verified".
-  // Both rows still appear in DnsRecordsTable with their real status.
-  const requiredRecords = records.filter(
-    (r) => r.record_type !== 'MX' && !r.name.startsWith('_dmarc.')
-  )
+  // Advisory records (MX, DMARC) are excluded from the "required" count,
+  // matching the backend's are_all_records_verified gate exactly, so a domain
+  // the backend already marked "verified" is not reported as unverified here.
+  // Both rows still appear in DnsRecordsTable.
+  const requiredRecords = records.filter((r) => !isAdvisoryDnsRecord(r))
   const verifiedCount = requiredRecords.filter(
     (r) => r.status === 'verified'
   ).length
@@ -412,7 +439,10 @@ export function DnsRecordsTable({ records }: { records: DnsRecord[] }) {
                   {record.priority ?? '-'}
                 </TableCell>
                 <TableCell>
-                  <DnsRecordStatusBadge status={record.status} />
+                  <DnsRecordStatusBadge
+                    status={record.status}
+                    advisory={isAdvisoryDnsRecord(record)}
+                  />
                 </TableCell>
               </TableRow>
             ))}
@@ -466,6 +496,14 @@ export function EmailDomainsManagement() {
   const verifyMutation = useMutation({
     mutationFn: verifyEmailDomain,
     onSuccess: (data) => {
+      const provider = providersQuery.data?.find(
+        (p) => p.id === data.domain.provider_id
+      )
+      if (isSmtpProvider(provider)) {
+        smtpVerifyToast(data, provider)
+        updateCachedDomain(data)
+        return
+      }
       // MX and DMARC are both excluded — see DnsVerificationSummary's comment.
       // Exclude them from the counts shown here too, so the toast reflects
       // the records that actually gate the domain status.
@@ -497,21 +535,25 @@ export function EmailDomainsManagement() {
         })
       }
 
-      queryClient.setQueryData(['email-domain', data.domain.id], data)
-      queryClient.setQueryData(
-        ['email-domains'],
-        (oldDomains: EmailDomain[] | undefined) => {
-          if (!oldDomains) return oldDomains
-          return oldDomains.map((d) =>
-            d.id === data.domain.id ? data.domain : d
-          )
-        }
-      )
+      updateCachedDomain(data)
     },
     onError: (error: Error) => {
       toast.error('Failed to verify domain', { description: error.message })
     },
   })
+
+  function updateCachedDomain(data: EmailDomainWithDns) {
+    queryClient.setQueryData(['email-domain', data.domain.id], data)
+    queryClient.setQueryData(
+      ['email-domains'],
+      (oldDomains: EmailDomain[] | undefined) => {
+        if (!oldDomains) return oldDomains
+        return oldDomains.map((d) =>
+          d.id === data.domain.id ? data.domain : d
+        )
+      }
+    )
+  }
 
   const deleteMutation = useMutation({
     mutationFn: deleteEmailDomain,
@@ -605,6 +647,12 @@ export function EmailDomainsManagement() {
             <ul role="list" className="divide-y">
               {domains.map((domain) => {
                 const provider = providerById.get(domain.provider_id)
+                // Temps checks no DNS for SMTP domains (they are verified at
+                // the upstream provider), so they get no DNS verify action —
+                // only "Enable sending" while the stored status still gates
+                // sends (after creation or a credentials change).
+                const isSmtp = isSmtpProvider(provider)
+                const canEnableSending = isSmtp && domain.status !== 'verified'
                 return (
                   <li
                     key={domain.id}
@@ -644,8 +692,17 @@ export function EmailDomainsManagement() {
                         )}
                       </div>
                       <div className="mt-1 flex items-center gap-3 text-xs text-muted-foreground">
-                        <DomainStatusInline status={domain.status} />
-                        <span>
+                        <DomainStatusInline
+                          status={domain.status}
+                          label={
+                            isSmtp
+                              ? domain.status === 'verified'
+                                ? 'Sending enabled'
+                                : 'Sending paused'
+                              : undefined
+                          }
+                        />
+                        <span className={cn(isSmtp && 'hidden')}>
                           {domain.last_verified_at
                             ? `Verified ${formatDistanceToNow(
                                 new Date(domain.last_verified_at),
@@ -666,10 +723,24 @@ export function EmailDomainsManagement() {
                       className="flex items-center gap-1"
                       onClick={(e) => e.stopPropagation()}
                     >
+                      {canEnableSending && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => handleVerify(domain.id)}
+                          disabled={verifyMutation.isPending}
+                        >
+                          {verifyMutation.isPending &&
+                            verifyMutation.variables === domain.id && (
+                              <RefreshCw className="mr-2 size-3.5 animate-spin" />
+                            )}
+                          Enable sending
+                        </Button>
+                      )}
                       <Button
                         variant="ghost"
                         size="icon"
-                        className="size-8"
+                        className={cn('size-8', isSmtp && 'hidden')}
                         onClick={() => handleVerify(domain.id)}
                         disabled={verifyMutation.isPending}
                         title="Verify DNS"
@@ -705,12 +776,14 @@ export function EmailDomainsManagement() {
                           >
                             Open domain
                           </DropdownMenuItem>
-                          <DropdownMenuItem
-                            onClick={() => handleVerify(domain.id)}
-                          >
-                            <RefreshCw className="mr-2 size-4" />
-                            Verify DNS
-                          </DropdownMenuItem>
+                          {!isSmtp && (
+                            <DropdownMenuItem
+                              onClick={() => handleVerify(domain.id)}
+                            >
+                              <RefreshCw className="mr-2 size-4" />
+                              Verify DNS
+                            </DropdownMenuItem>
+                          )}
                           <DropdownMenuSeparator />
                           <DropdownMenuItem
                             className="text-destructive"
