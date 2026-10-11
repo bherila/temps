@@ -46,6 +46,16 @@ pub enum EmailError {
     #[error("Idempotency key '{key}' was reused with a different email payload")]
     IdempotencyConflict { key: String },
 
+    /// The email is not in a state that may be delivered again: it was
+    /// already sent, the provider may already have accepted it, it is still
+    /// being delivered, or its recipients are suppressed.
+    #[error("Email {email_id} cannot be resent (status: {status}): {reason}")]
+    NotResendable {
+        email_id: uuid::Uuid,
+        status: String,
+        reason: String,
+    },
+
     #[error("Invalid provider type: {0}")]
     InvalidProviderType(String),
 
