@@ -260,8 +260,9 @@ impl PublicBuildValues {
         self.0.insert(name.into(), value.into());
     }
 
-    /// Record each of `names` with its current value in `env`, for values
-    /// the platform itself just set.
+    /// Record each of `names` with its current value in `env`. Only for
+    /// names the platform itself just set unconditionally: a name it merely
+    /// defaults (`or_insert`) may hold a project's secret value instead.
     fn record_present(&mut self, env: &std::collections::HashMap<String, String>, names: &[&str]) {
         for name in names {
             if let Some(value) = env.get(*name) {
@@ -871,21 +872,23 @@ impl WorkflowPlanner {
 
             env_vars_map.insert("OTEL_SERVICE_NAME".to_string(), project.name.clone());
 
-            // Use commit SHA as service version when available
+            // Use commit SHA as service version when available. A value the
+            // project set wins, and keeps whatever classification it had.
             if let Some(ref commit_sha) = deployment.commit_sha {
-                env_vars_map
-                    .entry("OTEL_SERVICE_VERSION".to_string())
-                    .or_insert_with(|| commit_sha.clone());
+                if !env_vars_map.contains_key("OTEL_SERVICE_VERSION") {
+                    env_vars_map.insert("OTEL_SERVICE_VERSION".to_string(), commit_sha.clone());
+                    public_values.record("OTEL_SERVICE_VERSION", commit_sha.clone());
+                }
             }
 
-            // The headers carry the deployment token and stay unrecorded.
+            // Only the three the platform set unconditionally above. The
+            // headers carry the deployment token and stay unrecorded.
             public_values.record_present(
                 &env_vars_map,
                 &[
                     "OTEL_EXPORTER_OTLP_ENDPOINT",
                     "OTEL_EXPORTER_OTLP_PROTOCOL",
                     "OTEL_SERVICE_NAME",
-                    "OTEL_SERVICE_VERSION",
                 ],
             );
 
@@ -1532,14 +1535,16 @@ impl WorkflowPlanner {
             &deployment.slug,
             default_port,
         );
-        public_values.record_present(
-            &env_vars,
-            &[
-                "PORT",
-                "TEMPS_ASSET_PREFIX",
-                "NEXT_PUBLIC_TEMPS_ASSET_PREFIX",
-            ],
-        );
+        // Record exactly what `apply_deployment_owned_variables` just set: a
+        // name it left alone may still hold a project's secret value.
+        let mut deployment_owned = vec!["TEMPS_ASSET_PREFIX"];
+        if default_port.is_some() {
+            deployment_owned.push("PORT");
+        }
+        if project.preset == temps_entities::preset::Preset::NextJs {
+            deployment_owned.push("NEXT_PUBLIC_TEMPS_ASSET_PREFIX");
+        }
+        public_values.record_present(&env_vars, &deployment_owned);
 
         debug!(
             "📦 Gathered {} environment variables for deployment",
@@ -4606,7 +4611,15 @@ mod tests {
             "PUBLIC_SITE_TITLE",
             "REACT_APP_FEATURE",
         ];
-        const SECRET_USER_VARS: [&str; 2] = ["VITE_PRIVATE_TOKEN", "DATABASE_URL"];
+        // The last two reuse names the platform only sets conditionally (a
+        // default, and a Next.js-only value): a project's secret under such
+        // a name must stay a secret.
+        const SECRET_USER_VARS: [&str; 4] = [
+            "VITE_PRIVATE_TOKEN",
+            "DATABASE_URL",
+            "OTEL_SERVICE_VERSION",
+            "NEXT_PUBLIC_TEMPS_ASSET_PREFIX",
+        ];
 
         let mut planned = Vec::new();
         for (index, catalog_preset) in temps_presets::all_presets().into_iter().enumerate() {
@@ -4720,6 +4733,10 @@ mod tests {
                     "{slug}: {name} is withheld from workers"
                 );
             }
+            // Next.js is the one preset whose asset prefix the platform sets,
+            // replacing the project's value; everywhere else the project's
+            // secret under that name is what the build carries.
+            let platform_asset_prefix = stored.preset == Preset::NextJs;
             for name in SECRET_USER_VARS.iter().copied().chain([
                 "TEMPS_API_TOKEN",
                 "CRON_SECRET",
@@ -4727,6 +4744,15 @@ mod tests {
                 "SENTRY_AUTH_TOKEN",
                 BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG,
             ]) {
+                if name == "NEXT_PUBLIC_TEMPS_ASSET_PREFIX" && platform_asset_prefix {
+                    assert!(keys.contains(name), "{slug}: {name} is withheld");
+                    assert_ne!(
+                        build_args.get(name).map(String::as_str),
+                        Some("synthetic-next_public_temps_asset_prefix"),
+                        "{slug}: the platform's asset prefix did not replace the project's"
+                    );
+                    continue;
+                }
                 assert!(
                     !keys.contains(name),
                     "{slug}: {name} would leave the control plane"
@@ -4738,18 +4764,20 @@ mod tests {
                     "{slug}: {key} is not a build arg"
                 );
             }
-            // Only the project's own secret inlined variable could keep this
+            // Only the project's own secret inlined variables could keep this
             // build off a worker; the platform's variables never do.
-            assert_eq!(
-                crate::jobs::build_image::build_inlined_variables(
-                    build_args
-                        .keys()
-                        .filter(|name| !keys.contains(*name))
-                        .map(String::as_str)
-                ),
-                vec!["VITE_PRIVATE_TOKEN".to_string()],
-                "{slug}"
+            let mut withheld_inlined = crate::jobs::build_image::build_inlined_variables(
+                build_args
+                    .keys()
+                    .filter(|name| !keys.contains(*name))
+                    .map(String::as_str),
             );
+            withheld_inlined.sort();
+            let mut expected = vec!["VITE_PRIVATE_TOKEN".to_string()];
+            if !platform_asset_prefix {
+                expected.insert(0, "NEXT_PUBLIC_TEMPS_ASSET_PREFIX".to_string());
+            }
+            assert_eq!(withheld_inlined, expected, "{slug}");
             planned.push(slug);
         }
         for slug in [
