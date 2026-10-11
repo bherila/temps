@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0-beta.57] - 2026-10-11
 
+### Added
+
+- **email:** Resend captured emails
+
 ### Documentation
 
 - **security:** Use david@temps.sh as the vulnerability report address ([#1382](https://github.com/gotempsh/temps/issues/1382))
@@ -18,6 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - QA retest findings — S3 errors, Elixir umbrellas, screenshot hang, HA replica race, pg_dump temp dir, failover after CP outage ([#1395](https://github.com/gotempsh/temps/issues/1395))
 - **compose:** Show why a Compose deployment failed, and pass project variables to builds ([#1397](https://github.com/gotempsh/temps/issues/1397))
 - QA retest findings #1389–#1394 (DB startup wait, operation status, Drop ZIPs, node placement, HA standby protection, console a11y) ([#1398](https://github.com/gotempsh/temps/issues/1398))
+- **web:** Keep the requested page when paginating service backups
+- **web:** Keep the plugins tab in the URL
+- **web:** Show honest email domain states for SMTP and project access
+- **web:** Let dev-server requests pass same-origin guards
+- **email:** Keep failed resends resendable and never show a paused SMTP domain as sending
+- **email:** Refuse resending an email whose stored headers can no longer be sent
+- **email:** Keep a resend's claim when its provider result could not be saved
+- **email:** Fence resends so a stalled attempt cannot deliver or overwrite
+- **email:** Return a rejected resend to captured when its result cannot be saved
+- **deployments:** Pass build-argument values to worker builds for every preset
+- **deployments:** Record only platform-set values as public build arguments
+- **deployer:** Join continued Dockerfile lines the way Docker does
+- **agents:** Skip the microsandbox SDK on Intel macOS so the release binary builds
 
 ### Miscellaneous
 
