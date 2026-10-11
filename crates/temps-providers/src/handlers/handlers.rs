@@ -3717,6 +3717,8 @@ async fn update_service_resources(
         ServiceHealthStatusEntryResponse,
         ClusterHealthReportResponse,
         ClusterMemberHealthResponse,
+        super::types::ClusterProtectionResponse,
+        crate::services::ClusterProtectionState,
         crate::externalsvc::ServiceResourceLimits,
         crate::externalsvc::postgres_wal_health::PostgresWalHealth,
         crate::externalsvc::postgres_wal_health::ArchiveMode,

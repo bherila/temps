@@ -497,6 +497,51 @@ const NODE_APP_AUTH_SNIPPET: &str = r#"(
   exit 1
 ) &"#;
 
+/// Where the cluster image installs PostgreSQL's binaries. pg_autoctl runs
+/// `pg_basebackup` from the directory of the `pg_ctl` it uses, by absolute
+/// path, so this is the copy every standby clone goes through.
+const PG_BINDIR_GLOB: &str = "/usr/lib/postgresql/*/bin";
+
+/// Suffix of the real `pg_basebackup` once the fast-checkpoint wrapper is in
+/// place.
+const REAL_PG_BASEBACKUP_SUFFIX: &str = ".temps-real";
+
+/// Data node, before pg_autoctl starts: make every `pg_basebackup` request a
+/// fast checkpoint.
+///
+/// pg_autoctl clones a standby (the initial standby of a new cluster, a
+/// member added later, a node rebuilt after a failover) with
+/// `pg_basebackup` and offers no option for the checkpoint mode, so the
+/// backup waits for a *spread* checkpoint on the primary first. On an empty
+/// database that wait took about 96 s while the copy itself took under one;
+/// for that whole window the primary sits in `wait_primary` with no standby
+/// to fail over to. `--checkpoint=fast` makes the primary checkpoint
+/// immediately.
+///
+/// The real binary is moved aside once and a two-line wrapper put in its
+/// place, so it is idempotent across container restarts (the container
+/// filesystem survives them). The moved-aside binary decides whether a
+/// directory is handled, not `pg_basebackup` itself, so a stop between the
+/// move and the wrapper's install is repaired on the next start instead of
+/// leaving the standby without the command it clones with. Runs as root,
+/// before `pg_autoctl create`.
+fn fast_checkpoint_basebackup_snippet(bindir_glob: &str) -> String {
+    format!(
+        r#"for BIN in {bindir_glob}; do
+  BB="$BIN/pg_basebackup"
+  REAL="$BB{suffix}"
+  if [ ! -e "$REAL" ]; then
+    [ -f "$BB" ] || continue
+    mv "$BB" "$REAL" || {{ echo "temps: could not move $BB aside; standby clones keep the spread checkpoint" >&2; continue; }}
+  fi
+  printf '#!/bin/sh\n# Installed by Temps: request a fast checkpoint for every base backup.\nexec "%s" --checkpoint=fast "$@"\n' "$REAL" > "$BB.temps-wrapper"
+  chmod 755 "$BB.temps-wrapper"
+  mv "$BB.temps-wrapper" "$BB"
+done"#,
+        suffix = REAL_PG_BASEBACKUP_SUFFIX,
+    )
+}
+
 /// Removes pg_autoctl's pidfile left behind by an unclean stop.
 ///
 /// pg_autoctl writes it under `/tmp/pg_autoctl/<PGDATA path>/pg_autoctl.pid`
@@ -761,12 +806,15 @@ fi"#
         // 4. pg_autoctl run — keeps running, handles replication and failover
         //
         // Runs as the `postgres` user because pg_ctl refuses to run as root.
+        let fast_checkpoint = fast_checkpoint_basebackup_snippet(PG_BINDIR_GLOB);
         vec![
             "bash".to_string(),
             "-c".to_string(),
             [
                 "PGDATA=/var/lib/postgresql/pgdata",
                 "chown -R postgres:postgres /var/lib/postgresql",
+                // Before `create` clones a standby: see the snippet.
+                fast_checkpoint.as_str(),
                 // Background HBA patcher: polls for pg_hba.conf and patches it
                 // as soon as it exists. pg_auto_failover only generates
                 // replication rules for peer addresses it resolves itself,
@@ -1863,6 +1911,141 @@ exit 0
             );
             assert!(!script.contains("/tmp/pg_autoctl/*/*.pid"));
         }
+    }
+
+    #[test]
+    fn standby_clones_request_a_fast_checkpoint_before_pg_autoctl_starts() {
+        let script = offline_service().node_command()[2].clone();
+        let wrapper = script
+            .find(&fast_checkpoint_basebackup_snippet(PG_BINDIR_GLOB))
+            .expect("the data node script installs the fast-checkpoint wrapper");
+        let create = script
+            .find("pg_autoctl create postgres")
+            .expect("create runs");
+        let run = script.find("pg_autoctl run").expect("run runs");
+        assert!(
+            wrapper < create && wrapper < run,
+            "the wrapper must be in place before pg_autoctl clones a standby"
+        );
+        // The monitor never clones, so it does not touch its binaries.
+        assert!(!offline_service().monitor_command()[2].contains("pg_basebackup"));
+    }
+
+    /// Runs the real snippet against a stand-in `pg_basebackup` that records
+    /// its arguments, twice (a container restart), and checks what pg_autoctl
+    /// would actually execute.
+    #[cfg(unix)]
+    #[test]
+    fn fast_checkpoint_wrapper_passes_the_flag_and_survives_a_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let bindir = root.path().join("18").join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let recorded = root.path().join("args");
+        let original = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n",
+            recorded.display()
+        );
+        let pg_basebackup = bindir.join("pg_basebackup");
+        std::fs::write(&pg_basebackup, &original).unwrap();
+        std::fs::set_permissions(
+            &pg_basebackup,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let glob = format!("{}/*/bin", root.path().display());
+        let snippet = fast_checkpoint_basebackup_snippet(&glob);
+        for _ in 0..2 {
+            let status = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!("set -e\n{snippet}"))
+                .status()
+                .expect("run the snippet");
+            assert!(status.success());
+        }
+
+        let real = bindir.join(format!("pg_basebackup{REAL_PG_BASEBACKUP_SUFFIX}"));
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            original,
+            "the real binary is moved aside once and never overwritten"
+        );
+        let status = std::process::Command::new(&pg_basebackup)
+            .args(["-w", "-d", "host=primary port=6121", "--wal-method=stream"])
+            .status()
+            .expect("run the wrapper");
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&recorded).unwrap().trim(),
+            "--checkpoint=fast -w -d host=primary port=6121 --wal-method=stream"
+        );
+    }
+
+    /// A stop between moving the real binary aside and installing the
+    /// wrapper leaves only `pg_basebackup.temps-real`; the next start must
+    /// put the wrapper back rather than skip the directory.
+    #[cfg(unix)]
+    #[test]
+    fn fast_checkpoint_wrapper_is_repaired_after_an_interrupted_install() {
+        let root = tempfile::tempdir().unwrap();
+        let bindir = root.path().join("18").join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let recorded = root.path().join("args");
+        let real = bindir.join(format!("pg_basebackup{REAL_PG_BASEBACKUP_SUFFIX}"));
+        std::fs::write(
+            &real,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n",
+                recorded.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&real, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let pg_basebackup = bindir.join("pg_basebackup");
+        assert!(
+            !pg_basebackup.exists(),
+            "the interrupted state has no command"
+        );
+
+        let glob = format!("{}/*/bin", root.path().display());
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "set -e\n{}",
+                fast_checkpoint_basebackup_snippet(&glob)
+            ))
+            .status()
+            .expect("run the snippet");
+        assert!(status.success());
+
+        let status = std::process::Command::new(&pg_basebackup)
+            .args(["-w", "-D", "/tmp/x"])
+            .status()
+            .expect("run the repaired wrapper");
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&recorded).unwrap().trim(),
+            "--checkpoint=fast -w -D /tmp/x"
+        );
+    }
+
+    /// No PostgreSQL bin directory (another image layout): nothing to wrap,
+    /// and the entrypoint must carry on.
+    #[cfg(unix)]
+    #[test]
+    fn fast_checkpoint_snippet_is_a_no_op_without_postgres_binaries() {
+        let root = tempfile::tempdir().unwrap();
+        let glob = format!("{}/*/bin", root.path().display());
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "set -e\n{}",
+                fast_checkpoint_basebackup_snippet(&glob)
+            ))
+            .status()
+            .expect("run the snippet");
+        assert!(status.success());
     }
 
     #[test]

@@ -2,11 +2,40 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { DropInspectionResponse, DropPresetCandidate } from '@/api/client'
-import { prepareDrop, type DropFile } from '@/lib/drop-archive'
+import {
+  prepareDrop,
+  type DropFile,
+  type DropLeftOutPath,
+} from '@/lib/drop-archive'
 
 export interface PreparedDropInspection {
   archive: File
   inspection: DropInspectionResponse
+  /** Everything left out of the upload: by the console for a folder, by the
+   * server for a ZIP. Empty when nothing was. */
+  leftOut: DropLeftOutPath[]
+  /** Files left out in total, including any beyond the listed paths. */
+  leftOutFileCount: number
+}
+
+/** Combine the console's and the server's left-out reports. */
+export function mergeLeftOut(
+  local: { leftOut: DropLeftOutPath[]; leftOutFileCount: number },
+  inspection: Pick<
+    DropInspectionResponse,
+    'skippedEntries' | 'skippedFileCount'
+  >
+): { leftOut: DropLeftOutPath[]; leftOutFileCount: number } {
+  const server = inspection.skippedEntries ?? []
+  const leftOut = [...local.leftOut, ...server].sort((a, b) =>
+    a.path.localeCompare(b.path)
+  )
+  return {
+    leftOut,
+    // Totals, not sums of the listed paths: either list may be truncated.
+    leftOutFileCount:
+      local.leftOutFileCount + (inspection.skippedFileCount ?? 0),
+  }
 }
 
 export function presetConfigForDropCandidate(
@@ -73,5 +102,9 @@ export async function prepareAndInspectDrop(
     throw new Error('No deployable project preset was detected')
   }
 
-  return { archive: prepared.file, inspection }
+  return {
+    archive: prepared.file,
+    inspection,
+    ...mergeLeftOut(prepared, inspection),
+  }
 }

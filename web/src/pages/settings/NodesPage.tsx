@@ -65,6 +65,7 @@ import {
 import type {
   NodeInfoResponse,
   NodeContainerResponse,
+  NodePlacementReference,
   RemoveNodeResponse,
   WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
@@ -106,25 +107,27 @@ import {
 } from '@/components/ui/alert-dialog'
 import { toast } from 'sonner'
 import { client } from '@/api/client/client.gen'
+import { describeUpdatedPlacements } from '@/lib/node-placements'
 
 // ── Helpers ──
 
+/** Status tones, from the theme's contrast-checked status tokens. */
+const nodeStatusVariant: Record<
+  string,
+  'success-subtle' | 'destructive-subtle' | 'warning-subtle' | 'neutral-subtle'
+> = {
+  active: 'success-subtle',
+  offline: 'destructive-subtle',
+  draining: 'warning-subtle',
+  drained: 'neutral-subtle',
+  pending: 'warning-subtle',
+}
+
 function StatusBadge({ status }: { status: string }) {
-  const styles: Record<string, string> = {
-    active:
-      'bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20',
-    offline: 'bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/20',
-    draining:
-      'bg-orange-500/15 text-orange-700 dark:text-orange-400 border-orange-500/20',
-    drained:
-      'bg-gray-500/15 text-gray-700 dark:text-gray-400 border-gray-500/20',
-    pending:
-      'bg-yellow-500/15 text-yellow-700 dark:text-yellow-400 border-yellow-500/20',
-  }
   return (
     <Badge
-      variant="default"
-      className={`${styles[status] ?? ''} text-xs capitalize`}
+      variant={nodeStatusVariant[status] ?? 'neutral-subtle'}
+      className="text-xs capitalize"
     >
       {status}
     </Badge>
@@ -423,10 +426,7 @@ function JoinTokenSection() {
     return (
       <div className="space-y-4">
         <div className="flex items-center gap-2 text-sm">
-          <Badge
-            variant="default"
-            className="bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20"
-          >
+          <Badge variant="success-subtle">
             <Shield className="h-3 w-3 mr-1" />
             Token configured
           </Badge>
@@ -845,7 +845,7 @@ function MiniStat({
 }) {
   const accentClass =
     accent === 'green'
-      ? 'text-green-600 dark:text-green-400'
+      ? 'text-success-strong'
       : accent === 'yellow'
         ? 'text-yellow-600 dark:text-yellow-400'
         : accent === 'blue'
@@ -922,6 +922,10 @@ function NodeDetail({
   // dialog lists them and offers to remove the node anyway.
   const [unremovedContainers, setUnremovedContainers] =
     useState<UnremovedNodeContainers | null>(null)
+  // Environments pinned only to this node, from a refused removal.
+  const [pinnedPlacements, setPinnedPlacements] = useState<
+    NodePlacementReference[] | null
+  >(null)
   const [undrainPending, setUndrainPending] = useState(false)
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
@@ -1021,6 +1025,13 @@ function NodeDetail({
         // Containers Temps placed on the node may still exist: keep the
         // dialog open with the list so the operator decides whether the
         // host is gone for good.
+        const pinned = (resp.error as { placements?: unknown }).placements
+        if (Array.isArray(pinned) && pinned.length > 0) {
+          setPinnedPlacements(pinned as NodePlacementReference[])
+          keepDialogOpen = true
+          setShowRemoveDialog(true)
+          return
+        }
         const unremoved = unremovedNodeContainers(resp.error)
         if (unremoved && !force) {
           setUnremovedContainers(unremoved)
@@ -1054,13 +1065,22 @@ function NodeDetail({
         })
         return
       }
-      const orphaned =
-        (resp.data as RemoveNodeResponse | undefined)?.orphaned_containers ?? []
+      const removal = resp.data as RemoveNodeResponse | undefined
+      const orphaned = removal?.orphaned_containers ?? []
+      // Environments whose target nodes listed this node no longer do; say
+      // which, since a rejoined machine gets a new ID and is not targeted.
+      const placements = describeUpdatedPlacements(removal?.placements_updated)
       if (orphaned.length > 0) {
         toast.warning('Node removed', {
-          description:
+          description: [
             'Some containers could not be removed and were recorded as orphaned. If the host still exists, remove them there with docker rm -f.',
+            placements,
+          ]
+            .filter(Boolean)
+            .join(' '),
         })
+      } else if (placements) {
+        toast.warning('Node removed', { description: placements })
       } else {
         toast.success('Node removed')
       }
@@ -1076,6 +1096,7 @@ function NodeDetail({
       if (!keepDialogOpen) {
         setShowRemoveDialog(false)
         setUnremovedContainers(null)
+        setPinnedPlacements(null)
       }
     }
   }
@@ -1244,18 +1265,36 @@ function NodeDetail({
         open={showRemoveDialog}
         onOpenChange={(open) => {
           setShowRemoveDialog(open)
-          if (!open) setUnremovedContainers(null)
+          if (!open) {
+            setUnremovedContainers(null)
+            setPinnedPlacements(null)
+          }
         }}
       >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Remove node “{node.name}”?</AlertDialogTitle>
             <AlertDialogDescription>
-              {unremovedContainers
-                ? `Temps could not confirm that ${unremovedContainers.count} container(s) it placed on this node are gone, so the node was not removed. Start the agent on the node and try again, or remove them on that host with docker rm -f. If the host is gone for good, remove the node anyway: these containers are then recorded as orphaned and never touched again.`
-                : 'This will permanently remove the node from the cluster. This action cannot be undone. The node must be drained first (no active containers) and host no sandboxes. Containers Temps left on it are removed first.'}
+              {pinnedPlacements
+                ? 'The node was not removed: it is the only target node of the environments below. Removing it would leave them with no target, so they could run on any node. Change their target nodes in each environment’s settings, then remove the node.'
+                : unremovedContainers
+                  ? `Temps could not confirm that ${unremovedContainers.count} container(s) it placed on this node are gone, so the node was not removed. Start the agent on the node and try again, or remove them on that host with docker rm -f. If the host is gone for good, remove the node anyway: these containers are then recorded as orphaned and never touched again.`
+                  : 'This will permanently remove the node from the cluster. This action cannot be undone. The node must be drained first (no active containers) and host no sandboxes. Containers Temps left on it are removed first, and it is taken out of the target nodes of every environment that lists it.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
+          {pinnedPlacements && (
+            <ul className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2 text-sm">
+              {pinnedPlacements.map((placement) => (
+                <li
+                  key={`${placement.project_id}-${placement.environment_id ?? 'default'}`}
+                >
+                  {placement.environment_name
+                    ? `${placement.project_name} / ${placement.environment_name}`
+                    : `${placement.project_name} (project default)`}
+                </li>
+              ))}
+            </ul>
+          )}
           {unremovedContainers && (
             <ul className="max-h-48 space-y-1 overflow-y-auto rounded-md border p-2 font-mono text-xs break-all">
               {unremovedContainers.lines.map((container) => (
@@ -1326,8 +1365,8 @@ function NodeDetail({
           <AlertTitle
             className={
               node.status === 'drained' || drainStatus?.drain_complete
-                ? 'text-green-700 dark:text-green-400'
-                : 'text-orange-700 dark:text-orange-400'
+                ? 'text-success-strong'
+                : 'text-warning-strong'
             }
           >
             {node.status === 'drained'
@@ -1339,8 +1378,8 @@ function NodeDetail({
           <AlertDescription
             className={
               node.status === 'drained' || drainStatus?.drain_complete
-                ? 'text-green-600 dark:text-green-300'
-                : 'text-orange-600 dark:text-orange-300'
+                ? 'text-success-strong'
+                : 'text-warning-strong'
             }
           >
             {node.status === 'drained'
@@ -1488,13 +1527,11 @@ function NodeDetail({
                           <TableCell>
                             <Badge
                               variant={
-                                c.status === 'running' ? 'default' : 'secondary'
-                              }
-                              className={`text-xs ${
                                 c.status === 'running'
-                                  ? 'bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20'
-                                  : ''
-                              }`}
+                                  ? 'success-subtle'
+                                  : 'secondary'
+                              }
+                              className="text-xs"
                             >
                               {c.status}
                             </Badge>
