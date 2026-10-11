@@ -3780,6 +3780,14 @@
             },
             "description": "Workspace preview gateway settings (single shared container per node).\nOwned by `PATCH /preview-gateway/settings` and\n`POST /preview-gateway/upgrade`, which change the gateway's containers\nto match; the generic settings update preserves the stored value."
           },
+          "public_ingress_url": {
+            "default": null,
+            "description": "Base URL handed to third parties that call back into Temps: email\nopen/click tracking, git provider webhooks, SES/SNS events, revenue\nwebhooks, the Sentry DSN (ADR-051). `None` (the default) falls back to\n`external_url`, which is right whenever the console is publicly\nreachable. Set it when the console host is restricted (VPN, firewall,\nidentity-aware proxy) so only this hostname has to be public: the proxy\nserves nothing but the public callback routes on it. Read it through\n[`AppSettings::effective_public_ingress_url`].",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "rate_limiting": {
             "$ref": "#/components/schemas/RateLimitSettings",
             "default": {
@@ -4026,6 +4034,13 @@
             "format": "int32",
             "minimum": 0,
             "type": "integer"
+          },
+          "public_ingress_url": {
+            "description": "Base URL handed to third parties that call back into Temps (ADR-051).\n`None` means callbacks use `external_url`; see\n`GET /settings/public-ingress` for the effective value.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "rate_limiting": {
             "$ref": "#/components/schemas/RateLimitSettings"
@@ -41734,6 +41749,53 @@
           "certificate_count",
           "route_count",
           "unsupported_route_count"
+        ],
+        "type": "object"
+      },
+      "PublicIngressSource": {
+        "description": "Where the effective ingress URL came from.",
+        "enum": [
+          "explicit",
+          "external_url_fallback"
+        ],
+        "type": "string"
+      },
+      "PublicIngressStatusResponse": {
+        "description": "Where third-party callbacks are sent, and whether they can arrive.\n\nThe console reads callback URLs from here instead of deriving them from\nthe address the operator happens to be browsing, which is the console host\nand may be private.",
+        "properties": {
+          "configured": {
+            "description": "`false` when Temps can tell from its own configuration that a third\nparty cannot reach `effective_url`. `true` is not a guarantee: a\nfirewall, VPN or identity-aware proxy in front of the host is\ninvisible from here.",
+            "type": "boolean"
+          },
+          "effective_url": {
+            "description": "Base URL third parties are given, with no trailing slash. Callback\npaths (`/api/webhook/git/...`, `/api/emails/...`) are appended to it.",
+            "example": "https://hooks.example.com",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why callbacks will not arrive, when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Console path that fixes it, when `configured` is false.",
+            "example": "/settings#public-ingress",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/PublicIngressSource",
+            "description": "Whether `effective_url` is the explicit setting or the `external_url`\nfallback."
+          }
+        },
+        "required": [
+          "effective_url",
+          "source",
+          "configured"
         ],
         "type": "object"
       },
@@ -122669,6 +122731,42 @@
         ],
         "tags": [
           "Agents"
+        ]
+      }
+    },
+    "/settings/public-ingress": {
+      "get": {
+        "description": "Returns the base URL Temps hands to third parties that call back into it\n(email open/click tracking, git provider webhooks, SES/SNS delivery\nevents, revenue webhooks, the Sentry DSN) and whether Temps can tell that\nURL is unreachable for them. Unlike a 404, `configured: false` means the\nfeature exists but needs setting up; `setup_path` says where.",
+        "operationId": "get_public_ingress_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicIngressStatusResponse"
+                }
+              }
+            },
+            "description": "Effective public ingress URL and its reachability"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get where third-party callbacks are sent",
+        "tags": [
+          "Settings"
         ]
       }
     },

@@ -176,6 +176,16 @@ pub struct ProxyCommand {
     #[arg(long, env = "TEMPS_CONSOLE_ADDRESS")]
     pub console_address: Option<String>,
 
+    /// Address of the console's public-only listener: the value given to
+    /// `temps serve --role=console --console-ingress-address`.
+    ///
+    /// With it, third-party callbacks (email tracking, provider webhooks)
+    /// reach the console's public routes even from clients the admin gate
+    /// denies, and the public ingress hostname is pinned to that listener.
+    /// Without it this proxy keeps answering gate-denied requests with a 404.
+    #[arg(long, env = "TEMPS_CONSOLE_INGRESS_ADDRESS")]
+    pub console_ingress_address: Option<String>,
+
     /// Disable HTTP-to-HTTPS redirect (useful for local development without TLS)
     #[arg(long, env = "TEMPS_DISABLE_HTTPS_REDIRECT")]
     pub disable_https_redirect: bool,
@@ -478,6 +488,10 @@ impl ProxyCommand {
         let proxy_config = temps_proxy::ProxyConfig {
             address,
             console_address,
+            console_ingress_address: self
+                .console_ingress_address
+                .clone()
+                .filter(|address| !address.is_empty()),
             internal_dns_sync_address,
             tls_address,
             preview_domain,

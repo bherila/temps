@@ -256,3 +256,9 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .merge(trigger::routes())
         .merge(workflows::routes())
 }
+
+/// Routes third parties call without a session (ADR-051 D3): the agent
+/// webhook trigger, authenticated by its `X-Webhook-Token`.
+pub fn configure_public_routes() -> Router<Arc<AppState>> {
+    trigger::public_routes()
+}

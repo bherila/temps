@@ -201,6 +201,8 @@ export type PublicHostnameStrategy = 'standard' | 'flat'
 export interface PlatformSettings extends AppSettingsResponse {
   external_url: string | null
   internal_url: string | null
+  /** Base URL handed to third parties that call back (ADR-051); null = use external_url. */
+  public_ingress_url?: string | null
   letsencrypt: LetsEncryptSettings
   preview_domain: string
   /** Public address synced DNS records point at (IP → A/AAAA, else CNAME). */
@@ -307,6 +309,9 @@ export function buildPlatformSettingsUpdateBody(
     dns_provider: updated.dns_provider,
     external_url: updated.external_url,
     internal_url: updated.internal_url,
+    // Sent explicitly so clearing the field (null) reaches the server; an
+    // omitted key would keep the stored value.
+    public_ingress_url: updated.public_ingress_url ?? null,
     letsencrypt: updated.letsencrypt,
     preview_domain: updated.preview_domain,
     edge_target: updated.edge_target,

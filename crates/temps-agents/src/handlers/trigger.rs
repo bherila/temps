@@ -70,14 +70,31 @@ impl AuditOperation for AgentRunTriggeredAudit {
 // lives in `handlers::workflows` — it owns its own routes, request type, and
 // audit struct.
 
+/// Request body ceiling for the agent webhook trigger. Matches what the route
+/// accepted before it declared a limit (axum's default).
+const WEBHOOK_TRIGGER_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// The agent webhook trigger (ADR-051 D3).
+///
+/// Called by whatever system the operator wired the agent to, from the open
+/// internet and with no session, so it is mounted on the public router. The
+/// handler authenticates the request with the agent's `X-Webhook-Token`
+/// (constant-time compared) and never reads the session cookie.
+pub fn public_routes() -> Router<Arc<AppState>> {
+    Router::new().route(
+        "/agents/webhook/{webhook_id}",
+        post(webhook_trigger).layer(axum::extract::DefaultBodyLimit::max(
+            WEBHOOK_TRIGGER_BODY_LIMIT,
+        )),
+    )
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route(
             "/projects/{project_id}/agents/{slug}/trigger",
             post(trigger_agent),
         )
-        // Public webhook endpoint — X-Webhook-Token header auth
-        .route("/agents/webhook/{webhook_id}", post(webhook_trigger))
         .route(
             "/projects/{project_id}/agents/cli-status",
             get(get_cli_status),

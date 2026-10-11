@@ -562,7 +562,11 @@ pub fn setup_proxy_server(
         lb = lb.with_admin_gate(gate);
     }
     if let Some(state) = proxy_config.console_startup.clone() {
-        lb = lb.with_console_startup_state(state, &proxy_config.console_address);
+        lb = lb.with_console_startup_state(
+            state,
+            &proxy_config.console_address,
+            proxy_config.console_ingress_address.as_deref(),
+        );
     }
 
     // Wire up on-demand scale-to-zero if OnDemandManager was created.

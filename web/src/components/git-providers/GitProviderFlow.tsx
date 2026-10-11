@@ -56,6 +56,8 @@ import {
 import GithubIcon from '@/icons/Github'
 import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
+import { usePublicIngress } from '@/hooks/usePublicIngress'
+import { publicIngressCallbackUrl } from '@/lib/publicIngress'
 
 type Step =
   | 'provider'
@@ -90,6 +92,14 @@ export function GitProviderFlow({
   mode: _mode = 'settings',
 }: GitProviderFlowProps) {
   const queryClient = useQueryClient()
+  // GitHub delivers webhooks from its own servers, so the events URL is the
+  // public ingress URL. The auth/callback/install URLs below stay on the
+  // browser origin: GitHub redirects the operator's own browser to them.
+  const { baseUrl: publicIngressUrl } = usePublicIngress()
+  const githubEventsUrl = publicIngressCallbackUrl(
+    publicIngressUrl,
+    '/api/webhook/git/github/events'
+  )
   const { isLocalMode: isLocal, hasPublicIP } = usePlatformCapabilities()
   // GitHub/GitLab Apps require a public URL for webhooks
   // Disable if running in local mode without a public IP
@@ -409,8 +419,7 @@ export function GitProviderFlow({
   })
 
   const handleCopyWebhook = () => {
-    const url = `${window.location.origin}/api/webhook/git/github/events`
-    navigator.clipboard.writeText(url)
+    navigator.clipboard.writeText(githubEventsUrl)
     setCopiedWebhook(true)
     setTimeout(() => setCopiedWebhook(false), 2000)
   }
@@ -452,7 +461,7 @@ export function GitProviderFlow({
         name: appName,
         url: appUrl,
         hook_attributes: {
-          url: `${apiUrl}/webhook/git/github/events`,
+          url: githubEventsUrl,
           active: true,
         },
         redirect_url: `${apiUrl}/webhook/git/github/auth`,
@@ -1647,8 +1656,7 @@ export function GitProviderFlow({
                         <p className="text-muted-foreground">Webhook URL:</p>
                         <div className="flex items-center gap-2">
                           <code className="text-xs bg-muted px-2 py-1 rounded flex-1 overflow-x-auto">
-                            {window.location.origin}
-                            /api/webhook/git/github/events
+                            {githubEventsUrl}
                           </code>
                           <Button
                             size="sm"

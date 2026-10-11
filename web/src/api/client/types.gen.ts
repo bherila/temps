@@ -1790,6 +1790,17 @@ export type AppSettings = {
      * to match; the generic settings update preserves the stored value.
      */
     preview_gateway?: PreviewGatewaySettings;
+    /**
+     * Base URL handed to third parties that call back into Temps: email
+     * open/click tracking, git provider webhooks, SES/SNS events, revenue
+     * webhooks, the Sentry DSN (ADR-051). `None` (the default) falls back to
+     * `external_url`, which is right whenever the console is publicly
+     * reachable. Set it when the console host is restricted (VPN, firewall,
+     * identity-aware proxy) so only this hostname has to be public: the proxy
+     * serves nothing but the public callback routes on it. Read it through
+     * [`AppSettings::effective_public_ingress_url`].
+     */
+    public_ingress_url?: string | null;
     rate_limiting?: RateLimitSettings;
     /**
      * Prefix applied to Docker Hub base images generated for a build (e.g.
@@ -1984,6 +1995,12 @@ export type AppSettingsResponse = {
      * `{slug}-{env_slug}.{preview_domain}:{port}` URL before it's deployed.
      */
     proxy_port: number;
+    /**
+     * Base URL handed to third parties that call back into Temps (ADR-051).
+     * `None` means callbacks use `external_url`; see
+     * `GET /settings/public-ingress` for the effective value.
+     */
+    public_ingress_url?: string | null;
     rate_limiting: RateLimitSettings;
     /**
      * Prefix applied to implicit Docker Hub base images in generated
@@ -19550,6 +19567,46 @@ export type PublicIngressHeartbeat = {
     running: boolean;
     unsupported_reasons?: Array<string>;
     unsupported_route_count: number;
+};
+
+/**
+ * Where the effective ingress URL came from.
+ */
+export type PublicIngressSource = 'explicit' | 'external_url_fallback';
+
+/**
+ * Where third-party callbacks are sent, and whether they can arrive.
+ *
+ * The console reads callback URLs from here instead of deriving them from
+ * the address the operator happens to be browsing, which is the console host
+ * and may be private.
+ */
+export type PublicIngressStatusResponse = {
+    /**
+     * `false` when Temps can tell from its own configuration that a third
+     * party cannot reach `effective_url`. `true` is not a guarantee: a
+     * firewall, VPN or identity-aware proxy in front of the host is
+     * invisible from here.
+     */
+    configured: boolean;
+    /**
+     * Base URL third parties are given, with no trailing slash. Callback
+     * paths (`/api/webhook/git/...`, `/api/emails/...`) are appended to it.
+     */
+    effective_url: string;
+    /**
+     * Why callbacks will not arrive, when `configured` is false.
+     */
+    reason?: string | null;
+    /**
+     * Console path that fixes it, when `configured` is false.
+     */
+    setup_path?: string | null;
+    /**
+     * Whether `effective_url` is the explicit setting or the `external_url`
+     * fallback.
+     */
+    source: PublicIngressSource;
 };
 
 /**
@@ -66043,6 +66100,37 @@ export type RevealGlobalMcpConfigResponses = {
 };
 
 export type RevealGlobalMcpConfigResponse = RevealGlobalMcpConfigResponses[keyof RevealGlobalMcpConfigResponses];
+
+export type GetPublicIngressStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/public-ingress';
+};
+
+export type GetPublicIngressStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPublicIngressStatusResponses = {
+    /**
+     * Effective public ingress URL and its reachability
+     */
+    200: PublicIngressStatusResponse;
+};
+
+export type GetPublicIngressStatusResponse = GetPublicIngressStatusResponses[keyof GetPublicIngressStatusResponses];
 
 export type RefreshRouteTableData = {
     body?: never;

@@ -91,6 +91,8 @@ import {
   YAxis,
 } from 'recharts'
 import { toast } from 'sonner'
+import { usePublicIngress } from '@/hooks/usePublicIngress'
+import { publicIngressCallbackUrl } from '@/lib/publicIngress'
 
 interface ProjectRevenueProps {
   project: ProjectResponse
@@ -734,7 +736,8 @@ function IntegrationRow({
   integration: IntegrationResponse
 }) {
   const queryClient = useQueryClient()
-  const fullUrl = absoluteWebhookUrl(integration.webhook_path)
+  const { baseUrl: publicIngressUrl } = usePublicIngress()
+  const fullUrl = absoluteWebhookUrl(publicIngressUrl, integration.webhook_path)
   const integrationsKey = revenueListIntegrationsQueryKey({
     path: { project_id: projectId },
   })
@@ -1698,7 +1701,8 @@ function SuccessStep({
   integration: IntegrationResponse
   onClose: () => void
 }) {
-  const url = absoluteWebhookUrl(integration.webhook_path)
+  const { baseUrl: publicIngressUrl } = usePublicIngress()
+  const url = absoluteWebhookUrl(publicIngressUrl, integration.webhook_path)
   return (
     <>
       <DialogHeader>
@@ -1770,7 +1774,14 @@ function formatBucketLabel(bucket: string): string {
   })
 }
 
-function absoluteWebhookUrl(relativePath: string): string {
-  if (typeof window === 'undefined') return relativePath
-  return `${window.location.origin}/api${relativePath}`
+/**
+ * The URL the revenue provider is told to call. It is built from the public
+ * ingress URL, not the address being browsed: the provider calls from its own
+ * servers and cannot reach a console that is restricted to an allowlist.
+ */
+function absoluteWebhookUrl(
+  publicIngressUrl: string,
+  relativePath: string
+): string {
+  return publicIngressCallbackUrl(publicIngressUrl, `/api${relativePath}`)
 }

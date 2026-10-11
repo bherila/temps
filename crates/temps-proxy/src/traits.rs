@@ -123,6 +123,21 @@ pub trait UpstreamResolver: Send + Sync {
     fn console_address(&self) -> &str {
         ""
     }
+
+    /// Address of the listener that serves only the console's public routes
+    /// (ADR-051), when one exists. `None` keeps the earlier behaviour: a
+    /// gate-denied request is answered with a 404 by the proxy itself.
+    fn console_ingress_address(&self) -> Option<&str> {
+        None
+    }
+
+    /// Whether `host` is the dedicated public ingress hostname. Such a
+    /// request may only ever reach the public-only listener. Must not block
+    /// or allocate: it runs for every request that falls through to the
+    /// console.
+    fn is_public_ingress_host(&self, _host: &str) -> bool {
+        false
+    }
 }
 
 /// Trait for resolving project context from request information

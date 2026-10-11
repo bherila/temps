@@ -270,6 +270,19 @@ pub struct ServeCommand {
     #[arg(long, env = "TEMPS_CONSOLE_ADMIN_ADDRESS")]
     pub console_admin_address: Option<String>,
 
+    /// Address of a listener that serves only the console's public routes
+    /// (email tracking, provider webhooks, ingest) and nothing else.
+    ///
+    /// The proxy sends third-party callbacks here, so they can arrive while
+    /// the console itself stays restricted. The single-binary server picks a
+    /// loopback port for this automatically. Set it only in split topology
+    /// (`--role=console`), together with the same value on
+    /// `temps proxy --console-ingress-address`. Ignored when
+    /// `--console-admin-address` is set, because `--console-address` is
+    /// already public-only then.
+    #[arg(long, env = "TEMPS_CONSOLE_INGRESS_ADDRESS")]
+    pub console_ingress_address: Option<String>,
+
     /// Forbid applying release updates from the console, permanently for the
     /// lifetime of this process.
     ///
@@ -415,6 +428,9 @@ impl ServeCommand {
         if let Some(ref admin) = self.console_admin_address {
             std::env::set_var("TEMPS_CONSOLE_ADMIN_ADDRESS", admin);
         }
+        if let Some(ref ingress) = self.console_ingress_address {
+            std::env::set_var("TEMPS_CONSOLE_INGRESS_ADDRESS", ingress);
+        }
 
         // Same bridge for the data directory. `ServerConfig::new` resolves it
         // from TEMPS_DATA_DIR or falls back to ~/.temps, and never saw this
@@ -455,12 +471,21 @@ impl ServeCommand {
 
         let external_plugin_registry = temps_external_plugins::catalog::RegistryConfig::default();
 
-        let serve_config = Arc::new(temps_config::ServerConfig::new(
+        let serve_config = temps_config::ServerConfig::new(
             effective_proxy_address,
             self.database_url.clone(),
             effective_proxy_tls_address,
             self.console_address.clone(),
-        )?);
+        )?;
+        // ADR-051: the in-process proxy is handed the public-only listener's
+        // address directly, so it can live on a random loopback port. A split
+        // console only binds one when `--console-ingress-address` names it,
+        // because the sibling `temps proxy` could not discover a random port.
+        let serve_config = Arc::new(if self.role == ServeRole::Console {
+            serve_config
+        } else {
+            serve_config.with_default_ingress_listener()
+        });
         let encryption_service = Arc::new(temps_core::EncryptionService::new(
             &serve_config.encryption_key,
         )?);

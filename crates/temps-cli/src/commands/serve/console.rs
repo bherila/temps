@@ -2067,6 +2067,61 @@ fn health_router(ready: Arc<std::sync::atomic::AtomicBool>) -> Router {
         .route("/readyz", get(readyz))
 }
 
+/// The console's public surface and nothing else (ADR-051 D4).
+///
+/// Serves the health probes and the public router under `/api`. It has no
+/// admin routes, no MCP endpoint and no dashboard fallback, so a request that
+/// reaches it cannot execute an admin handler or receive the SPA whatever its
+/// path, `Host`, forwarding headers or cookies: the boundary is what is
+/// mounted here, not a path match. The proxy sends it the public ingress
+/// hostname and every request the admin gate denies.
+///
+/// Handlers on `public_router` authenticate the request (a provider
+/// signature, a capability token in the path, a scoped API key), never the
+/// session — they have to work for callers that hold no cookie at all.
+fn public_only_app(health: Router, public_router: Router) -> Router {
+    Router::new()
+        .merge(health)
+        .nest("/api", public_router)
+        .fallback(public_only_not_found)
+        .layer(axum::middleware::from_fn(track_server_errors))
+}
+
+/// 404 for everything that is not a public route. A browser gets the same
+/// branded page the proxy renders for an unknown host, so a non-allowlisted
+/// visitor sees exactly what they saw before this listener existed; an API
+/// client gets an empty body.
+async fn public_only_not_found(req: Request) -> Response {
+    use axum::response::IntoResponse;
+
+    let headers = req.headers();
+    let wants_html = !req.uri().path().starts_with("/api/")
+        && headers
+            .get(header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|accept| accept.contains("text/html"));
+    if !wants_html {
+        return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response();
+    }
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    (
+        StatusCode::NOT_FOUND,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+        ],
+        temps_proxy::branded_404::render(host, request_id),
+    )
+        .into_response()
+}
+
 /// ALLOWLIST for the AI `call_api` read tool — opt-in / secure by default.
 /// The model may call ONLY these read-only GET operations; every other
 /// endpoint (including any newly added one) is invisible to it. This is
@@ -4643,6 +4698,13 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         }
     };
 
+    // ADR-051 D4: the same public routes a second time, with nothing else
+    // around them. Only bound in single-listener mode; in dual-listener mode
+    // `console_address` already serves nothing but `public_app`.
+    let ingress_app = config
+        .ingress_listener_to_bind()
+        .map(|_| public_only_app(health_router(ready_flag.clone()), public_router.clone()));
+
     let public_app = Router::new()
         .merge(health_router(ready_flag.clone()))
         .merge(mcp_root_router)
@@ -4851,6 +4913,20 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             let listener = bind_console_listener(&config.console_address).await?;
             info!("Console API server listening on {}", config.console_address);
 
+            // Bound before `/readyz` flips, so a proxy that is told the
+            // console is ready can already reach the public-only surface.
+            let ingress = match (config.ingress_listener_to_bind(), ingress_app) {
+                (Some(address), Some(app)) => {
+                    let listener = bind_console_listener(address).await?;
+                    info!(
+                        "Console PUBLIC-ONLY API server listening on {} (third-party callbacks, ADR-051)",
+                        address
+                    );
+                    Some((listener, app))
+                }
+                _ => None,
+            };
+
             // Routers, middleware, and the listener are ready; flip `/readyz`
             // to 200. `ready_signal` already fired earlier, right after
             // plugin init -- see that call site for why the two are
@@ -4863,17 +4939,199 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 &config.data_dir,
             );
 
-            axum::serve(
+            let console_fut = axum::serve(
                 listener,
                 merged.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
-            .with_graceful_shutdown(shutdown_signal)
-            .await?;
+            .with_graceful_shutdown(shutdown_signal.clone());
+
+            match ingress {
+                Some((ingress_listener, ingress_app)) => {
+                    let ingress_fut = axum::serve(
+                        ingress_listener,
+                        ingress_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(shutdown_signal);
+                    tokio::try_join!(console_fut, ingress_fut)?;
+                }
+                None => console_fut.await?,
+            }
         }
     }
 
     info!("Console API server exited");
     Ok(())
+}
+
+#[cfg(test)]
+mod public_only_app_tests {
+    //! ADR-051 invariant 1: a request that reaches the public-only listener
+    //! cannot execute an admin handler or receive the dashboard, whatever its
+    //! path or headers. The boundary is what `public_only_app` mounts.
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::{get, post};
+    use std::sync::atomic::AtomicBool;
+    use tower::ServiceExt; // for `oneshot`
+
+    /// A public router shaped like the real one: receivers only.
+    fn public_router() -> Router {
+        Router::new()
+            .route("/emails/{email_id}/track/open", get(|| async { "pixel" }))
+            .route("/webhook/git/gitlab/events", post(|| async { "ok" }))
+            .route("/_temps/event", post(|| async { "ok" }))
+    }
+
+    /// Routes that exist on the admin router and on the merged console
+    /// listener, and must not exist here.
+    fn admin_router() -> Router {
+        Router::new()
+            .route("/settings", get(|| async { "settings" }))
+            .route("/projects", get(|| async { "projects" }))
+            .route("/_temps/internal", get(|| async { "internal" }))
+    }
+
+    fn app() -> Router {
+        public_only_app(
+            health_router(Arc::new(AtomicBool::new(true))),
+            public_router(),
+        )
+    }
+
+    async fn send(app: Router, request: Request<Body>) -> Response {
+        app.oneshot(request).await.expect("router responds")
+    }
+
+    fn request(method: &str, path: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::HOST, "hooks.example.com")
+            .body(Body::empty())
+            .expect("request builds")
+    }
+
+    #[tokio::test]
+    async fn serves_public_receivers_and_health_probes() {
+        for (method, path) in [
+            ("GET", "/healthz"),
+            ("GET", "/readyz"),
+            (
+                "GET",
+                "/api/emails/0b5a51a2-2b0a-4c0b-9f0e-6a1f0d1c2e3f/track/open",
+            ),
+            ("POST", "/api/webhook/git/gitlab/events"),
+            ("POST", "/api/_temps/event"),
+        ] {
+            assert_eq!(
+                send(app(), request(method, path)).await.status(),
+                StatusCode::OK,
+                "{method} {path} must be served on the public-only listener"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_routes_and_the_dashboard_are_not_mounted() {
+        // Sanity check: these paths do answer on a console that mounts them,
+        // so a 404 below is the boundary and not a typo in the path.
+        let merged = Router::new()
+            .nest("/api", public_router().merge(admin_router()))
+            .fallback(|| async { "dashboard" });
+        for path in [
+            "/",
+            "/api/settings",
+            "/api/projects",
+            "/api/_temps/internal",
+        ] {
+            assert_eq!(
+                send(merged.clone(), request("GET", path)).await.status(),
+                StatusCode::OK
+            );
+        }
+
+        for path in [
+            "/",
+            "/dashboard",
+            "/index.html",
+            "/settings",
+            "/api/settings",
+            "/api/projects",
+            // An authenticated sibling of a public ingest route.
+            "/api/_temps/internal",
+            "/mcp",
+            "/mcp/tools",
+            "/api/swagger-ui",
+        ] {
+            let response = send(app(), request("GET", path)).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must not be reachable on the public-only listener"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn headers_cannot_steer_a_request_onto_an_admin_route() {
+        let request = Request::builder()
+            .uri("/api/settings")
+            .header(header::HOST, "console.example.com")
+            .header("x-forwarded-host", "console.example.com")
+            .header("x-forwarded-for", "127.0.0.1")
+            .header(header::COOKIE, "session=valid-admin-session")
+            .header(header::AUTHORIZATION, "Bearer tk_admin")
+            .body(Body::empty())
+            .expect("request builds");
+        assert_eq!(send(app(), request).await.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_browser_gets_the_branded_404_and_an_api_client_an_empty_one() {
+        let browser = Request::builder()
+            .uri("/dashboard")
+            .header(header::HOST, "hooks.example.com")
+            .header(header::ACCEPT, "text/html,application/xhtml+xml")
+            .body(Body::empty())
+            .expect("request builds");
+        let response = send(app(), browser).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains("<!doctype html>"),
+            "expected the branded page"
+        );
+        assert!(html.contains("hooks.example.com"));
+        assert!(
+            !html.contains("id=\"root\""),
+            "the dashboard bundle must never be served here"
+        );
+
+        // `/api/*` never gets HTML, even from a browser.
+        let api = Request::builder()
+            .uri("/api/settings")
+            .header(header::ACCEPT, "text/html")
+            .body(Body::empty())
+            .expect("request builds");
+        let response = send(app(), api).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(body.is_empty());
+    }
 }
 
 #[cfg(test)]

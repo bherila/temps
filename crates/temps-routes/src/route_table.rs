@@ -616,6 +616,10 @@ struct LegacyRouteTable {
     exact: HashMap<String, RouteInfo>,
     wildcards: WildcardMatcher,
     reserved_console_host: Option<String>,
+    /// Hostname of an explicit `public_ingress_url` that is not the console
+    /// hostname (ADR-051). Reserved exactly like the console hostname, and
+    /// additionally pinned by the proxy to the public-only console surface.
+    reserved_ingress_host: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -645,8 +649,15 @@ impl RouteTableSnapshot {
 }
 
 impl LegacyRouteTable {
+    /// Whether `host` belongs to the platform itself (console or public
+    /// ingress) and must therefore never resolve to a project route.
+    fn is_reserved(&self, host: &str) -> bool {
+        self.reserved_console_host.as_deref() == Some(host)
+            || self.reserved_ingress_host.as_deref() == Some(host)
+    }
+
     fn get(&self, host: &str) -> Option<&RouteInfo> {
-        if self.reserved_console_host.as_deref() == Some(host) {
+        if self.is_reserved(host) {
             return None;
         }
         self.exact
@@ -689,12 +700,10 @@ fn build_route_ownership_snapshot<'a>(
     legacy_hosts: impl IntoIterator<Item = &'a String>,
     http_hosts: impl IntoIterator<Item = &'a String>,
     tls_hosts: impl IntoIterator<Item = &'a String>,
-    reserved_console_host: Option<String>,
+    reserved_hosts: impl IntoIterator<Item = String>,
 ) -> RouteOwnershipSnapshot {
     let mut snapshot = RouteOwnershipSnapshot::default();
-    if let Some(host) = reserved_console_host {
-        snapshot.reserved_hosts.insert(host);
-    }
+    snapshot.reserved_hosts.extend(reserved_hosts);
     for host in legacy_hosts.into_iter().chain(http_hosts).chain(tls_hosts) {
         if let Some(base) = host.strip_prefix("*.") {
             if !base.is_empty() {
@@ -1240,7 +1249,7 @@ impl CachedPeerTable {
     /// Checks exact matches first, then wildcard patterns.
     pub fn get_route_by_host(&self, host: &str) -> Option<RouteInfo> {
         let snapshot = self.route_snapshot.load();
-        if snapshot.legacy.reserved_console_host.as_deref() == Some(host) {
+        if snapshot.legacy.is_reserved(host) {
             return None;
         }
 
@@ -1270,7 +1279,7 @@ impl CachedPeerTable {
     /// Checks exact matches first, then wildcard patterns.
     pub fn get_route_by_sni(&self, sni: &str) -> Option<RouteInfo> {
         let snapshot = self.route_snapshot.load();
-        if snapshot.legacy.reserved_console_host.as_deref() == Some(sni) {
+        if snapshot.legacy.is_reserved(sni) {
             return None;
         }
 
@@ -1295,7 +1304,7 @@ impl CachedPeerTable {
     /// and reject every certable host. O(1) per map, no I/O.
     pub fn resolve_route_for_sni(&self, sni: &str) -> Option<RouteInfo> {
         let snapshot = self.route_snapshot.load();
-        if snapshot.legacy.reserved_console_host.as_deref() == Some(sni) {
+        if snapshot.legacy.is_reserved(sni) {
             return None;
         }
         snapshot
@@ -1326,7 +1335,12 @@ impl CachedPeerTable {
             snapshot.legacy.exact.keys(),
             snapshot.http_routes.keys(),
             snapshot.tls_routes.keys(),
-            snapshot.legacy.reserved_console_host.clone(),
+            snapshot
+                .legacy
+                .reserved_console_host
+                .iter()
+                .chain(snapshot.legacy.reserved_ingress_host.iter())
+                .cloned(),
         );
         self.route_snapshot.store(Arc::new(snapshot));
     }
@@ -1345,6 +1359,16 @@ impl CachedPeerTable {
     pub fn reserve_hostname_for_test(&self, host: &str) {
         let mut snapshot = (*self.route_snapshot.load_full()).clone();
         snapshot.legacy.reserved_console_host = Some(host.to_string());
+        snapshot.ownership.reserved_hosts.insert(host.to_string());
+        self.route_snapshot.store(Arc::new(snapshot));
+    }
+
+    /// Reserve the public ingress hostname for cross-crate tests without
+    /// database setup.
+    #[doc(hidden)]
+    pub fn reserve_public_ingress_hostname_for_test(&self, host: &str) {
+        let mut snapshot = (*self.route_snapshot.load_full()).clone();
+        snapshot.legacy.reserved_ingress_host = Some(host.to_string());
         snapshot.ownership.reserved_hosts.insert(host.to_string());
         self.route_snapshot.store(Arc::new(snapshot));
     }
@@ -2778,6 +2802,24 @@ impl CachedPeerTable {
             }
         }
 
+        // The public ingress hostname is owned by the control plane for the
+        // same reason (ADR-051): a project route on it would swallow every
+        // third-party callback. The settings API refuses a hostname that is
+        // already routed, so this only fires for a route created by a path
+        // that bypassed that check.
+        let ingress_host = app_settings.dedicated_public_ingress_hostname();
+        if let Some(ingress_host) = ingress_host.as_ref() {
+            let removed = routes.remove(ingress_host).is_some()
+                | http_routes_map.remove(ingress_host).is_some()
+                | tls_routes_map.remove(ingress_host).is_some();
+            if removed {
+                warn!(
+                    "Ignoring project route for reserved public ingress hostname '{}' — Temps serves third-party callbacks on it (ADR-051)",
+                    ingress_host
+                );
+            }
+        }
+
         // A live route always wins over an unavailable entry for the same
         // host, whichever section recorded it, and the console hostname is
         // never reported as an application host. Lookups re-check live
@@ -2792,6 +2834,9 @@ impl CachedPeerTable {
             .retain(|base, _| !routes.contains_key(&format!("*.{base}")));
         if let Some(console_host) = app_settings.console_hostname() {
             unavailable.exact.remove(&console_host);
+        }
+        if let Some(ingress_host) = ingress_host.as_ref() {
+            unavailable.exact.remove(ingress_host);
         }
 
         // Build the wildcard index for legacy project/environment routes. A
@@ -2814,7 +2859,10 @@ impl CachedPeerTable {
             routes.keys(),
             http_routes_map.keys(),
             tls_routes_map.keys(),
-            app_settings.console_hostname(),
+            app_settings
+                .console_hostname()
+                .into_iter()
+                .chain(ingress_host.clone()),
         );
 
         // Atomically replace all route tables
@@ -2835,6 +2883,7 @@ impl CachedPeerTable {
                 exact: routes,
                 wildcards: legacy_wildcards_matcher,
                 reserved_console_host: app_settings.console_hostname(),
+                reserved_ingress_host: ingress_host,
             },
             ownership: route_ownership,
             unavailable,
@@ -2995,9 +3044,7 @@ impl CachedPeerTable {
         // The unavailable map is usually empty, so check it first: console
         // and unknown-host requests pay one hash lookup, not the full chain.
         let route = snapshot.unavailable.get(host)?;
-        if snapshot.legacy.reserved_console_host.as_deref() == Some(host)
-            || snapshot.has_live_route(host)
-        {
+        if snapshot.legacy.is_reserved(host) || snapshot.has_live_route(host) {
             return None;
         }
         Some(route.clone())
@@ -3012,15 +3059,33 @@ impl CachedPeerTable {
         self.route_snapshot.store(Arc::new(snapshot));
     }
 
-    /// Whether this hostname is reserved for the control-plane console.
-    /// Wake-on-request checks this before consulting sleeping wildcards.
+    /// Whether this hostname is reserved for the control plane: the console
+    /// hostname or the public ingress hostname. Wake-on-request checks this
+    /// before consulting sleeping wildcards.
     pub fn is_reserved_hostname(&self, host: &str) -> bool {
-        self.route_snapshot
-            .load()
-            .legacy
-            .reserved_console_host
-            .as_deref()
-            == Some(host)
+        self.route_snapshot.load().legacy.is_reserved(host)
+    }
+
+    /// Whether `host` is the dedicated public ingress hostname (ADR-051): an
+    /// explicit `public_ingress_url` whose host is not the console host.
+    ///
+    /// The proxy sends such a request to the public-only console surface, and
+    /// nowhere else. One lock-free snapshot load and one string comparison
+    /// with no allocation, so it is safe on the per-request path. `host` may
+    /// be a raw `Host` header: a `:port` suffix, a trailing dot and letter
+    /// case are ignored.
+    pub fn is_public_ingress_hostname(&self, host: &str) -> bool {
+        let snapshot = self.route_snapshot.load();
+        let Some(reserved) = snapshot.legacy.reserved_ingress_host.as_deref() else {
+            return false;
+        };
+        let host = match host.rsplit_once(':') {
+            Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+                name
+            }
+            _ => host,
+        };
+        reserved.eq_ignore_ascii_case(host.trim_end_matches('.'))
     }
 
     /// Return whether an active route or reserved control-plane hostname owns

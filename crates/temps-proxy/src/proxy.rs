@@ -1074,6 +1074,12 @@ pub struct ProxyContext {
     /// Set when the request matched a workspace preview hostname and passed
     /// auth — `upstream_peer` will route it to the local preview gateway.
     pub preview_route: Option<PreviewHost>,
+    /// The admin gate denied this request, so `upstream_peer` must send it to
+    /// the listener that serves only the console's public routes (ADR-051)
+    /// instead of resolving a peer. A non-allowlisted client can therefore
+    /// reach a tracking pixel or a provider webhook, and structurally nothing
+    /// else, because nothing else is mounted there.
+    pub public_surface_only: bool,
     /// The upstream confirmed a long-lived stream (SSE `text/event-stream`, or
     /// a `101` WebSocket upgrade). Such a session's total duration is a
     /// connection lifetime, not a latency, so `logging` keeps it out of the
@@ -1295,9 +1301,11 @@ impl LoadBalancer {
         mut self,
         state: Arc<temps_core::console_startup::ConsoleStartupState>,
         console_address: &str,
+        console_ingress_address: Option<&str>,
     ) -> Self {
         self.console_unavailable = Some(Arc::new(
-            crate::console_unavailable::ConsoleUnavailableResponder::new(state, console_address),
+            crate::console_unavailable::ConsoleUnavailableResponder::new(state, console_address)
+                .with_ingress_address(console_ingress_address),
         ));
         self
     }
@@ -1316,10 +1324,11 @@ impl LoadBalancer {
         Arc::clone(&self.proxy_metrics)
     }
 
-    /// Wire the shared admin-gate handle. When set, `request_filter`
-    /// short-circuits unknown-host requests with 404 unless the request
-    /// matches the gate (`/api/_temps/*` is always exempt because public
-    /// ingest must reach the console from any host).
+    /// Wire the shared admin-gate handle. When set, `request_filter` keeps
+    /// requests the gate denies away from the console: they are sent to the
+    /// public-only listener when one exists (ADR-051), and answered with a
+    /// 404 otherwise. `/api/_temps/*` is never gated because public ingest
+    /// must work from any host.
     pub fn with_admin_gate(mut self, handle: temps_core::admin_gate::AdminGateHandle) -> Self {
         self.admin_gate = Some(handle);
         self
@@ -1514,12 +1523,40 @@ impl LoadBalancer {
         })
     }
 
+    /// Whether this request is for the dedicated public ingress hostname
+    /// and a public-only listener exists to pin it to. Lock-free and
+    /// allocation-free: one `Option` check and one snapshot comparison.
+    fn is_public_ingress_request(&self, host: &str) -> bool {
+        self.upstream_resolver.console_ingress_address().is_some()
+            && self.upstream_resolver.is_public_ingress_host(host)
+    }
+
+    /// Decide where a request that is about to fall through to the console
+    /// may go, given the admin gate. Pure, so the three-way decision of
+    /// ADR-051 D4 is testable without a live session.
+    fn console_fall_through(
+        config: &temps_core::admin_gate::AdminGateConfig,
+        client_ip: std::net::IpAddr,
+        host: &str,
+        has_public_only_listener: bool,
+    ) -> ConsoleFallThrough {
+        if config.would_allow(client_ip, Some(host)) {
+            ConsoleFallThrough::Console
+        } else if has_public_only_listener {
+            ConsoleFallThrough::PublicSurfaceOnly
+        } else {
+            ConsoleFallThrough::NotFound
+        }
+    }
+
     /// Decide whether the admin gate should be consulted for this request.
     ///
     /// The gate is only meaningful when it's non-noop, the request isn't a
     /// workspace/sandbox preview (those carry their own auth), and the path
-    /// isn't a public temps ingest endpoint (`/api/_temps/*` must reach the
-    /// console from any host). Even when this returns `true`, the caller
+    /// isn't a public temps ingest endpoint (`/api/_temps/*` must work from
+    /// any host; the resolver sends it to the public-only listener when one
+    /// exists, so skipping the gate exposes nothing else). Even when this
+    /// returns `true`, the caller
     /// must still consult `has_route_for_host` first so legitimate project
     /// traffic is never gated — only console fall-throughs are.
     fn should_consult_admin_gate(
@@ -3989,6 +4026,36 @@ fn is_connect_failure(error: &Error) -> bool {
     )
 }
 
+/// Where a request with no project route may go once the admin gate has
+/// been consulted (ADR-051 D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsoleFallThrough {
+    /// The gate allows the client: the full console (dashboard + admin API).
+    Console,
+    /// The gate denies the client: only the console's public routes, on the
+    /// listener that mounts nothing else.
+    PublicSurfaceOnly,
+    /// The gate denies the client and there is no public-only listener to
+    /// hand it to: the proxy answers 404 itself.
+    NotFound,
+}
+
+/// The control-plane listener `peer_addr` belongs to, for timeout purposes.
+///
+/// The public-only listener (ADR-051) is the same console process as
+/// `console_addr`, so a request routed there gets the console's fixed
+/// timeout rather than whatever customer traffic is configured to use.
+fn control_plane_address<'a>(
+    peer_addr: &str,
+    console_addr: &'a str,
+    ingress_addr: Option<&'a str>,
+) -> &'a str {
+    match ingress_addr {
+        Some(ingress) if !ingress.is_empty() && peer_addr == ingress => ingress,
+        _ => console_addr,
+    }
+}
+
 /// Console/control-plane traffic always gets a fixed timeout, regardless of
 /// what customer app traffic is configured to use — a `None` (no timeout)
 /// resolved for customer traffic must never leak into the console path.
@@ -4609,6 +4676,7 @@ impl ProxyHttp for LoadBalancer {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            public_surface_only: false,
             streaming_session: false,
             connection_permit: None,
         }
@@ -6667,10 +6735,17 @@ impl ProxyHttp for LoadBalancer {
         // Admin gate: when a non-noop gate is wired and the request is
         // about to fall back to the console (no deployed app for this host,
         // not a public ingest path under /api/_temps/*, not a preview),
-        // require the (IP, Host) tuple to pass the gate. If it doesn't,
-        // return a 404 from the proxy itself so the management surface is
-        // invisible from non-admin hosts.
-        if let Some(gate) = self.admin_gate.as_ref() {
+        // require the (IP, Host) tuple to pass the gate. If it doesn't, the
+        // management surface must stay invisible from non-admin hosts.
+        //
+        // The public ingress hostname (ADR-051) is not gated at all: the
+        // resolver pins it to the public-only listener for every client, so
+        // there is no management surface behind it to protect.
+        if let Some(gate) = self
+            .admin_gate
+            .as_ref()
+            .filter(|_| !self.is_public_ingress_request(&ctx.host))
+        {
             let config = gate.current();
             if Self::should_consult_admin_gate(&config, &ctx.path, ctx.preview_route.is_some()) {
                 let host_has_route = self.upstream_resolver.has_route_for_host(&ctx.host).await;
@@ -6680,26 +6755,50 @@ impl ProxyHttp for LoadBalancer {
                         .as_deref()
                         .and_then(|s| s.parse::<std::net::IpAddr>().ok())
                         .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
-                    if !config.would_allow(client_ip, Some(&ctx.host)) {
-                        warn!(
-                            host = %ctx.host,
-                            client_ip = %client_ip,
-                            path = %ctx.path,
-                            "admin gate denied request to non-admin host"
-                        );
-                        let mut response = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
-                        response.insert_header("Cache-Control", "no-store")?;
-                        response.insert_header("X-Request-ID", &ctx.request_id)?;
-                        response.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                        let body =
-                            Bytes::from(crate::branded_404::render(&ctx.host, &ctx.request_id));
-                        response.insert_header("Content-Length", body.len().to_string())?;
-                        session
-                            .write_response_header(Box::new(response), false)
-                            .await?;
-                        session.write_response_body(Some(body), true).await?;
-                        ctx.routing_status = "admin_gate_denied".to_string();
-                        return Ok(true);
+                    match Self::console_fall_through(
+                        &config,
+                        client_ip,
+                        &ctx.host,
+                        self.upstream_resolver.console_ingress_address().is_some(),
+                    ) {
+                        ConsoleFallThrough::Console => {}
+                        // A denied client is still a legitimate caller of the
+                        // public routes: a mail client fetching a tracking
+                        // pixel, a git provider delivering a push. Hand it to
+                        // the listener that mounts those and nothing else.
+                        // That listener answers everything that is not a
+                        // public route with a 404, so the console stays as
+                        // invisible as when the proxy answered itself.
+                        ConsoleFallThrough::PublicSurfaceOnly => {
+                            debug!(
+                                host = %ctx.host,
+                                client_ip = %client_ip,
+                                path = %ctx.path,
+                                "admin gate denied request; serving the public-only surface"
+                            );
+                            ctx.public_surface_only = true;
+                        }
+                        ConsoleFallThrough::NotFound => {
+                            warn!(
+                                host = %ctx.host,
+                                client_ip = %client_ip,
+                                path = %ctx.path,
+                                "admin gate denied request to non-admin host"
+                            );
+                            let mut response = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
+                            response.insert_header("Cache-Control", "no-store")?;
+                            response.insert_header("X-Request-ID", &ctx.request_id)?;
+                            response.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                            let body =
+                                Bytes::from(crate::branded_404::render(&ctx.host, &ctx.request_id));
+                            response.insert_header("Content-Length", body.len().to_string())?;
+                            session
+                                .write_response_header(Box::new(response), false)
+                                .await?;
+                            session.write_response_body(Some(body), true).await?;
+                            ctx.routing_status = "admin_gate_denied".to_string();
+                            return Ok(true);
+                        }
                     }
                 }
             }
@@ -7061,17 +7160,32 @@ impl ProxyHttp for LoadBalancer {
             domain, path
         );
 
-        // Use the upstream resolver trait
-        // Pass SNI hostname for TLS-based routing
-        let selection = self
-            .upstream_resolver
-            .resolve_peer_for_request(
-                &domain,
-                &path,
-                session.req_header().method.as_str(),
-                ctx.sni_hostname.as_deref(),
-            )
-            .await?;
+        // The admin gate denied this request: it may reach the console's
+        // public routes and nothing else (ADR-051). Skip resolution entirely
+        // so no path or `Host` can steer it to another peer.
+        let public_surface_address = ctx
+            .public_surface_only
+            .then(|| self.upstream_resolver.console_ingress_address())
+            .flatten();
+        let selection = match public_surface_address {
+            Some(ingress_address) => PeerSelection {
+                peer: Box::new(HttpPeer::new(ingress_address, false, String::new())),
+                container_id: None,
+                container_name: None,
+            },
+            // Use the upstream resolver trait
+            // Pass SNI hostname for TLS-based routing
+            None => {
+                self.upstream_resolver
+                    .resolve_peer_for_request(
+                        &domain,
+                        &path,
+                        session.req_header().method.as_str(),
+                        ctx.sni_hostname.as_deref(),
+                    )
+                    .await?
+            }
+        };
 
         let mut peer = selection.peer;
 
@@ -7134,9 +7248,14 @@ impl ProxyHttp for LoadBalancer {
         // RST'd out from under a handler that goes on to finish successfully
         // server-side — the import completes, but the browser sees a 503
         // and the user has no way to know it worked.
+        let peer_address = peer.address().to_string();
         let io_timeout = upstream_io_timeout(
-            &peer.address().to_string(),
-            self.upstream_resolver.console_address(),
+            &peer_address,
+            control_plane_address(
+                &peer_address,
+                self.upstream_resolver.console_address(),
+                self.upstream_resolver.console_ingress_address(),
+            ),
             is_websocket,
             customer_io_timeout,
         );
@@ -7436,6 +7555,102 @@ mod admin_gate_tests {
         assert!(LoadBalancer::should_consult_admin_gate(&config, "/", false,));
     }
 
+    // ADR-051 D4: the three-way console fall-through.
+
+    #[test]
+    fn allowlisted_client_reaches_the_full_console() {
+        let config = AdminGateConfig::from_parts(
+            &["203.0.113.0/24".to_string()],
+            &[],
+            false,
+            AdminGateSource::Db,
+        )
+        .expect("valid gate");
+        let admin: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        for has_listener in [true, false] {
+            assert_eq!(
+                LoadBalancer::console_fall_through(
+                    &config,
+                    admin,
+                    "console.example.com",
+                    has_listener
+                ),
+                ConsoleFallThrough::Console
+            );
+        }
+    }
+
+    #[test]
+    fn denied_client_gets_only_the_public_surface() {
+        let config = AdminGateConfig::from_parts(
+            &["203.0.113.0/24".to_string()],
+            &[],
+            false,
+            AdminGateSource::Db,
+        )
+        .expect("valid gate");
+        let stranger: std::net::IpAddr = "198.51.100.20".parse().unwrap();
+        assert_eq!(
+            LoadBalancer::console_fall_through(&config, stranger, "console.example.com", true),
+            ConsoleFallThrough::PublicSurfaceOnly,
+            "a mail client or webhook sender must reach the public routes"
+        );
+    }
+
+    #[test]
+    fn denied_client_keeps_the_404_without_a_public_only_listener() {
+        let config = gated(&["console.example.com"]);
+        let stranger: std::net::IpAddr = "198.51.100.20".parse().unwrap();
+        assert_eq!(
+            LoadBalancer::console_fall_through(&config, stranger, "other.example.com", false),
+            ConsoleFallThrough::NotFound,
+            "a split proxy with no ingress address must behave as before"
+        );
+    }
+
+    #[test]
+    fn host_allowlist_denial_also_falls_through_to_the_public_surface() {
+        let config = gated(&["console.example.com"]);
+        let client: std::net::IpAddr = "198.51.100.20".parse().unwrap();
+        assert_eq!(
+            LoadBalancer::console_fall_through(&config, client, "console.example.com", true),
+            ConsoleFallThrough::Console
+        );
+        assert_eq!(
+            LoadBalancer::console_fall_through(&config, client, "203.0.113.5", true),
+            ConsoleFallThrough::PublicSurfaceOnly
+        );
+    }
+
+    #[test]
+    fn public_only_listener_gets_the_console_timeout() {
+        let console = "127.0.0.1:8081";
+        let ingress = "127.0.0.1:8082";
+        assert_eq!(
+            control_plane_address(ingress, console, Some(ingress)),
+            ingress
+        );
+        assert_eq!(
+            control_plane_address(console, console, Some(ingress)),
+            console
+        );
+        assert_eq!(
+            control_plane_address("10.0.0.9:3000", console, None),
+            console
+        );
+        // A request routed to the public-only listener is control-plane
+        // traffic: it must not inherit a customer timeout (or lack of one).
+        assert_eq!(
+            upstream_io_timeout(
+                ingress,
+                control_plane_address(ingress, console, Some(ingress)),
+                false,
+                None
+            ),
+            Some(std::time::Duration::from_secs(CONSOLE_IO_TIMEOUT_SECS))
+        );
+    }
+
     // Regression: setting an admin host (e.g. `app.temps.kfs.es`) used to
     // 404 every project deployment because the gate consulted
     // `has_custom_route`, which only knows about operator-defined LB
@@ -7731,6 +7946,7 @@ mod markdown_tests {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            public_surface_only: false,
             streaming_session: false,
             connection_permit: None,
         }
@@ -8265,6 +8481,7 @@ mod markdown_pipeline_tests {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            public_surface_only: false,
             streaming_session: false,
             connection_permit: None,
         }

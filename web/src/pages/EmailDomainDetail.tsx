@@ -88,6 +88,7 @@ import {
   Trash2,
   Wand2,
 } from 'lucide-react'
+import { PublicIngressNotice } from '@/components/settings/PublicIngressNotice'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
@@ -569,6 +570,9 @@ export function EmailDomainDetail() {
         facts={domainFacts(domain, provider, verifiedCount, totalCount)}
         main={
           <>
+            <PublicIngressNotice
+              title="Opens, clicks and delivery events will not be recorded"
+            />
             {domain.verification_error ? (
               <Callout
                 tone={domain.status === 'pending' ? 'warning' : 'error'}

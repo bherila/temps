@@ -36,6 +36,8 @@ import {
 import type { AgentRunResponse as AgentRun } from '@/api/client/types.gen'
 import { AutopilotStatusBadge } from './AutopilotStatusBadge'
 import { settingsSectionHref } from '@/lib/project-settings-sections'
+import { usePublicIngress } from '@/hooks/usePublicIngress'
+import { publicIngressCallbackUrl } from '@/lib/publicIngress'
 
 interface AgentDetailPageProps {
   project: ProjectResponse
@@ -148,6 +150,13 @@ function TriggerRow({
 function AgentProperties({ agent }: { agent: Agent }) {
   const cronSchedule = agent.trigger_config?.schedule?.cron
   const nextRun = nextCronRun(cronSchedule)
+  // Whatever triggers the agent calls from outside, so the URL to hand out
+  // is the public ingress URL rather than the address being browsed.
+  const { baseUrl: publicIngressUrl } = usePublicIngress()
+  const webhookTriggerUrl = publicIngressCallbackUrl(
+    publicIngressUrl,
+    agent.webhook_url ?? ''
+  )
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -326,15 +335,12 @@ function AgentProperties({ agent }: { agent: Agent }) {
                 <label className="text-xs text-muted-foreground">URL</label>
                 <div className="flex items-center gap-2">
                   <code className="text-xs bg-muted px-2 py-1.5 rounded flex-1 overflow-x-auto">
-                    POST {window.location.origin}
-                    {agent.webhook_url}
+                    POST {webhookTriggerUrl}
                   </code>
                   <button
                     type="button"
                     onClick={() => {
-                      navigator.clipboard.writeText(
-                        `${window.location.origin}${agent.webhook_url}`
-                      )
+                      navigator.clipboard.writeText(webhookTriggerUrl)
                       toast.success('URL copied')
                     }}
                     className="text-muted-foreground hover:text-foreground p-1"
