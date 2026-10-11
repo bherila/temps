@@ -239,6 +239,65 @@ use super::deployment_token_service::DeploymentTokenService;
 
 const BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG: &str = "BUILDKIT_CACHE_MOUNT_NS";
 
+/// Plaintext job-config field listing the build arguments whose values may
+/// be sent to a worker build. Names only, like `build_args_keys`.
+pub(crate) const WORKER_BUILD_ARG_KEYS_FIELD: &str = "worker_build_arg_keys";
+
+/// Values the planner knows to be public: the project's variables that are
+/// not marked secret, and the platform's own non-secret values (the bind
+/// address, the browser Sentry DSN and tunnel, the API and OTLP endpoints,
+/// asset prefixes). A build argument may be sent to a worker build only when
+/// its final value is the one recorded here, so a secret source that sets the
+/// same name later -- a secrets-manager binding, a linked service, a platform
+/// token -- keeps it on the control plane.
+///
+/// Deliberately not `Debug`: it holds values.
+#[derive(Default)]
+pub(crate) struct PublicBuildValues(std::collections::HashMap<String, String>);
+
+impl PublicBuildValues {
+    pub(crate) fn record(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        self.0.insert(name.into(), value.into());
+    }
+
+    /// Record each of `names` with its current value in `env`, for values
+    /// the platform itself just set.
+    fn record_present(&mut self, env: &std::collections::HashMap<String, String>, names: &[&str]) {
+        for name in names {
+            if let Some(value) = env.get(*name) {
+                self.record(*name, value.clone());
+            }
+        }
+    }
+
+    /// The names in `build_args` whose values may be sent to a worker build,
+    /// sorted. Never a `BUILDKIT_*` argument (the cache namespace travels on
+    /// its own) or the `.npmrc` credentials.
+    pub(crate) fn worker_build_arg_keys(
+        &self,
+        build_args: &std::collections::HashMap<String, String>,
+    ) -> Vec<String> {
+        let mut keys: Vec<String> = build_args
+            .iter()
+            .filter(|(name, value)| self.0.get(name.as_str()) == Some(*value))
+            .map(|(name, _)| name.clone())
+            .filter(|name| {
+                temps_deployer::build_protocol::is_worker_build_arg_name(name)
+                    && !matches!(name.as_str(), "NPM_TOKEN" | "NPM_RC")
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+}
+
+/// A deployment's resolved variables, with the record of which of their
+/// values are public.
+struct DeploymentVariables {
+    values: std::collections::HashMap<String, String>,
+    public: PublicBuildValues,
+}
+
 /// Derive an opaque, stable namespace for BuildKit cache mounts.
 ///
 /// Cache mounts are writable and live on a shared builder. A public namespace
@@ -411,18 +470,20 @@ impl WorkflowPlanner {
         project: &projects::Model,
         environment: &environments::Model,
         deployment: &deployments::Model,
-    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    ) -> anyhow::Result<(std::collections::HashMap<String, String>, PublicBuildValues)> {
         use std::collections::{BTreeMap, HashMap};
         use temps_entities::{env_var_environments, env_vars, project_services};
 
         let mut env_vars_map = HashMap::new();
         let mut explicit_project_vars = HashMap::new();
+        let mut public_values = PublicBuildValues::default();
 
         // Add default HOST environment variable
         // This ensures containers bind to all network interfaces (0.0.0.0)
         // which is required for external access via port mapping
         // Can be overridden by user-defined environment variables
         env_vars_map.insert("HOST".to_string(), "0.0.0.0".to_string());
+        public_values.record("HOST", "0.0.0.0");
 
         // 1. Get environment variables for this project and environment
         // Query through the env_var_environments junction table to get all env vars
@@ -457,6 +518,9 @@ impl WorkflowPlanner {
                 } else {
                     env_var.value
                 };
+                if !env_var.is_secret {
+                    public_values.record(env_var.key.clone(), value.clone());
+                }
                 explicit_project_vars.insert(env_var.key, value);
             }
         }
@@ -683,6 +747,14 @@ impl WorkflowPlanner {
                         if let Some(tunnel_var) = public_sentry_tunnel_var(project.preset) {
                             env_vars_map.insert(tunnel_var.to_string(), sentry_tunnel);
                         }
+
+                        // A DSN carries only a public key -- browser bundles
+                        // embed it -- and the tunnel is a path, so a worker
+                        // build may receive all four.
+                        let mut sentry_vars = vec!["SENTRY_DSN", "SENTRY_TUNNEL"];
+                        sentry_vars.extend(public_sentry_dsn_var(project.preset));
+                        sentry_vars.extend(public_sentry_tunnel_var(project.preset));
+                        public_values.record_present(&env_vars_map, &sentry_vars);
                     }
                     Err(e) => {
                         // Warn about Sentry DSN failure but don't fail the deployment
@@ -723,6 +795,7 @@ impl WorkflowPlanner {
             Ok(base_url) => {
                 // Set the API URL - this is always available
                 env_vars_map.insert("TEMPS_API_URL".to_string(), format!("{}/api", base_url));
+                public_values.record_present(&env_vars_map, &["TEMPS_API_URL"]);
 
                 // Get or create the deployment token
                 match self
@@ -805,6 +878,17 @@ impl WorkflowPlanner {
                     .or_insert_with(|| commit_sha.clone());
             }
 
+            // The headers carry the deployment token and stay unrecorded.
+            public_values.record_present(
+                &env_vars_map,
+                &[
+                    "OTEL_EXPORTER_OTLP_ENDPOINT",
+                    "OTEL_EXPORTER_OTLP_PROTOCOL",
+                    "OTEL_SERVICE_NAME",
+                    "OTEL_SERVICE_VERSION",
+                ],
+            );
+
             debug!(
                 "Set OTEL_EXPORTER_OTLP_ENDPOINT for project {} environment {}",
                 project.id, environment.id
@@ -816,7 +900,7 @@ impl WorkflowPlanner {
             env_vars_map.len(),
             env_vars_map.keys().cloned().collect::<Vec<_>>().join(", ")
         );
-        Ok(env_vars_map)
+        Ok((env_vars_map, public_values))
     }
 
     /// Gathers secrets visible to this deployment, decrypted and keyed by name.
@@ -1408,7 +1492,7 @@ impl WorkflowPlanner {
         );
 
         // Gather environment variables for the deployment
-        let mut env_vars = self
+        let (mut env_vars, mut public_values) = self
             .gather_environment_variables(project, environment, deployment)
             .await?;
 
@@ -1447,6 +1531,14 @@ impl WorkflowPlanner {
             project.preset,
             &deployment.slug,
             default_port,
+        );
+        public_values.record_present(
+            &env_vars,
+            &[
+                "PORT",
+                "TEMPS_ASSET_PREFIX",
+                "NEXT_PUBLIC_TEMPS_ASSET_PREFIX",
+            ],
         );
 
         debug!(
@@ -1518,23 +1610,15 @@ impl WorkflowPlanner {
                 self.plan_static_bundle_deployment(project, environment, deployment, env_vars)
                     .await
             }
-            SourceType::Git => {
+            SourceType::Git | SourceType::UploadedSource => {
                 self.plan_git_deployment(
                     project,
                     environment,
                     deployment,
-                    env_vars,
-                    remote_env_plan,
-                    secrets,
-                )
-                .await
-            }
-            SourceType::UploadedSource => {
-                self.plan_git_deployment(
-                    project,
-                    environment,
-                    deployment,
-                    env_vars,
+                    DeploymentVariables {
+                        values: env_vars,
+                        public: public_values,
+                    },
                     remote_env_plan,
                     secrets,
                 )
@@ -1567,10 +1651,14 @@ impl WorkflowPlanner {
         project: &projects::Model,
         environment: &environments::Model,
         deployment: &deployments::Model,
-        mut env_vars: std::collections::HashMap<String, String>,
+        variables: DeploymentVariables,
         remote_env_plan: RemoteEnvironmentPlan,
         secrets: std::collections::HashMap<String, String>,
     ) -> anyhow::Result<Vec<JobDefinition>> {
+        let DeploymentVariables {
+            values: mut env_vars,
+            public: mut public_values,
+        } = variables;
         let mut jobs = Vec::new();
 
         let source_bundle_path = deployment
@@ -1593,9 +1681,10 @@ impl WorkflowPlanner {
         // Inject SENTRY_RELEASE so the SDK tags events with the correct release version.
         // This must match the release used for source map uploads.
         if let Some(ref commit_sha) = deployment.commit_sha {
-            env_vars
-                .entry("SENTRY_RELEASE".to_string())
-                .or_insert_with(|| commit_sha.clone());
+            if !env_vars.contains_key("SENTRY_RELEASE") {
+                env_vars.insert("SENTRY_RELEASE".to_string(), commit_sha.clone());
+                public_values.record("SENTRY_RELEASE", commit_sha.clone());
+            }
         }
 
         // Inject Sentry source map upload env vars so `@sentry/nextjs` (and other Sentry
@@ -1604,23 +1693,31 @@ impl WorkflowPlanner {
         //
         // Docker builds use networkmode "host" (BuildKit) so the container can reach the
         // Temps server. Auth uses deployment tokens (dt_*) validated via the Sentry-compat API.
+        //
+        // The URL, organization and project are public; a value a project
+        // variable already set keeps whatever classification it had.
+        // SENTRY_AUTH_TOKEN is the deployment token and stays unrecorded.
         if let Some(api_url) = env_vars.get("TEMPS_API_URL").cloned() {
             let sentry_url = api_url.trim_end_matches("/api").to_string();
-            env_vars
-                .entry("SENTRY_URL".to_string())
-                .or_insert(sentry_url);
+            if !env_vars.contains_key("SENTRY_URL") {
+                public_values.record("SENTRY_URL", sentry_url.clone());
+                env_vars.insert("SENTRY_URL".to_string(), sentry_url);
+            }
         }
         if let Some(api_token) = env_vars.get("TEMPS_API_TOKEN").cloned() {
             env_vars
                 .entry("SENTRY_AUTH_TOKEN".to_string())
                 .or_insert(api_token);
         }
-        env_vars
-            .entry("SENTRY_ORG".to_string())
-            .or_insert_with(|| "default".to_string());
-        env_vars
-            .entry("SENTRY_PROJECT".to_string())
-            .or_insert_with(|| project.slug.clone());
+        for (name, value) in [
+            ("SENTRY_ORG", "default".to_string()),
+            ("SENTRY_PROJECT", project.slug.clone()),
+        ] {
+            if !env_vars.contains_key(name) {
+                public_values.record(name, value.clone());
+                env_vars.insert(name.to_string(), value);
+            }
+        }
 
         // Check if git info is available
         let has_git_info = !project.repo_owner.is_empty() && !project.repo_name.is_empty();
@@ -1772,6 +1869,10 @@ impl WorkflowPlanner {
             });
             if let Some(obj) = build_job_config.as_object_mut() {
                 self.seal_sensitive_field(obj, deployment, "build_args", &build_args_map)?;
+                obj.insert(
+                    WORKER_BUILD_ARG_KEYS_FIELD.to_string(),
+                    serde_json::json!(public_values.worker_build_arg_keys(&build_args_map)),
+                );
             }
 
             // Job 2: Build image (for static deployments, this builds the static files inside container)
@@ -1879,6 +1980,10 @@ impl WorkflowPlanner {
             });
             if let Some(obj) = build_job_config.as_object_mut() {
                 self.seal_sensitive_field(obj, deployment, "build_args", &build_args_map)?;
+                obj.insert(
+                    WORKER_BUILD_ARG_KEYS_FIELD.to_string(),
+                    serde_json::json!(public_values.worker_build_arg_keys(&build_args_map)),
+                );
             }
 
             jobs.push(JobDefinition {
@@ -4428,5 +4533,238 @@ mod tests {
                 "must fail closed for {config}"
             );
         }
+    }
+
+    /// A name is sent to a worker build only while its final value is the
+    /// one recorded as public: a secret source that later sets the same name
+    /// keeps it on the control plane.
+    #[test]
+    fn public_build_values_follow_the_final_value() {
+        let mut public = PublicBuildValues::default();
+        public.record("HOST", "0.0.0.0");
+        public.record("VITE_API_URL", "https://api.example.test");
+        public.record("SENTRY_RELEASE", "abc123");
+        public.record("NPM_TOKEN", "recorded-but-never-sent");
+        public.record("BUILDKIT_SYNTAX", "recorded-but-never-sent");
+        let build_args: std::collections::HashMap<String, String> = [
+            ("HOST", "0.0.0.0"),
+            ("VITE_API_URL", "https://api.example.test"),
+            // Overridden later by a secret source.
+            ("SENTRY_RELEASE", "secret-override"),
+            ("TEMPS_API_TOKEN", "never-recorded"),
+            ("NPM_TOKEN", "recorded-but-never-sent"),
+            ("BUILDKIT_SYNTAX", "recorded-but-never-sent"),
+            (BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG, "ns"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+        assert_eq!(
+            public.worker_build_arg_keys(&build_args),
+            vec!["HOST".to_string(), "VITE_API_URL".to_string()]
+        );
+    }
+
+    /// Issue #1344, at the planner, for every preset in the catalog
+    /// (`temps_presets::all_presets`): the build job records which of the
+    /// variables it carries a worker may receive. That always includes the
+    /// platform's public Sentry DSN and tunnel for the framework and the
+    /// project's non-secret variables, never a secret or a platform
+    /// credential -- so the platform's own variables can neither block nor
+    /// downgrade a worker build.
+    #[tokio::test]
+    async fn every_preset_plan_lets_worker_builds_receive_public_variables(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::{env_var_environments, env_vars};
+
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping every-preset worker variables test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let encryption_service = create_test_encryption_service();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            encryption_service.clone(),
+        );
+        const PUBLIC_USER_VARS: [&str; 4] = [
+            "VITE_API_URL",
+            "NEXT_PUBLIC_SITE_NAME",
+            "PUBLIC_SITE_TITLE",
+            "REACT_APP_FEATURE",
+        ];
+        const SECRET_USER_VARS: [&str; 2] = ["VITE_PRIVATE_TOKEN", "DATABASE_URL"];
+
+        let mut planned = Vec::new();
+        for (index, catalog_preset) in temps_presets::all_presets().into_iter().enumerate() {
+            let slug = catalog_preset.slug();
+            let stored = catalog_preset.resolve_storage(None)?;
+            if stored.preset == Preset::DockerCompose {
+                continue;
+            }
+            let project = projects::ActiveModel {
+                name: Set(format!("Worker vars {slug}")),
+                slug: Set(format!("worker-vars-{index}")),
+                repo_owner: Set("test-owner".to_string()),
+                repo_name: Set("test-repo".to_string()),
+                main_branch: Set("main".to_string()),
+                git_provider_connection_id: Set(Some(1)),
+                preset: Set(stored.preset),
+                preset_config: Set(stored.config.clone()),
+                directory: Set("/".to_string()),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+            let environment = environments::ActiveModel {
+                project_id: Set(project.id),
+                name: Set("Production".to_string()),
+                slug: Set("production".to_string()),
+                host: Set(format!("worker-vars-{index}.example.com")),
+                upstreams: Set(UpstreamList::default()),
+                subdomain: Set(format!("worker-vars-{index}.example.com")),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+            let deployment = deployments::ActiveModel {
+                project_id: Set(project.id),
+                environment_id: Set(environment.id),
+                slug: Set(format!("worker-vars-{index}-deployment")),
+                state: Set("pending".to_string()),
+                metadata: Set(Some(
+                    temps_entities::deployments::DeploymentMetadata::default(),
+                )),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+            for (key, is_secret) in PUBLIC_USER_VARS
+                .iter()
+                .map(|key| (*key, false))
+                .chain(SECRET_USER_VARS.iter().map(|key| (*key, true)))
+            {
+                let variable = env_vars::ActiveModel {
+                    project_id: Set(project.id),
+                    environment_id: Set(Some(environment.id)),
+                    key: Set(key.to_string()),
+                    value: Set(format!("synthetic-{}", key.to_ascii_lowercase())),
+                    is_secret: Set(is_secret),
+                    ..Default::default()
+                }
+                .insert(db.as_ref())
+                .await?;
+                env_var_environments::ActiveModel {
+                    env_var_id: Set(variable.id),
+                    environment_id: Set(environment.id),
+                    ..Default::default()
+                }
+                .insert(db.as_ref())
+                .await?;
+            }
+
+            let jobs = planner
+                .create_deployment_jobs(
+                    deployment.id,
+                    temps_core::docker_socket_grant::DeployCaller::Platform,
+                )
+                .await?;
+            let Some(build_job) = jobs.iter().find(|job| job.job_id == "build_image") else {
+                // Nothing to build (e.g. a plain static site).
+                continue;
+            };
+            let config = build_job
+                .job_config
+                .as_ref()
+                .expect("a build job has configuration");
+            let build_args = crate::services::sensitive_envelope::read_sealed(
+                config,
+                Some(&encryption_service),
+                "build_args",
+            )?;
+            let keys: std::collections::BTreeSet<String> = config
+                .get(WORKER_BUILD_ARG_KEYS_FIELD)
+                .and_then(|value| value.as_array())
+                .unwrap_or_else(|| panic!("{slug}: no {WORKER_BUILD_ARG_KEYS_FIELD}"))
+                .iter()
+                .filter_map(|key| key.as_str().map(str::to_owned))
+                .collect();
+
+            let mut must_send: Vec<&str> = PUBLIC_USER_VARS.to_vec();
+            must_send.extend(["HOST", "SENTRY_DSN", "SENTRY_TUNNEL", "TEMPS_API_URL"]);
+            must_send.extend(public_sentry_dsn_var(stored.preset));
+            must_send.extend(public_sentry_tunnel_var(stored.preset));
+            for name in must_send {
+                assert!(build_args.contains_key(name), "{slug}: {name} not planned");
+                assert!(
+                    keys.contains(name),
+                    "{slug}: {name} is withheld from workers"
+                );
+            }
+            for name in SECRET_USER_VARS.iter().copied().chain([
+                "TEMPS_API_TOKEN",
+                "CRON_SECRET",
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                "SENTRY_AUTH_TOKEN",
+                BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG,
+            ]) {
+                assert!(
+                    !keys.contains(name),
+                    "{slug}: {name} would leave the control plane"
+                );
+            }
+            for key in &keys {
+                assert!(
+                    build_args.contains_key(key),
+                    "{slug}: {key} is not a build arg"
+                );
+            }
+            // Only the project's own secret inlined variable could keep this
+            // build off a worker; the platform's variables never do.
+            assert_eq!(
+                crate::jobs::build_image::build_inlined_variables(
+                    build_args
+                        .keys()
+                        .filter(|name| !keys.contains(*name))
+                        .map(String::as_str)
+                ),
+                vec!["VITE_PRIVATE_TOKEN".to_string()],
+                "{slug}"
+            );
+            planned.push(slug);
+        }
+        for slug in [
+            "nextjs",
+            "vite",
+            "rsbuild",
+            "docusaurus",
+            "autopack",
+            "dockerfile",
+        ] {
+            assert!(
+                planned.iter().any(|planned| planned == slug),
+                "{slug} not planned"
+            );
+        }
+        Ok(())
     }
 }
