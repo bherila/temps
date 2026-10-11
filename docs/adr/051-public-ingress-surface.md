@@ -107,6 +107,12 @@ router without being able to reach anything else.
   - Its host must not be a project domain, the preview wildcard, or an
     unroutable host (loopback, `*.localho.st`, private ranges). This is the
     same check the Worker Nodes page applies to join URLs (ADR-048 D2a).
+  - "A project domain" means any name the proxy serves for an application,
+    not only a stored domain row: a name a wildcard route covers, a name
+    generated from an environment's subdomain, and the names of stopped,
+    sleeping or not-yet-deployed environments. The route table is the only
+    place that knows all of them, so the check runs against a fresh load of
+    it, and the setting is refused when that check cannot run.
 - It is written through the settings API, audit-logged like every settings
   write, and editable from the console. It is **not** an environment
   variable. `temps setup` may accept it as a one-shot first-boot input,

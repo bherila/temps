@@ -1198,12 +1198,19 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         Ok(self.get_settings().await?.effective_public_ingress_url())
     }
 
-    /// Name the kind of project-facing record that already routes `host`, or
-    /// `None` when the hostname is free.
+    /// Name the kind of stored domain record that covers `host`, or `None`
+    /// when no record does.
     ///
-    /// The public ingress hostname is reserved for the platform: once set, the
-    /// route table drops any project route for it. Refusing a hostname that is
-    /// already in use turns that silent takeover into a validation error.
+    /// A record covers `host` when it names it exactly or is a single-label
+    /// wildcard over it (`*.example.com` covers `app.example.com`, matching
+    /// how the proxy resolves wildcards).
+    ///
+    /// This sees records the route table does not serve yet — a custom domain
+    /// on an environment that was never deployed — but it is not the whole
+    /// answer: names generated from an environment's subdomain are not stored
+    /// as domain rows at all. Callers that must know whether a hostname is in
+    /// use combine it with the route table's own check
+    /// (`RouteTableRefresher::application_serving_host`).
     pub async fn hostname_claimed_by(
         &self,
         host: &str,
@@ -1214,8 +1221,15 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         if host.is_empty() {
             return Ok(None);
         }
+        let mut candidates = vec![host.clone()];
+        if let Some((label, parent)) = host.split_once('.') {
+            if !label.is_empty() && !parent.is_empty() {
+                candidates.push(format!("*.{parent}"));
+            }
+        }
+
         if project_custom_domains::Entity::find()
-            .filter(project_custom_domains::Column::Domain.eq(host.as_str()))
+            .filter(project_custom_domains::Column::Domain.is_in(candidates.clone()))
             .one(self.db.as_ref())
             .await?
             .is_some()
@@ -1223,7 +1237,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             return Ok(Some("a project custom domain"));
         }
         if environment_domains::Entity::find()
-            .filter(environment_domains::Column::Domain.eq(host.as_str()))
+            .filter(environment_domains::Column::Domain.is_in(candidates.clone()))
             .one(self.db.as_ref())
             .await?
             .is_some()
@@ -1231,7 +1245,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             return Ok(Some("an environment domain"));
         }
         if custom_routes::Entity::find()
-            .filter(custom_routes::Column::Domain.eq(host.as_str()))
+            .filter(custom_routes::Column::Domain.is_in(candidates))
             .one(self.db.as_ref())
             .await?
             .is_some()
@@ -5783,6 +5797,48 @@ mod tests {
         assert_eq!(
             svc.hostname_claimed_by("hooks.example.com").await.unwrap(),
             Some("an environment domain")
+        );
+    }
+
+    // A wildcard record serves every name one label below it, so reserving
+    // such a name would take the application behind the wildcard offline.
+    #[tokio::test]
+    async fn hostname_claimed_by_looks_for_the_wildcard_that_covers_the_host() {
+        use temps_entities::project_custom_domains;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![project_custom_domains::Model {
+                    id: 7,
+                    project_id: 3,
+                    environment_id: 4,
+                    domain: "*.example.com".into(),
+                    redirect_to: None,
+                    status_code: None,
+                    branch: None,
+                    status: "active".into(),
+                    message: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    certificate_id: None,
+                    service_name: None,
+                }]])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        assert_eq!(
+            svc.hostname_claimed_by("App.Example.com").await.unwrap(),
+            Some("a project custom domain")
+        );
+        // The query asked for the exact name and for the wildcard one label up.
+        drop(svc);
+        let db = Arc::into_inner(db).expect("the service was the only other owner");
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(log.contains("app.example.com"), "{log}");
+        assert!(log.contains("*.example.com"), "{log}");
+        assert!(
+            !log.contains("*.com"),
+            "a wildcard stands for exactly one label: {log}"
         );
     }
 

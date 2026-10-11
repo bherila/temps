@@ -2325,11 +2325,23 @@ fn preserve_cloud_settings_not_sent_by_every_client(
 /// through untouched, so an unrelated save never fails over a field the
 /// client did not change (the rules may have tightened since it was stored).
 /// A new value must be a bare, internet-reachable origin whose hostname no
-/// project already routes: the route table reserves it for the platform, and
+/// application uses: the route table reserves it for the platform, and
 /// reserving a hostname that is serving an application would take that
 /// application down without anyone having asked for it.
+///
+/// "In use" is decided in two places, and both must agree the name is free:
+///
+/// - the stored domain records, exact or wildcard, which also cover a domain
+///   attached to an environment that was never deployed;
+/// - the route table, freshly loaded, which is the only place that knows the
+///   names generated from an environment's subdomain, wildcard matches as
+///   the proxy resolves them, stopped deployments and sleeping environments.
+///
+/// Without a route table there is no way to rule those out, so the change is
+/// refused rather than accepted unchecked.
 async fn validate_public_ingress_url(
     config_service: &ConfigService,
+    route_table: Option<&dyn temps_core::route_table::RouteTableRefresher>,
     submitted: Option<String>,
     stored: Option<&str>,
     preview_domain: &str,
@@ -2357,29 +2369,58 @@ async fn validate_public_ingress_url(
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .unwrap_or_default();
-    match config_service.hostname_claimed_by(&host).await {
-        Ok(None) => Ok(Some(normalized)),
-        Ok(Some(owner)) => Err(ErrorBuilder::new(StatusCode::CONFLICT)
+
+    let in_use = |owner: &str| {
+        ErrorBuilder::new(StatusCode::CONFLICT)
             .title("Public Ingress Hostname In Use")
             .detail(format!(
-                "'{host}' is already routed by {owner}. The public ingress hostname is \
-                 reserved for Temps itself, so setting it would take that route offline. \
-                 Remove the route first, or choose a hostname no project uses."
+                "'{host}' is already used by {owner}. The public ingress hostname is \
+                 reserved for Temps itself, so setting it would take that application \
+                 offline. Choose a hostname no application uses, or remove the route first."
             ))
             .value("field", "public_ingress_url")
-            .build()),
+            .build()
+    };
+    let unverifiable = |why: String| {
+        ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .title("Settings Save Aborted")
+            .detail(format!(
+                "Could not check whether '{host}' is already used by an application, so the \
+                 public ingress URL was not saved: {why}"
+            ))
+            .build()
+    };
+
+    match config_service.hostname_claimed_by(&host).await {
+        Ok(None) => {}
+        Ok(Some(owner)) => return Err(in_use(owner)),
         Err(e) => {
             error!(
-                "Could not check whether public ingress hostname '{}' is in use: {}",
+                "Could not check stored domains for public ingress hostname '{}': {}",
                 host, e
             );
-            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Settings Save Aborted")
-                .detail(format!(
-                    "Could not check whether '{host}' is already routed by a project, so the \
-                     public ingress URL was not saved: {e}"
-                ))
-                .build())
+            return Err(unverifiable(e.to_string()));
+        }
+    }
+
+    let Some(route_table) = route_table else {
+        error!(
+            "No route table is available to check public ingress hostname '{}'; refusing the change",
+            host
+        );
+        return Err(unverifiable(
+            "the route table is not available in this process".to_string(),
+        ));
+    };
+    match route_table.application_serving_host(&host).await {
+        Ok(None) => Ok(Some(normalized)),
+        Ok(Some(owner)) => Err(in_use(&owner)),
+        Err(e) => {
+            error!(
+                "Could not check the route table for public ingress hostname '{}': {}",
+                host, e
+            );
+            Err(unverifiable(e.to_string()))
         }
     }
 }
@@ -3182,6 +3223,7 @@ async fn update_settings(
     settings.internal_url = sanitize_optional_url("Internal", settings.internal_url)?;
     settings.public_ingress_url = validate_public_ingress_url(
         &app_state.config_service,
+        app_state.route_table_refresher.as_deref(),
         settings.public_ingress_url.take(),
         previous_public_ingress_url.as_deref(),
         &settings.preview_domain,
@@ -3884,6 +3926,37 @@ mod tests {
         )
     }
 
+    /// A route table that reports one fixed answer and records what it was
+    /// asked, so a test can also prove it was not consulted at all.
+    #[derive(Default)]
+    struct StubRouteTable {
+        serving: Option<&'static str>,
+        fails: bool,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[temps_core::async_trait::async_trait]
+    impl temps_core::route_table::RouteTableRefresher for StubRouteTable {
+        async fn refresh_routes(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(0)
+        }
+
+        async fn application_serving_host(
+            &self,
+            host: &str,
+        ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+            self.asked.lock().unwrap().push(host.to_string());
+            if self.fails {
+                return Err("route table reload failed".into());
+            }
+            Ok(self.serving.map(str::to_string))
+        }
+    }
+
+    fn free_route_table() -> StubRouteTable {
+        StubRouteTable::default()
+    }
+
     fn free_hostname_db() -> sea_orm::MockDatabase {
         use temps_entities::{custom_routes, environment_domains, project_custom_domains};
         sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
@@ -3897,6 +3970,7 @@ mod tests {
         let svc = ingress_config_service(free_hostname_db());
         let saved = validate_public_ingress_url(
             &svc,
+            Some(&free_route_table()),
             Some("  https://Hooks.Example.com/ ".into()),
             None,
             "apps.example.com",
@@ -3915,6 +3989,7 @@ mod tests {
         for submitted in [None, Some(String::new()), Some("   ".to_string())] {
             let saved = validate_public_ingress_url(
                 &svc,
+                Some(&free_route_table()),
                 submitted,
                 Some("https://hooks.example.com"),
                 "apps.example.com",
@@ -3933,6 +4008,7 @@ mod tests {
         ));
         let saved = validate_public_ingress_url(
             &svc,
+            Some(&free_route_table()),
             Some("http://10.0.0.5".into()),
             Some("http://10.0.0.5"),
             "apps.example.com",
@@ -3954,10 +4030,15 @@ mod tests {
             "http://hooks.localho.st",
             "https://apps.example.com",
         ] {
-            let problem =
-                validate_public_ingress_url(&svc, Some(url.into()), None, "apps.example.com")
-                    .await
-                    .expect_err("an invalid ingress URL must be rejected");
+            let problem = validate_public_ingress_url(
+                &svc,
+                Some(&free_route_table()),
+                Some(url.into()),
+                None,
+                "apps.example.com",
+            )
+            .await
+            .expect_err("an invalid ingress URL must be rejected");
             assert_eq!(problem.status_code, StatusCode::BAD_REQUEST, "{url}");
             assert_eq!(
                 problem.body.get("field").and_then(|v| v.as_str()),
@@ -3981,6 +4062,7 @@ mod tests {
         let svc = ingress_config_service(db);
         let problem = validate_public_ingress_url(
             &svc,
+            Some(&free_route_table()),
             Some("https://shop.example.com".into()),
             None,
             "apps.example.com",
@@ -4000,6 +4082,7 @@ mod tests {
         let svc = ingress_config_service(db);
         let problem = validate_public_ingress_url(
             &svc,
+            Some(&free_route_table()),
             Some("https://hooks.example.com".into()),
             None,
             "apps.example.com",
@@ -4007,6 +4090,103 @@ mod tests {
         .await
         .expect_err("an unverifiable hostname must not be saved");
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // The stored domain rows say nothing about a name a wildcard route covers
+    // or one generated from an environment's subdomain. The route table does,
+    // and reserving such a name would stop serving the application behind it.
+    #[tokio::test]
+    async fn public_ingress_url_on_a_host_the_route_table_serves_is_a_conflict() {
+        for owner in [
+            "a deployed application",
+            "an environment's generated hostname",
+            "a sleeping on-demand environment",
+        ] {
+            let svc = ingress_config_service(free_hostname_db());
+            let route_table = StubRouteTable {
+                serving: Some(owner),
+                ..Default::default()
+            };
+            let problem = validate_public_ingress_url(
+                &svc,
+                Some(&route_table),
+                Some("https://App.Example.com".into()),
+                None,
+                "apps.example.com",
+            )
+            .await
+            .expect_err("a hostname the proxy serves must be refused");
+            assert_eq!(problem.status_code, StatusCode::CONFLICT, "{owner}");
+            let detail = problem.body.get("detail").and_then(|v| v.as_str()).unwrap();
+            assert!(detail.contains("app.example.com"), "{detail}");
+            assert!(detail.contains(owner), "{detail}");
+            assert_eq!(
+                route_table.asked.lock().unwrap().as_slice(),
+                ["app.example.com"],
+                "the route table is asked about the normalized hostname"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_ingress_url_is_not_saved_when_the_route_table_cannot_answer() {
+        // A failed reload, or no route table at all: either way nothing rules
+        // out an application on that name, so the change is refused.
+        let svc = ingress_config_service(free_hostname_db());
+        let failing = StubRouteTable {
+            fails: true,
+            ..Default::default()
+        };
+        let problem = validate_public_ingress_url(
+            &svc,
+            Some(&failing),
+            Some("https://hooks.example.com".into()),
+            None,
+            "apps.example.com",
+        )
+        .await
+        .expect_err("an unverifiable hostname must not be saved");
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let svc = ingress_config_service(free_hostname_db());
+        let problem = validate_public_ingress_url(
+            &svc,
+            None,
+            Some("https://hooks.example.com".into()),
+            None,
+            "apps.example.com",
+        )
+        .await
+        .expect_err("without a route table the hostname cannot be verified");
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem.body.get("detail").and_then(|v| v.as_str()).unwrap();
+        assert!(detail.contains("route table"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn clearing_or_keeping_the_public_ingress_url_never_reloads_routes() {
+        let svc = ingress_config_service(sea_orm::MockDatabase::new(
+            sea_orm::DatabaseBackend::Postgres,
+        ));
+        let route_table = free_route_table();
+        for (submitted, stored) in [
+            (None, Some("https://hooks.example.com")),
+            (
+                Some("https://hooks.example.com".to_string()),
+                Some("https://hooks.example.com"),
+            ),
+        ] {
+            validate_public_ingress_url(
+                &svc,
+                Some(&route_table),
+                submitted,
+                stored,
+                "apps.example.com",
+            )
+            .await
+            .expect("an unchanged or cleared value needs no check");
+        }
+        assert!(route_table.asked.lock().unwrap().is_empty());
     }
 
     #[test]
