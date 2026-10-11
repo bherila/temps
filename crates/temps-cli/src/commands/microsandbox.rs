@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use temps_agents::sandbox::microsandbox::{
     microsandbox_capability, MicrosandboxSandboxConfig, MICROSANDBOX_VERSION,
 };
-#[cfg(not(target_env = "musl"))]
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 use {
     std::collections::HashMap,
     std::time::{Duration, Instant},
@@ -32,9 +32,9 @@ use {
     temps_agents::sandbox::{SandboxBackend, SandboxCreateConfig, SandboxProvider},
 };
 
-#[cfg(not(target_env = "musl"))]
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 const SMOKE_LABEL: &str = "setup-smoke";
-#[cfg(not(target_env = "musl"))]
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 const SMOKE_IMAGE: &str = "alpine:3.20";
 
 /// Manage the microsandbox microVM sandbox backend (experimental)
@@ -118,16 +118,16 @@ impl MicrosandboxSetupCommand {
         self.install(config).await
     }
 
-    /// musl builds don't link the microsandbox SDK, so there is nothing to
-    /// install; say why instead.
-    #[cfg(target_env = "musl")]
+    /// musl and Intel macOS builds don't link the microsandbox SDK, so there
+    /// is nothing to install; say why instead.
+    #[cfg(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64")))]
     async fn install(self, config: MicrosandboxSandboxConfig) -> anyhow::Result<()> {
         let capability = microsandbox_capability(&config.data_dir);
         fail(&capability.reason.unwrap_or_default());
         anyhow::bail!("this temps build cannot run the microsandbox backend")
     }
 
-    #[cfg(not(target_env = "musl"))]
+    #[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
     async fn install(self, config: MicrosandboxSandboxConfig) -> anyhow::Result<()> {
         let provider = MicrosandboxSandboxProvider::new(config)?;
 
@@ -167,7 +167,7 @@ impl MicrosandboxSetupCommand {
     }
 }
 
-#[cfg(not(target_env = "musl"))]
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 async fn smoke_test(provider: &MicrosandboxSandboxProvider) -> anyhow::Result<()> {
     let config = SandboxCreateConfig {
         run_id: 0,
@@ -226,7 +226,7 @@ fn ok(message: &str) {
     println!("  {} {}", "✓".green().bold(), message);
 }
 
-#[cfg(not(target_env = "musl"))]
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 fn warn(message: &str) {
     println!("  {} {}", "!".yellow().bold(), message);
 }

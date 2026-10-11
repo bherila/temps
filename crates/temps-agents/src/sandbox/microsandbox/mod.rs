@@ -31,17 +31,17 @@
 //! ADR-050 for the confinement applied today and what is deferred.
 //!
 //! The SDK-backed provider lives in [`sdk`] and is compiled for every target
-//! except musl, where the SDK's VMM crate does not build; there the backend
-//! reports itself unavailable with that reason. Everything here — status,
-//! host probing, configuration — is target-independent.
+//! except musl and Intel macOS, where the SDK's VMM crate does not build;
+//! there the backend reports itself unavailable with that reason. Everything
+//! here — status, host probing, configuration — is target-independent.
 
 use std::path::{Path, PathBuf};
 
 use crate::error::AgentError;
 
-#[cfg(not(target_env = "musl"))]
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 mod sdk;
-#[cfg(not(target_env = "musl"))]
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 pub use sdk::MicrosandboxSandboxProvider;
 
 /// VM name prefix — the routing provider dispatches recovery on this, and it
@@ -273,7 +273,7 @@ pub fn microsandbox_capability(data_dir: &Path) -> MicrosandboxCapability {
 }
 
 /// Whether the pinned runtime pair is installed under the config's home.
-#[cfg(not(target_env = "musl"))]
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 fn runtime_probe(config: &MicrosandboxSandboxConfig) -> Result<(), MicrosandboxUnavailable> {
     sdk::runtime_probe(config)
 }
@@ -284,6 +284,17 @@ fn runtime_probe(config: &MicrosandboxSandboxConfig) -> Result<(), MicrosandboxU
 fn runtime_probe(_config: &MicrosandboxSandboxConfig) -> Result<(), MicrosandboxUnavailable> {
     Err(MicrosandboxUnavailable::UnsupportedBuild {
         target: "musl".to_string(),
+    })
+}
+
+/// Intel macOS builds don't link the SDK either: its VMM crate needs KVM
+/// bindings there, and the runtime only supports macOS on Apple Silicon.
+/// `host_virtualization` already rejects this host before the probe runs.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn runtime_probe(_config: &MicrosandboxSandboxConfig) -> Result<(), MicrosandboxUnavailable> {
+    Err(MicrosandboxUnavailable::UnsupportedPlatform {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
     })
 }
 
