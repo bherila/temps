@@ -4,8 +4,8 @@
 use axum::{
     body::Bytes,
     extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, State},
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -114,6 +114,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/{project_id}/store/", post(ingest_sentry_event))
         .route("/{project_id}/envelope/", post(ingest_sentry_envelope))
+        .route(SENTRY_TUNNEL_ROUTE_PATH, post(ingest_tunneled_envelope))
         // Sentry simple cron check-in "ping" URL (GET or POST), e.g.
         // /api/{project_id}/cron/{monitor_slug}/{sentry_key}/?status=ok
         .route(
