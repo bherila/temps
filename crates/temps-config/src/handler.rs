@@ -2322,12 +2322,14 @@ fn preserve_cloud_settings_not_sent_by_every_client(
 /// Validate a submitted `public_ingress_url` (ADR-051 D1).
 ///
 /// Blank clears the setting. A value identical to the stored one is passed
-/// through untouched, so an unrelated save never fails over a field the
-/// client did not change (the rules may have tightened since it was stored).
-/// A new value must be a bare, internet-reachable origin whose hostname no
-/// application uses: the route table reserves it for the platform, and
-/// reserving a hostname that is serving an application would take that
-/// application down without anyone having asked for it.
+/// through, so an unrelated save never fails over a field the client did not
+/// change (the rules may have tightened since it was stored); it is only
+/// checked against the preview domain, which the same save may be changing.
+/// A new value must be a bare, internet-reachable origin outside the preview
+/// domain's generated namespace, whose hostname no application uses: the
+/// route table reserves it for the platform, and reserving a hostname that is
+/// serving an application would take that application down without anyone
+/// having asked for it.
 ///
 /// "In use" is decided in two places, and both must agree the name is free:
 ///
@@ -2353,6 +2355,27 @@ async fn validate_public_ingress_url(
         return Ok(None);
     };
     if stored.map(str::trim) == Some(raw.as_str()) {
+        // Unchanged, so not re-validated — with one exception. The preview
+        // domain may be what changed in this save, and moving it onto the
+        // stored ingress hostname creates the same collision as moving the
+        // ingress hostname into it: generated names and workspace previews
+        // would share a namespace with the callback host.
+        let stored_host = url::Url::parse(&raw)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_default();
+        if let Some(conflict) =
+            temps_core::public_ingress::preview_namespace_conflict(&stored_host, preview_domain)
+        {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Preview Domain Conflicts With Public Ingress URL")
+                .detail(format!(
+                    "{conflict}. Change the public ingress URL first, or choose a preview \
+                     domain that does not contain it."
+                ))
+                .value("field", "preview_domain")
+                .build());
+        }
         return Ok(Some(raw));
     }
 
@@ -4161,6 +4184,75 @@ mod tests {
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
         let detail = problem.body.get("detail").and_then(|v| v.as_str()).unwrap();
         assert!(detail.contains("route table"), "{detail}");
+    }
+
+    // The generated namespace is refused outright, before any lookup: a name
+    // directly under the preview domain can belong to an environment that
+    // exists now or one created later, and a `ws-` shaped one is a sandbox
+    // preview to the proxy.
+    #[tokio::test]
+    async fn public_ingress_url_inside_the_preview_namespace_is_refused_without_a_lookup() {
+        // Nothing queued and a route table that records being asked.
+        let svc = ingress_config_service(sea_orm::MockDatabase::new(
+            sea_orm::DatabaseBackend::Postgres,
+        ));
+        let route_table = free_route_table();
+        for url in [
+            "https://hooks.apps.example.com",
+            "https://shop-production.apps.example.com",
+            "https://ws-0123456789abcdef-3000.apps.example.com",
+        ] {
+            let problem = validate_public_ingress_url(
+                &svc,
+                Some(&route_table),
+                Some(url.into()),
+                None,
+                "*.apps.example.com",
+            )
+            .await
+            .expect_err("a name inside the generated namespace must be refused");
+            assert_eq!(problem.status_code, StatusCode::BAD_REQUEST, "{url}");
+            let detail = problem.body.get("detail").and_then(|v| v.as_str()).unwrap();
+            assert!(detail.contains("inside the preview domain"), "{detail}");
+        }
+        assert!(route_table.asked.lock().unwrap().is_empty());
+    }
+
+    // The collision can also be created from the other side, by moving the
+    // preview domain onto an ingress hostname that was fine when it was saved.
+    #[tokio::test]
+    async fn a_preview_domain_moved_onto_the_stored_ingress_hostname_is_refused() {
+        let svc = ingress_config_service(sea_orm::MockDatabase::new(
+            sea_orm::DatabaseBackend::Postgres,
+        ));
+        let stored = "https://hooks.example.com";
+
+        let problem = validate_public_ingress_url(
+            &svc,
+            Some(&free_route_table()),
+            Some(stored.into()),
+            Some(stored),
+            "example.com",
+        )
+        .await
+        .expect_err("the unchanged ingress host is now inside the preview namespace");
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            problem.body.get("field").and_then(|v| v.as_str()),
+            Some("preview_domain")
+        );
+
+        // An unrelated save, with the preview domain where it was, still passes.
+        let saved = validate_public_ingress_url(
+            &svc,
+            Some(&free_route_table()),
+            Some(stored.into()),
+            Some(stored),
+            "apps.example.com",
+        )
+        .await
+        .expect("an unchanged pair is not re-validated");
+        assert_eq!(saved.as_deref(), Some(stored));
     }
 
     #[tokio::test]

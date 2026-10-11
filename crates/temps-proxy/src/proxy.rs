@@ -4026,6 +4026,22 @@ fn is_connect_failure(error: &Error) -> bool {
     )
 }
 
+/// The workspace preview a request is for, if any.
+///
+/// A host that is the reserved public ingress hostname is never a preview,
+/// even when it has the `ws-<id>-<port>` shape: it must reach the callback
+/// routes, not preview authentication or the preview gateway.
+///
+/// `is_public_ingress_host` is only consulted for a host that parses as a
+/// preview, so ordinary requests pay nothing for the check.
+fn preview_host_for_request(
+    host: &str,
+    preview_domain: &str,
+    is_public_ingress_host: impl FnOnce() -> bool,
+) -> Option<PreviewHost> {
+    parse_preview_host(host, preview_domain).filter(|_| !is_public_ingress_host())
+}
+
 /// Where a request with no project route may go once the admin gate has
 /// been consulted (ADR-051 D4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4919,8 +4935,18 @@ impl ProxyHttp for LoadBalancer {
         //
         // HTTP Basic auth is NOT supported — see `preview_auth.rs` for
         // rationale.
+        //
+        // The public ingress hostname (ADR-051) is never a preview, whatever
+        // it looks like: it is reserved for the platform's callback routes,
+        // and treating a `ws-` shaped one as a sandbox would answer provider
+        // callbacks with a login redirect or a 404. The settings API refuses
+        // such a hostname; this keeps the guarantee if one is stored anyway.
         if let Ok(settings) = self.config_service.get_settings().await {
-            if let Some(preview_host) = parse_preview_host(&ctx.host, &settings.preview_domain) {
+            if let Some(preview_host) =
+                preview_host_for_request(&ctx.host, &settings.preview_domain, || {
+                    self.upstream_resolver.is_public_ingress_host(&ctx.host)
+                })
+            {
                 let client_ip = ctx
                     .ip_address
                     .as_deref()
@@ -7619,6 +7645,26 @@ mod admin_gate_tests {
         assert_eq!(
             LoadBalancer::console_fall_through(&config, client, "203.0.113.5", true),
             ConsoleFallThrough::PublicSurfaceOnly
+        );
+    }
+
+    #[test]
+    fn the_public_ingress_host_is_never_treated_as_a_workspace_preview() {
+        let preview_shaped = "ws-0123456789abcdef-3000.apps.example.com";
+
+        // Ordinarily that host is a sandbox preview…
+        let preview = preview_host_for_request(preview_shaped, "apps.example.com", || false)
+            .expect("a ws- host under the preview domain is a preview");
+        assert_eq!(preview.port, 3000);
+        // …but not when it is the reserved callback hostname.
+        assert!(preview_host_for_request(preview_shaped, "apps.example.com", || true).is_none());
+        // An ordinary host is not a preview, and the ingress check is not
+        // even consulted for it.
+        assert!(
+            preview_host_for_request("hooks.example.com", "apps.example.com", || {
+                unreachable!("only preview-shaped hosts are checked")
+            })
+            .is_none()
         );
     }
 

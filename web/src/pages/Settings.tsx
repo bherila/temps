@@ -318,7 +318,7 @@ export function Settings() {
                 help={{
                   label: 'About the public ingress URL',
                   content:
-                    'The address third parties call back: email open and click tracking, git provider webhooks, SES delivery events, revenue webhooks and error-tracking DSNs. Set it when the console is restricted (VPN, firewall, allowlist), so only this hostname has to be public. Temps serves nothing but those callback routes on it.',
+                    'The address third parties call back: email open and click tracking, git provider webhooks, SES delivery events, revenue webhooks and error-tracking DSNs. Set it when the console is restricted (VPN, firewall, allowlist), so only this hostname has to be public. Temps serves nothing but those callback routes on it. Use a hostname outside the preview domain, which is reserved for the names Temps generates.',
                 }}
               >
                 {(fieldProps) => (

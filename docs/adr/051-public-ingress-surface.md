@@ -107,6 +107,18 @@ router without being able to reach anything else.
   - Its host must not be a project domain, the preview wildcard, or an
     unroutable host (loopback, `*.localho.st`, private ranges). This is the
     same check the Worker Nodes page applies to join URLs (ADR-048 D2a).
+  - "The preview wildcard" means every name it covers, not only the apex.
+    Each hostname Temps generates is a single label directly under the
+    preview domain: an environment, a deployment, a Compose service, a
+    workspace preview (`ws-<id>-<port>`). An ingress hostname there could
+    take over an application's name, now or when one is generated later,
+    and the proxy would handle a preview-shaped one as a sandbox preview
+    before it reached the callback routes. So the whole namespace is refused
+    rather than each generator being checked, and the same check runs when
+    the preview domain is changed onto a stored ingress hostname. A deeper
+    name (`hooks.cb.<preview>`) is not generated and stays allowed. As a
+    second line, the proxy never treats the reserved ingress hostname as a
+    workspace preview.
   - "A project domain" means any name the proxy serves for an application,
     not only a stored domain row: a name a wildcard route covers, a name
     generated from an environment's subdomain, and the names of stopped,
@@ -401,10 +413,10 @@ cover how to run it. Surfaces:
 
 Two things in the list below are narrower than the decision text:
 
-- **Certificates.** With on-demand TLS, the ingress hostname is exempt from
-  the route check exactly like the console hostname, so an in-zone ingress
-  host gets its certificate automatically. On a custom-domain install the
-  operator provisions it under Domains, as for the console host.
+- **Certificates.** The ingress hostname sits outside the preview domain
+  (D1), and on-demand TLS only issues inside that zone, so it does not cover
+  it. The operator provisions the certificate under Domains, as for a
+  console on a custom domain.
 - **`configured: false`.** With D4 in place the built-in gate no longer
   blocks callbacks, and an external restriction is invisible, so the only
   condition Temps can prove in Phase 1 is an unroutable effective host.

@@ -270,15 +270,10 @@ impl OnDemandCertManager {
         // Exemption: the console host (`console.<zone>`) is served as a
         // fall-through, not a `CachedPeerTable` route, so it has no route entry
         // to satisfy this check. It is nonetheless a stable, single host that
-        // should get on-demand HTTPS, so it bypasses the route check. The
-        // public ingress host (ADR-051) is the same shape — one
-        // operator-configured platform hostname with no route entry — and is
-        // exempt for the same reason. Everything else still requires a
-        // cert-eligible route, which is what keeps a random-SNI flood from
-        // creating issuance jobs.
-        if !self.is_console_host(&hostname)
-            && !self.route_table.is_public_ingress_hostname(&hostname)
-        {
+        // should get on-demand HTTPS, so it bypasses the route check. Everything
+        // else still requires a cert-eligible route, which is what keeps a
+        // random-SNI flood from creating issuance jobs.
+        if !self.is_console_host(&hostname) {
             match self.route_table.resolve_route_for_sni(&hostname) {
                 Some(route) if route.cert_eligible => {}
                 _ => {
@@ -765,45 +760,6 @@ mod tests {
         assert_eq!(
             calls.lock().unwrap().as_slice(),
             &["console.1.2.3.4.sslip.io".to_string()]
-        );
-    }
-
-    // ADR-051: the public ingress host is a platform hostname with no route
-    // entry, exactly like the console host, so it gets the same exemption.
-    #[tokio::test]
-    async fn test_gate_accepts_public_ingress_host_without_route() {
-        let (p, calls) = fake(true);
-        let rt = empty_route_table();
-        rt.reserve_public_ingress_hostname_for_test("hooks.1.2.3.4.sslip.io");
-        let mgr = manager_with("1.2.3.4.sslip.io", rt, Arc::clone(&p));
-
-        assert_eq!(
-            mgr.try_enqueue("hooks.1.2.3.4.sslip.io", ip()),
-            EnqueueOutcome::Enqueued
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(
-            calls.lock().unwrap().as_slice(),
-            &["hooks.1.2.3.4.sslip.io".to_string()]
-        );
-
-        // Another routeless in-zone host does not inherit the exemption.
-        assert_eq!(
-            mgr.try_enqueue("ghost.1.2.3.4.sslip.io", ip()),
-            EnqueueOutcome::SkippedNoRoute
-        );
-    }
-
-    #[tokio::test]
-    async fn test_public_ingress_exemption_still_requires_in_zone() {
-        let (p, _) = fake(true);
-        let rt = empty_route_table();
-        rt.reserve_public_ingress_hostname_for_test("hooks.example.com");
-        let mgr = manager_with("1.2.3.4.sslip.io", rt, p);
-
-        assert_eq!(
-            mgr.try_enqueue("hooks.example.com", ip()),
-            EnqueueOutcome::SkippedGate
         );
     }
 

@@ -47,9 +47,20 @@ pub enum PublicIngressUrlError {
 
     #[error(
         "Public ingress URL host '{host}' is the preview domain, which is reserved for \
-         deployment URLs. Use a dedicated hostname such as hooks.{host}"
+         deployment URLs. Use a dedicated hostname outside it"
     )]
     PreviewDomain { host: String },
+
+    #[error(
+        "Public ingress URL host '{host}' is inside the preview domain '{preview_domain}'. \
+         Temps generates the hostnames directly under it (environments, deployments, \
+         services and workspace previews), so a callback hostname there can collide with \
+         an application now or later. Use a hostname outside '{preview_domain}'"
+    )]
+    InsidePreviewDomain {
+        host: String,
+        preview_domain: String,
+    },
 }
 
 /// Where the effective ingress URL came from.
@@ -124,11 +135,53 @@ pub fn unroutable_host_reason(host: &str) -> Option<String> {
     None
 }
 
+/// Why `host` cannot be the public ingress hostname given the preview domain,
+/// or `None` when the two do not collide.
+///
+/// Every hostname Temps generates is a single label directly under the
+/// preview domain: an environment (`shop-production.<preview>`), a deployment,
+/// a Compose service, a workspace preview (`ws-<id>-<port>.<preview>`). The
+/// ingress hostname is reserved for the platform, so if it lived there it
+/// could take over a name an application has, or one an application is given
+/// later, and the proxy would treat a preview-shaped name as a sandbox
+/// preview before it ever reached the callback routes. Keeping the ingress
+/// hostname out of that namespace rules out the whole class, instead of
+/// chasing each generator.
+///
+/// A deeper name (`hooks.cb.<preview>`) is not generated and not matched by
+/// the preview wildcard, so it stays allowed.
+pub fn preview_namespace_conflict(
+    host: &str,
+    preview_domain: &str,
+) -> Option<PublicIngressUrlError> {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let preview = preview_domain
+        .trim()
+        .trim_start_matches("*.")
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host.is_empty() || preview.is_empty() {
+        return None;
+    }
+    if host == preview {
+        return Some(PublicIngressUrlError::PreviewDomain { host });
+    }
+    let generated_label = host
+        .strip_suffix(preview.as_str())
+        .and_then(|label| label.strip_suffix('.'))
+        .is_some_and(|label| !label.is_empty() && !label.contains('.'));
+    generated_label.then_some(PublicIngressUrlError::InsidePreviewDomain {
+        host,
+        preview_domain: preview,
+    })
+}
+
 /// Validate and canonicalise a submitted `public_ingress_url`.
 ///
 /// Returns `scheme://host[:port]` with no trailing slash. The URL must be a
-/// bare origin, because every callback path is appended to it, and its host
-/// must be one a third party can reach.
+/// bare origin, because every callback path is appended to it, its host must
+/// be one a third party can reach, and it must sit outside the namespace
+/// Temps generates hostnames in (see [`preview_namespace_conflict`]).
 pub fn normalize_public_ingress_url(
     raw: &str,
     preview_domain: &str,
@@ -174,13 +227,8 @@ pub fn normalize_public_ingress_url(
     if let Some(reason) = unroutable_host_reason(&host) {
         return Err(PublicIngressUrlError::UnroutableHost { host, reason });
     }
-    let preview = preview_domain
-        .trim()
-        .trim_start_matches("*.")
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    if !preview.is_empty() && preview == host {
-        return Err(PublicIngressUrlError::PreviewDomain { host });
+    if let Some(conflict) = preview_namespace_conflict(&host, preview_domain) {
+        return Err(conflict);
     }
 
     let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
@@ -364,19 +412,84 @@ mod tests {
     }
 
     #[test]
-    fn normalize_rejects_the_preview_domain_apex_but_not_a_name_under_it() {
+    fn normalize_rejects_the_preview_domain_apex() {
         assert_eq!(
             normalize_public_ingress_url("https://apps.example.com", "*.apps.example.com"),
             Err(PublicIngressUrlError::PreviewDomain {
                 host: "apps.example.com".to_string()
             })
         );
-        // The console itself is commonly `console.<preview domain>`; a
-        // reserved platform host takes precedence over the wildcard.
+    }
+
+    // Every generated hostname is a single label directly under the preview
+    // domain. An ingress hostname there could take over an application's
+    // name, now or once one is generated, and a preview-shaped one would be
+    // handled as a sandbox preview by the proxy.
+    #[test]
+    fn normalize_rejects_any_name_the_preview_wildcard_covers() {
+        for url in [
+            "https://hooks.apps.example.com",
+            "https://shop-production.apps.example.com",
+            "https://api--shop-production.apps.example.com",
+            "https://ws-0123456789abcdef-3000.apps.example.com",
+            "https://Hooks.Apps.Example.com.",
+        ] {
+            for preview in [
+                "apps.example.com",
+                "*.apps.example.com",
+                "Apps.Example.com.",
+            ] {
+                assert!(
+                    matches!(
+                        normalize_public_ingress_url(url, preview),
+                        Err(PublicIngressUrlError::InsidePreviewDomain { .. })
+                    ),
+                    "{url} is inside the generated namespace of {preview}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_accepts_names_outside_the_generated_namespace() {
+        for (url, expected) in [
+            // A sibling of the preview domain.
+            ("https://hooks.example.com", "https://hooks.example.com"),
+            // Deeper than one label: not generated, not matched by the wildcard.
+            (
+                "https://hooks.cb.apps.example.com",
+                "https://hooks.cb.apps.example.com",
+            ),
+            // Only looks like a suffix match.
+            (
+                "https://hooks.notapps.example.com",
+                "https://hooks.notapps.example.com",
+            ),
+            (
+                "https://hooksapps.example.com",
+                "https://hooksapps.example.com",
+            ),
+        ] {
+            assert_eq!(
+                normalize_public_ingress_url(url, "apps.example.com").as_deref(),
+                Ok(expected),
+                "{url}"
+            );
+        }
+        // No preview domain configured: nothing is generated anywhere.
+        assert!(normalize_public_ingress_url("https://hooks.example.com", "  ").is_ok());
+    }
+
+    #[test]
+    fn preview_namespace_conflict_names_both_sides() {
+        let conflict = preview_namespace_conflict("hooks.apps.example.com", "*.apps.example.com")
+            .expect("a single label under the preview domain conflicts");
+        let message = conflict.to_string();
+        assert!(message.contains("hooks.apps.example.com"), "{message}");
+        assert!(message.contains("'apps.example.com'"), "{message}");
         assert_eq!(
-            normalize_public_ingress_url("https://hooks.apps.example.com", "apps.example.com")
-                .unwrap(),
-            "https://hooks.apps.example.com"
+            preview_namespace_conflict("hooks.example.com", "apps.example.com"),
+            None
         );
     }
 
