@@ -23,9 +23,9 @@ use crate::services::monitor_service::{MonitorError, MonitorService, MonitorUpda
 #[openapi(
     paths(list_monitors, get_monitor, update_monitor, list_monitor_check_ins),
     components(schemas(
-        MonitorResponse,
-        MonitorListResponse,
-        UpdateMonitorRequest,
+        CronMonitorResponse,
+        CronMonitorListResponse,
+        UpdateCronMonitorRequest,
         MonitorCheckInResponse,
         MonitorCheckInListResponse,
     )),
@@ -64,7 +64,7 @@ pub struct PaginationQuery {
 // ===== Response/Request DTOs =====
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct MonitorResponse {
+pub struct CronMonitorResponse {
     pub id: i32,
     pub project_id: i32,
     pub environment_id: Option<i32>,
@@ -85,7 +85,7 @@ pub struct MonitorResponse {
     pub updated_at: String,
 }
 
-impl From<monitors::Model> for MonitorResponse {
+impl From<monitors::Model> for CronMonitorResponse {
     fn from(m: monitors::Model) -> Self {
         Self {
             id: m.id,
@@ -111,13 +111,13 @@ impl From<monitors::Model> for MonitorResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct MonitorListResponse {
-    pub items: Vec<MonitorResponse>,
+pub struct CronMonitorListResponse {
+    pub items: Vec<CronMonitorResponse>,
     pub total: u64,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct UpdateMonitorRequest {
+pub struct UpdateCronMonitorRequest {
     pub name: Option<String>,
     pub muted: Option<bool>,
     /// Per-monitor retention for check-in rows (minimum 1 day).
@@ -166,7 +166,7 @@ pub struct MonitorCheckInListResponse {
     path = "/projects/{project_id}/cron-monitors",
     params(("project_id" = i32, Path, description = "Project ID"), PaginationQuery),
     responses(
-        (status = 200, description = "List of monitors", body = MonitorListResponse),
+        (status = 200, description = "List of monitors", body = CronMonitorListResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
     ),
@@ -178,7 +178,7 @@ pub async fn list_monitors(
     RequireAuth(auth): RequireAuth,
     Path(project_id): Path<i32>,
     Query(pagination): Query<PaginationQuery>,
-) -> Result<Json<MonitorListResponse>, Problem> {
+) -> Result<Json<CronMonitorListResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
@@ -188,8 +188,8 @@ pub async fn list_monitors(
         .list_monitors(project_id, pagination.page, pagination.page_size)
         .await?;
 
-    Ok(Json(MonitorListResponse {
-        items: items.into_iter().map(MonitorResponse::from).collect(),
+    Ok(Json(CronMonitorListResponse {
+        items: items.into_iter().map(CronMonitorResponse::from).collect(),
         total,
     }))
 }
@@ -202,7 +202,7 @@ pub async fn list_monitors(
         ("monitor_id" = i32, Path, description = "Monitor ID")
     ),
     responses(
-        (status = 200, description = "Monitor", body = MonitorResponse),
+        (status = 200, description = "Monitor", body = CronMonitorResponse),
         (status = 404, description = "Not found", body = ProblemDetails),
     ),
     security(("bearer_auth" = [])),
@@ -212,7 +212,7 @@ pub async fn get_monitor(
     State(state): State<Arc<MonitorAppState>>,
     RequireAuth(auth): RequireAuth,
     Path((project_id, monitor_id)): Path<(i32, i32)>,
-) -> Result<Json<MonitorResponse>, Problem> {
+) -> Result<Json<CronMonitorResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
@@ -221,7 +221,7 @@ pub async fn get_monitor(
         .monitor_service
         .get_monitor(project_id, monitor_id)
         .await?;
-    Ok(Json(MonitorResponse::from(monitor)))
+    Ok(Json(CronMonitorResponse::from(monitor)))
 }
 
 #[utoipa::path(
@@ -231,9 +231,9 @@ pub async fn get_monitor(
         ("project_id" = i32, Path, description = "Project ID"),
         ("monitor_id" = i32, Path, description = "Monitor ID")
     ),
-    request_body = UpdateMonitorRequest,
+    request_body = UpdateCronMonitorRequest,
     responses(
-        (status = 200, description = "Updated monitor", body = MonitorResponse),
+        (status = 200, description = "Updated monitor", body = CronMonitorResponse),
         (status = 404, description = "Not found", body = ProblemDetails),
     ),
     security(("bearer_auth" = [])),
@@ -243,8 +243,8 @@ pub async fn update_monitor(
     State(state): State<Arc<MonitorAppState>>,
     RequireAuth(auth): RequireAuth,
     Path((project_id, monitor_id)): Path<(i32, i32)>,
-    Json(req): Json<UpdateMonitorRequest>,
-) -> Result<Json<MonitorResponse>, Problem> {
+    Json(req): Json<UpdateCronMonitorRequest>,
+) -> Result<Json<CronMonitorResponse>, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
@@ -263,7 +263,7 @@ pub async fn update_monitor(
         )
         .await?;
 
-    Ok(Json(MonitorResponse::from(monitor)))
+    Ok(Json(CronMonitorResponse::from(monitor)))
 }
 
 #[utoipa::path(
