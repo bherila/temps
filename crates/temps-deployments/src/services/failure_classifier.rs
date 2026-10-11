@@ -1683,6 +1683,9 @@ mod tests {
             "Failed to build image for linux/arm64: Invalid context: Worker builds cannot pass build-argument values yet, but 'Dockerfile' declares ARG TOKEN for a project variable that the build would silently lose. Build on the control plane, or remove the ARG",
             "Failed to build image for linux/arm64: Invalid context: Worker builds cannot use Dockerfile ARG instructions until build-argument credential handling is reviewed",
             "Failed to build image: Invalid context: Worker builds do not support cache_from image imports; use a local builder or remove cache_from",
+            "Worker builds cannot pass secret values: 'Dockerfile' declares ARG DATABASE_URL, but it is a secret, a platform credential or a BuildKit setting, which never leaves the control plane, so this build on worker node 2 would silently lose it.",
+            "Worker builds cannot tell which build arguments 'Dockerfile' reads: an ARG instruction names a variable reference, and secret values never leave the control plane.",
+            "Failed to build image: Invalid context: Worker builds cannot pass build argument 'BUILDKIT_SYNTAX': it is not a valid ARG name, or is a BUILDKIT_* argument a worker sets itself.",
         ] {
             assert_class(
                 &wrapped("build_image", detail),

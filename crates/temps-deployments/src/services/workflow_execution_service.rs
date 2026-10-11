@@ -245,30 +245,47 @@ struct OffloadBuildCandidate {
     platform: Option<String>,
 }
 
-/// Project variables a framework inlines into a generated build, which keep
-/// that build on the control plane. Names only, never values.
+/// Secret variables a framework inlines into the application, which keep an
+/// offloaded build on the control plane: a worker never receives a secret
+/// value, so the bundle it built would hold them empty. Names only.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "{names} {verb} inlined into the application at build time, and worker builds cannot \
-     receive project variables yet",
+    "{names} {verb} inlined into the application at build time, but {pronoun} secret, and \
+     secret values never leave the control plane for a worker build",
     names = .variables.join(", "),
-    verb = if .variables.len() == 1 { "is" } else { "are" }
+    verb = if .variables.len() == 1 { "is" } else { "are" },
+    pronoun = if .variables.len() == 1 { "it is" } else { "they are" }
 )]
 struct InlinedVariablesKeepBuildLocal {
     variables: Vec<String>,
 }
 
-/// A worker build receives no variable values, so a generated build that a
-/// framework inlines variables into would ship them empty.
+/// A worker build receives every value that is not secret -- the project's
+/// own variables and the platform's public ones alike -- so only a secret
+/// variable the framework inlines changes what a worker would build.
 fn inlined_variables_allow_offload(
-    inlined_build_variables: &[String],
+    withheld_inlined_variables: &[String],
 ) -> Result<(), InlinedVariablesKeepBuildLocal> {
-    if inlined_build_variables.is_empty() {
+    if withheld_inlined_variables.is_empty() {
         return Ok(());
     }
     Err(InlinedVariablesKeepBuildLocal {
-        variables: inlined_build_variables.to_vec(),
+        variables: withheld_inlined_variables.to_vec(),
     })
+}
+
+/// The inlined variables among `build_args` whose values a worker build
+/// would not receive (not in the planner's `worker_build_arg_keys`).
+fn withheld_inlined_variables<'a>(
+    build_args: impl IntoIterator<Item = &'a String>,
+    worker_build_arg_keys: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    crate::jobs::build_image::build_inlined_variables(
+        build_args
+            .into_iter()
+            .filter(|name| !worker_build_arg_keys.contains(*name))
+            .map(String::as_str),
+    )
 }
 
 /// Whether a build that the control plane would run can move to a worker
@@ -1203,23 +1220,23 @@ impl WorkflowExecutionService {
                 // build that needs them stays on the control plane.
                 let needs_npm_credentials =
                     crate::jobs::npmrc::plan_npmrc(&build_args_map).is_some();
-                // A worker build receives no variable values. Autopack builds
-                // there without them; any other generated build that inlines
-                // one stays here when it can (BuildImageJob refuses otherwise).
-                let inlined_build_variables = if temps_presets::get_preset_for_storage(
-                    project.preset,
-                    project.preset_config.as_ref(),
-                )
-                .ok()
-                .flatten()
-                .is_some_and(|preset| preset.uses_autopack())
-                {
-                    Vec::new()
-                } else {
-                    crate::jobs::build_image::build_inlined_variables(
-                        build_args_map.keys().map(String::as_str),
-                    )
-                };
+                // Names whose values may be sent to a worker build (names
+                // only, plaintext). A job planned before the field existed
+                // has none: a worker then receives no value at all.
+                let worker_build_arg_keys: std::collections::BTreeSet<String> = config
+                    .get(crate::services::workflow_planner::WORKER_BUILD_ARG_KEYS_FIELD)
+                    .and_then(|value| value.as_array())
+                    .map(|keys| {
+                        keys.iter()
+                            .filter_map(|key| key.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Only a secret value the framework inlines changes what a
+                // worker builds; such a build stays here when it can.
+                let inlined_build_variables =
+                    withheld_inlined_variables(build_args_map.keys(), &worker_build_arg_keys);
+                builder = builder.worker_build_arg_keys(worker_build_arg_keys);
                 if !build_args_map.is_empty() {
                     let build_args: Vec<(String, String)> = build_args_map.into_iter().collect();
                     builder = builder.build_args(build_args);
@@ -4201,17 +4218,55 @@ mod tests {
         }
     }
 
-    /// A build whose framework inlines a project variable stays on the
-    /// control plane, naming the variable (never its value); platform and
-    /// runtime-only variables never keep a build there.
+    /// Only a secret variable the framework inlines keeps an offloaded build
+    /// on the control plane, named (never its value). The platform's public
+    /// variables -- `VITE_SENTRY_DSN`, `VITE_SENTRY_TUNNEL` and the other
+    /// frameworks' equivalents -- and the project's non-secret variables are
+    /// sent to the worker, so they never keep a build here (issue #1344).
     #[test]
     fn inlined_build_variables_keep_offloaded_builds_local() {
-        use super::inlined_variables_allow_offload;
+        use super::{inlined_variables_allow_offload, withheld_inlined_variables};
+        use std::collections::BTreeSet;
+
+        let build_args: Vec<String> = [
+            "HOST",
+            "SENTRY_DSN",
+            "VITE_SENTRY_DSN",
+            "VITE_SENTRY_TUNNEL",
+            "NEXT_PUBLIC_SENTRY_DSN",
+            "PUBLIC_SENTRY_TUNNEL",
+            "VITE_API_URL",
+            "VITE_PRIVATE_KEY",
+            "TEMPS_API_TOKEN",
+            "BUILDKIT_CACHE_MOUNT_NS",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let sent: BTreeSet<String> = build_args
+            .iter()
+            .filter(|name| !matches!(name.as_str(), "VITE_PRIVATE_KEY" | "TEMPS_API_TOKEN"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            withheld_inlined_variables(&build_args, &sent),
+            vec!["VITE_PRIVATE_KEY".to_string()]
+        );
+        let all_public: BTreeSet<String> = sent
+            .iter()
+            .cloned()
+            .chain(["VITE_PRIVATE_KEY".to_string()])
+            .collect();
+        assert_eq!(
+            inlined_variables_allow_offload(&withheld_inlined_variables(&build_args, &all_public)),
+            Ok(())
+        );
 
         assert_eq!(inlined_variables_allow_offload(&[]), Ok(()));
         let one = inlined_variables_allow_offload(&["VITE_API_URL".to_string()]).unwrap_err();
         assert_eq!(one.variables, vec!["VITE_API_URL".to_string()]);
         assert!(one.to_string().contains("VITE_API_URL is inlined"), "{one}");
+        assert!(one.to_string().contains("it is secret"), "{one}");
         let two = inlined_variables_allow_offload(&[
             "NEXT_PUBLIC_A".to_string(),
             "NEXT_PUBLIC_B".to_string(),
