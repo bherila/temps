@@ -3,7 +3,10 @@
 
 import { useQuery } from '@tanstack/react-query'
 import { getPublicIngressStatusOptions } from '@/api/client/@tanstack/react-query.gen'
-import { publicIngressBaseUrl } from '@/lib/publicIngress'
+import {
+  publicIngressBaseUrl,
+  publicIngressCallbackUrlOrNull,
+} from '@/lib/publicIngress'
 
 /**
  * Where third-party callbacks are sent (`GET /settings/public-ingress`).
@@ -13,9 +16,15 @@ import { publicIngressBaseUrl } from '@/lib/publicIngress'
  * an agent trigger URL. It is the public ingress URL, which is not the
  * address being browsed when the console is restricted.
  *
+ * `baseUrl` and `callbackUrl()` are `null` while the status is loading and
+ * after a failed read. They never fall back to the browser origin: that is
+ * the private console when a separate ingress URL is configured, and a
+ * provider registered against it cannot deliver anything. Callers must keep
+ * copy and submit controls disabled while it is `null`, and offer `refetch`
+ * when `isError` is set — `PublicCallbackUrl` does both.
+ *
  * The endpoint only needs `projects:read`, so it works for every role that
- * can wire a callback. While it loads, or if it fails, `baseUrl` is the
- * browser origin: the value the console used before.
+ * can wire a callback.
  */
 export function usePublicIngress() {
   const query = useQuery({
@@ -26,8 +35,12 @@ export function usePublicIngress() {
 
   return {
     status: query.data,
-    baseUrl: publicIngressBaseUrl(query.data, window.location.origin),
+    baseUrl: publicIngressBaseUrl(query.data),
+    callbackUrl: (path: string) =>
+      publicIngressCallbackUrlOrNull(query.data, path),
     isPending: query.isPending,
     isError: query.isError,
+    isRefetching: query.isRefetching,
+    refetch: query.refetch,
   }
 }

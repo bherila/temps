@@ -2,40 +2,31 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { publicIngressBaseUrl, publicIngressCallbackUrl } from './publicIngress'
-
-const CONSOLE_ORIGIN = 'https://console.example.com'
+import {
+  publicIngressBaseUrl,
+  publicIngressCallbackUrl,
+  publicIngressCallbackUrlOrNull,
+} from './publicIngress'
 
 describe('publicIngressBaseUrl', () => {
-  test('uses the URL the API reports, not the address being browsed', () => {
+  test('uses the URL the API reports', () => {
     expect(
-      publicIngressBaseUrl(
-        { effective_url: 'https://hooks.example.com' },
-        CONSOLE_ORIGIN
-      )
+      publicIngressBaseUrl({ effective_url: 'https://hooks.example.com' })
     ).toBe('https://hooks.example.com')
   })
 
   test('strips trailing slashes and surrounding whitespace', () => {
     expect(
-      publicIngressBaseUrl(
-        { effective_url: '  https://hooks.example.com//  ' },
-        CONSOLE_ORIGIN
-      )
+      publicIngressBaseUrl({ effective_url: '  https://hooks.example.com//  ' })
     ).toBe('https://hooks.example.com')
   })
 
-  test('falls back to the browser origin while the status is unavailable', () => {
-    expect(publicIngressBaseUrl(undefined, CONSOLE_ORIGIN)).toBe(CONSOLE_ORIGIN)
-    expect(publicIngressBaseUrl(null, `${CONSOLE_ORIGIN}/`)).toBe(
-      CONSOLE_ORIGIN
-    )
-    expect(publicIngressBaseUrl({ effective_url: '   ' }, CONSOLE_ORIGIN)).toBe(
-      CONSOLE_ORIGIN
-    )
-    expect(publicIngressBaseUrl({ effective_url: null }, CONSOLE_ORIGIN)).toBe(
-      CONSOLE_ORIGIN
-    )
+  test('is null while the status is unavailable, never a guessed origin', () => {
+    expect(publicIngressBaseUrl(undefined)).toBeNull()
+    expect(publicIngressBaseUrl(null)).toBeNull()
+    expect(publicIngressBaseUrl({})).toBeNull()
+    expect(publicIngressBaseUrl({ effective_url: '   ' })).toBeNull()
+    expect(publicIngressBaseUrl({ effective_url: null })).toBeNull()
   })
 })
 
@@ -53,5 +44,33 @@ describe('publicIngressCallbackUrl', () => {
         'api/agents/webhook/wh_1'
       )
     ).toBe('https://hooks.example.com/api/agents/webhook/wh_1')
+  })
+})
+
+describe('publicIngressCallbackUrlOrNull', () => {
+  test('builds the callback URL once the ingress URL is known', () => {
+    expect(
+      publicIngressCallbackUrlOrNull(
+        { effective_url: 'https://hooks.example.com' },
+        '/api/webhook/git/github/events'
+      )
+    ).toBe('https://hooks.example.com/api/webhook/git/github/events')
+  })
+
+  test('is null while loading or after a failed read', () => {
+    // A registration made with a guessed URL would point the provider at the
+    // private console, so there must be nothing to copy or submit.
+    expect(
+      publicIngressCallbackUrlOrNull(
+        undefined,
+        '/api/webhook/git/github/events'
+      )
+    ).toBeNull()
+    expect(
+      publicIngressCallbackUrlOrNull(
+        { effective_url: '' },
+        '/api/webhook/git/github/events'
+      )
+    ).toBeNull()
   })
 })

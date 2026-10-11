@@ -15,18 +15,19 @@ export interface PublicIngressUrlSource {
 }
 
 /**
- * Base URL for anything a third party will request, with no trailing slash.
+ * Base URL for anything a third party will request, with no trailing slash,
+ * or `null` while it is not known.
  *
- * `fallbackOrigin` covers the cases where the status is unavailable: it has
- * not loaded yet, or the viewer may not read settings. The browser's origin is
- * the best remaining guess, and is what the console used before.
+ * There is deliberately no fallback to the browser's origin. When a separate
+ * public ingress URL is configured, the origin is the private console: a
+ * webhook registered against it can never be delivered, and nothing reports
+ * that. A caller that has no URL yet must wait or offer a retry instead.
  */
 export function publicIngressBaseUrl(
-  status: PublicIngressUrlSource | null | undefined,
-  fallbackOrigin: string
-): string {
+  status: PublicIngressUrlSource | null | undefined
+): string | null {
   const configured = status?.effective_url?.trim().replace(/\/+$/, '')
-  return configured || fallbackOrigin.replace(/\/+$/, '')
+  return configured || null
 }
 
 /** Join an ingress base URL and an absolute path such as `/api/webhook/...`. */
@@ -36,4 +37,16 @@ export function publicIngressCallbackUrl(
 ): string {
   const base = baseUrl.replace(/\/+$/, '')
   return `${base}${path.startsWith('/') ? path : `/${path}`}`
+}
+
+/**
+ * The callback URL for `path`, or `null` while the ingress URL is not known.
+ * A `null` must disable whatever would copy or submit the URL.
+ */
+export function publicIngressCallbackUrlOrNull(
+  status: PublicIngressUrlSource | null | undefined,
+  path: string
+): string | null {
+  const base = publicIngressBaseUrl(status)
+  return base === null ? null : publicIngressCallbackUrl(base, path)
 }

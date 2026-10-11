@@ -56,8 +56,11 @@ import {
 import GithubIcon from '@/icons/Github'
 import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
+import { PublicCallbackUrl } from '@/components/settings/PublicCallbackUrl'
 import { usePublicIngress } from '@/hooks/usePublicIngress'
-import { publicIngressCallbackUrl } from '@/lib/publicIngress'
+
+/** Where GitHub delivers webhook events, relative to the public ingress URL. */
+const GITHUB_EVENTS_PATH = '/api/webhook/git/github/events'
 
 type Step =
   | 'provider'
@@ -95,11 +98,12 @@ export function GitProviderFlow({
   // GitHub delivers webhooks from its own servers, so the events URL is the
   // public ingress URL. The auth/callback/install URLs below stay on the
   // browser origin: GitHub redirects the operator's own browser to them.
-  const { baseUrl: publicIngressUrl } = usePublicIngress()
-  const githubEventsUrl = publicIngressCallbackUrl(
-    publicIngressUrl,
-    '/api/webhook/git/github/events'
-  )
+  //
+  // `githubEventsUrl` is null until the API has answered. It is never
+  // replaced by the browser origin: registering an App whose webhook points
+  // at a private console produces an App that silently receives nothing.
+  const publicIngress = usePublicIngress()
+  const githubEventsUrl = publicIngress.callbackUrl(GITHUB_EVENTS_PATH)
   const { isLocalMode: isLocal, hasPublicIP } = usePlatformCapabilities()
   // GitHub/GitLab Apps require a public URL for webhooks
   // Disable if running in local mode without a public IP
@@ -113,7 +117,6 @@ export function GitProviderFlow({
   const [providerName, setProviderName] = useState('')
   const [gitlabBaseUrl, setGitlabBaseUrl] = useState('https://gitlab.com')
   const [isCreatingApp, setIsCreatingApp] = useState(false)
-  const [copiedWebhook, setCopiedWebhook] = useState(false)
   const [copiedCallback, setCopiedCallback] = useState(false)
   const [gitlabClientId, setGitlabClientId] = useState('')
   const [gitlabClientSecret, setGitlabClientSecret] = useState('')
@@ -418,12 +421,6 @@ export function GitProviderFlow({
     },
   })
 
-  const handleCopyWebhook = () => {
-    navigator.clipboard.writeText(githubEventsUrl)
-    setCopiedWebhook(true)
-    setTimeout(() => setCopiedWebhook(false), 2000)
-  }
-
   const handleCopyCallback = () => {
     const url = `${window.location.origin}/api/webhook/git/github/callback`
     navigator.clipboard.writeText(url)
@@ -433,6 +430,22 @@ export function GitProviderFlow({
 
   const handleCreateGitHubAppManifest = () => {
     try {
+      // The manifest fixes the App's webhook URL at creation. Without the
+      // public callback URL there is nothing correct to submit.
+      if (!githubEventsUrl) {
+        toast.error(
+          publicIngress.isError
+            ? "Couldn't load the public callback URL"
+            : 'The public callback URL is still loading',
+          {
+            description:
+              'The GitHub App needs the URL GitHub will deliver webhooks to. Try again in a moment.',
+          }
+        )
+        if (publicIngress.isError) void publicIngress.refetch()
+        return
+      }
+
       if (!canCreateGitHubApp) {
         toast.error('GitHub Apps require HTTPS', {
           description: httpWarningMessage,
@@ -1496,6 +1509,30 @@ export function GitProviderFlow({
                   </Alert>
                 )}
 
+                {!isLocalMode && publicIngress.isError && !githubEventsUrl && (
+                  <Alert variant="destructive">
+                    <AlertCircle className="h-4 w-4" />
+                    <AlertDescription className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                      <span>
+                        Couldn&apos;t load the URL GitHub will deliver webhooks
+                        to, so the App can&apos;t be created yet.
+                      </span>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={publicIngress.isRefetching}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          void publicIngress.refetch()
+                        }}
+                      >
+                        Retry
+                      </Button>
+                    </AlertDescription>
+                  </Alert>
+                )}
+
                 <div className="flex justify-end">
                   <Button
                     variant={
@@ -1503,7 +1540,7 @@ export function GitProviderFlow({
                         ? 'default'
                         : 'ghost'
                     }
-                    disabled={isLocalMode || isCreatingApp}
+                    disabled={isLocalMode || isCreatingApp || !githubEventsUrl}
                     onClick={(e) => {
                       e.stopPropagation()
                       if (!isLocalMode) {
@@ -1654,23 +1691,10 @@ export function GitProviderFlow({
                     <div className="space-y-2 ml-4">
                       <div>
                         <p className="text-muted-foreground">Webhook URL:</p>
-                        <div className="flex items-center gap-2">
-                          <code className="text-xs bg-muted px-2 py-1 rounded flex-1 overflow-x-auto">
-                            {githubEventsUrl}
-                          </code>
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            className="shrink-0 h-7 w-7 p-0"
-                            onClick={handleCopyWebhook}
-                          >
-                            {copiedWebhook ? (
-                              <Check className="h-3 w-3" />
-                            ) : (
-                              <Copy className="h-3 w-3" />
-                            )}
-                          </Button>
-                        </div>
+                        <PublicCallbackUrl
+                          path={GITHUB_EVENTS_PATH}
+                          label="Copy webhook URL"
+                        />
                       </div>
                       <div>
                         <p className="text-muted-foreground">Callback URL:</p>

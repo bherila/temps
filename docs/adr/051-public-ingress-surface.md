@@ -139,7 +139,10 @@ Each URL Temps emits is classified by **who will request it**:
 - The console UI stops deriving callback URLs from `window.location.origin`.
   It reads them from the API (D6), so the GitHub App manifest and revenue
   setup show the ingress host even while the operator is browsing the
-  private console.
+  private console. There is no fallback to the browser origin while that
+  read is pending or after it fails: copy and submit controls stay disabled
+  and the UI offers a retry, because a provider registered against the
+  private console can never deliver and nothing would report it.
 - A lint-style unit test enumerates the call sites of `get_external_url*`
   and fails when a new one appears in a crate that serves receivers. That
   forces the author to pick a column from the table above.
