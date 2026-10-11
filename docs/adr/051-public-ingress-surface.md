@@ -167,17 +167,23 @@ Each URL Temps emits is classified by **who will request it**:
 
 ### D4. The public router gets its own listener in every topology
 
-In single-listener mode, the console binds the public-only router a second
-time on an **ingress listener**. The proxy targets that listener whenever it
-must reach "public routes only". In dual-listener mode, `console_address` is
-already public-only and is reused as the ingress listener. Nothing about the
-existing listeners changes, so an external reverse proxy pointed at
-`console_address` keeps working.
+The console binds the public-only router a second time on an **ingress
+listener**, in every topology. The proxy targets that listener whenever it
+must reach "public routes only". Nothing about the existing listeners
+changes, so an external reverse proxy pointed at `console_address` keeps
+working.
 
 The ingress listener mounts the health probes and the public router under
 `/api`, and nothing else. In particular it does not mount the MCP endpoint,
 which `public_app` carries on `console_address`: its authenticated operations
-accept a session, and this surface must not.
+accept a session cookie or an API key, and this surface must not.
+
+That is why dual-listener mode does not reuse `console_address` as the
+ingress listener, even though no admin route is mounted there. A request the
+admin gate denied would land on a listener that serves authenticated MCP,
+and a denied client holding valid credentials could run MCP operations: the
+gate would stop restricting who can operate the instance. Startup refuses an
+ingress address equal to another console listener for the same reason.
 
 The proxy's console fall-through becomes a three-way decision. It is made in
 `request_filter`/`resolve_peer` from the same `ArcSwap` snapshot that holds
@@ -364,8 +370,8 @@ cover how to run it. Surfaces:
   inferring it from missing data.
 
 ### Negative
-- One more loopback listener in single-listener mode, and one more
-  bootstrap flag when the proxy runs as a separate process.
+- One more loopback listener in every topology, and one more bootstrap flag
+  when the proxy runs as a separate process.
 - Existing installs whose providers were registered against the console
   host keep calling it. That still works if the console host is public, or
   gated and covered by D4. Otherwise it needs D5 to run once after the

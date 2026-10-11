@@ -428,9 +428,9 @@ pub struct ServerConfig {
     /// reach an admin handler or the dashboard whatever their path.
     ///
     /// Bootstrap configuration, like `console_address`: it has to be known
-    /// before the listener binds. Unused when `console_admin_address` is set,
-    /// because `console_address` is already public-only then — read
-    /// [`ServerConfig::public_surface_address`] rather than this field.
+    /// before the listener binds. It is a listener of its own even when
+    /// `console_admin_address` is set — see
+    /// [`ServerConfig::public_surface_address`], which is what to read.
     pub console_ingress_address: Option<String>,
     /// Comma-separated list of IPs / CIDRs allowed to reach the admin listener.
     /// Empty / unset = no IP allowlist (admin gated only by binding address).
@@ -635,42 +635,26 @@ impl ServerConfig {
     /// `temps proxy` cannot discover a random port, so there the listener is
     /// only bound when `--console-ingress-address` names one.
     pub fn with_default_ingress_listener(mut self) -> Self {
-        if self.console_admin_address.is_none() && self.console_ingress_address.is_none() {
+        if self.public_surface_address().is_none() {
             self.console_ingress_address = Some(Self::get_random_console_address());
         }
         self
     }
 
     /// The address of the listener that serves only the console's public
-    /// routes, when one exists (ADR-051).
+    /// routes, when one exists (ADR-051). The console binds it, and the proxy
+    /// sends it every request that may reach nothing else.
     ///
-    /// In dual-listener mode `console_address` already serves nothing but the
-    /// public routes, so it is that listener. Otherwise it is the dedicated
-    /// ingress listener, if one is configured.
+    /// It is a listener of its own in every topology. In dual-listener mode
+    /// `console_address` looks like a candidate, since no admin route is
+    /// mounted there, but it also serves the MCP endpoint, whose operations
+    /// accept a session cookie or an API key. Reusing it would let a client
+    /// the admin gate denied run MCP operations with valid credentials, which
+    /// is exactly what the gate exists to prevent.
     pub fn public_surface_address(&self) -> Option<&str> {
-        if self.dedicated_admin_listener() {
-            return Some(&self.console_address);
-        }
         self.console_ingress_address
             .as_deref()
             .filter(|address| !address.is_empty())
-    }
-
-    /// Whether admin routes bind their own listener (`console_admin_address`).
-    fn dedicated_admin_listener(&self) -> bool {
-        self.console_admin_address
-            .as_deref()
-            .is_some_and(|address| !address.is_empty())
-    }
-
-    /// Address the console must bind an extra public-only listener on, or
-    /// `None` when no extra listener is needed (dual-listener mode, or no
-    /// ingress address configured).
-    pub fn ingress_listener_to_bind(&self) -> Option<&str> {
-        if self.dedicated_admin_listener() {
-            return None;
-        }
-        self.public_surface_address()
     }
 
     /// Get a random available port for console address
@@ -5524,23 +5508,36 @@ mod tests {
         config
     }
 
-    // ADR-051 D4: which listener serves only the public routes, per topology.
+    // ADR-051 D4: the public-only surface is a listener of its own in every
+    // topology.
     #[test]
     fn single_listener_binds_a_dedicated_public_only_listener() {
         let config = config_with_listeners(None, Some("127.0.0.1:8002"));
         assert_eq!(config.public_surface_address(), Some("127.0.0.1:8002"));
-        assert_eq!(config.ingress_listener_to_bind(), Some("127.0.0.1:8002"));
     }
 
+    // In dual-listener mode `console_address` has no admin routes but does
+    // serve authenticated MCP. A request the admin gate denied must not land
+    // there, so it is never the public-only surface.
     #[test]
-    fn dual_listener_reuses_the_public_console_listener() {
-        // `console_address` already serves nothing but public routes, so no
-        // extra listener is bound even if an ingress address is also set.
-        for ingress in [None, Some("127.0.0.1:8002")] {
-            let config = config_with_listeners(Some("127.0.0.1:8001"), ingress);
-            assert_eq!(config.public_surface_address(), Some("127.0.0.1:8000"));
-            assert_eq!(config.ingress_listener_to_bind(), None);
-        }
+    fn dual_listener_never_reuses_the_console_listener_as_the_public_surface() {
+        let with_ingress = config_with_listeners(Some("127.0.0.1:8001"), Some("127.0.0.1:8002"));
+        assert_eq!(
+            with_ingress.public_surface_address(),
+            Some("127.0.0.1:8002")
+        );
+
+        let without_ingress = config_with_listeners(Some("127.0.0.1:8001"), None);
+        assert_eq!(
+            without_ingress.public_surface_address(),
+            None,
+            "without a dedicated listener there is no public-only surface, \
+             and the proxy keeps answering gate-denied requests itself"
+        );
+        assert_ne!(
+            with_ingress.public_surface_address(),
+            Some(with_ingress.console_address.as_str())
+        );
     }
 
     #[test]
@@ -5548,30 +5545,28 @@ mod tests {
         for ingress in [None, Some("")] {
             let config = config_with_listeners(None, ingress);
             assert_eq!(config.public_surface_address(), None);
-            assert_eq!(config.ingress_listener_to_bind(), None);
         }
     }
 
     #[test]
-    fn default_ingress_listener_is_loopback_and_only_filled_when_needed() {
-        let config = config_with_listeners(None, None).with_default_ingress_listener();
-        let address = config
-            .ingress_listener_to_bind()
-            .expect("the single-binary server gets a public-only listener");
-        let socket: std::net::SocketAddr = address.parse().expect("a socket address");
-        assert!(socket.ip().is_loopback(), "{address} must be loopback");
-        assert_ne!(address, config.console_address);
+    fn default_ingress_listener_is_loopback_and_filled_in_both_listener_modes() {
+        for admin in [None, Some("127.0.0.1:8001")] {
+            let config = config_with_listeners(admin, None).with_default_ingress_listener();
+            let address = config
+                .public_surface_address()
+                .expect("the single-binary server gets a public-only listener");
+            let socket: std::net::SocketAddr = address.parse().expect("a socket address");
+            assert!(socket.ip().is_loopback(), "{address} must be loopback");
+            assert_ne!(address, config.console_address);
+            assert_ne!(Some(address), config.console_admin_address.as_deref());
+        }
 
-        // An explicit address is kept, and dual-listener mode needs none.
+        // An explicit address is kept; an empty one counts as unset.
         let explicit =
             config_with_listeners(None, Some("127.0.0.1:8002")).with_default_ingress_listener();
-        assert_eq!(
-            explicit.console_ingress_address.as_deref(),
-            Some("127.0.0.1:8002")
-        );
-        let dual =
-            config_with_listeners(Some("127.0.0.1:8001"), None).with_default_ingress_listener();
-        assert_eq!(dual.console_ingress_address, None);
+        assert_eq!(explicit.public_surface_address(), Some("127.0.0.1:8002"));
+        let blank = config_with_listeners(None, Some("")).with_default_ingress_listener();
+        assert!(blank.public_surface_address().is_some());
     }
 
     /// Count occurrences of `needle` in every `.rs` file under `dir`, keyed by

@@ -2087,6 +2087,26 @@ fn public_only_app(health: Router, public_router: Router) -> Router {
         .layer(axum::middleware::from_fn(track_server_errors))
 }
 
+/// Serve the public-only app until shutdown. Resolves immediately when this
+/// process has no such listener (a split console started without
+/// `--console-ingress-address`), so callers can join it unconditionally.
+async fn serve_public_only(
+    ingress: Option<(TcpListener, Router)>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    match ingress {
+        Some((listener, app)) => {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown)
+            .await
+        }
+        None => Ok(()),
+    }
+}
+
 /// 404 for everything that is not a public route. A browser gets the same
 /// branded page the proxy renders for an unknown host, so a non-allowlisted
 /// visitor sees exactly what they saw before this listener existed; an API
@@ -4699,10 +4719,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     };
 
     // ADR-051 D4: the same public routes a second time, with nothing else
-    // around them. Only bound in single-listener mode; in dual-listener mode
-    // `console_address` already serves nothing but `public_app`.
+    // around them. Bound in both listener modes: in dual-listener mode
+    // `console_address` has no admin routes, but `public_app` below still
+    // mounts the authenticated MCP endpoint, so it cannot stand in for it.
     let ingress_app = config
-        .ingress_listener_to_bind()
+        .public_surface_address()
         .map(|_| public_only_app(health_router(ready_flag.clone()), public_router.clone()));
 
     let public_app = Router::new()
@@ -4866,6 +4887,21 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         .shared()
     };
 
+    // Bound before `/readyz` flips, so a proxy that is told the console is
+    // ready can already reach the public-only surface.
+    let ingress = match (config.public_surface_address(), ingress_app) {
+        (Some(address), Some(app)) => {
+            let listener = bind_console_listener(address).await?;
+            info!(
+                "Console PUBLIC-ONLY API server listening on {} (third-party callbacks, ADR-051)",
+                address
+            );
+            Some((listener, app))
+        }
+        _ => None,
+    };
+    let ingress_fut = serve_public_only(ingress, shutdown_signal.clone());
+
     match config.console_admin_address.as_deref() {
         Some(admin_addr) if !admin_addr.is_empty() => {
             // Two-listener mode: public + admin on separate addresses.
@@ -4901,7 +4937,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             )
             .with_graceful_shutdown(shutdown_signal);
 
-            tokio::try_join!(public_fut, admin_fut)?;
+            tokio::try_join!(public_fut, admin_fut, ingress_fut)?;
         }
         _ => {
             // Single-listener mode (backwards compatible): merge public + admin
@@ -4912,20 +4948,6 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
             let listener = bind_console_listener(&config.console_address).await?;
             info!("Console API server listening on {}", config.console_address);
-
-            // Bound before `/readyz` flips, so a proxy that is told the
-            // console is ready can already reach the public-only surface.
-            let ingress = match (config.ingress_listener_to_bind(), ingress_app) {
-                (Some(address), Some(app)) => {
-                    let listener = bind_console_listener(address).await?;
-                    info!(
-                        "Console PUBLIC-ONLY API server listening on {} (third-party callbacks, ADR-051)",
-                        address
-                    );
-                    Some((listener, app))
-                }
-                _ => None,
-            };
 
             // Routers, middleware, and the listener are ready; flip `/readyz`
             // to 200. `ready_signal` already fired earlier, right after
@@ -4943,19 +4965,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 listener,
                 merged.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
-            .with_graceful_shutdown(shutdown_signal.clone());
+            .with_graceful_shutdown(shutdown_signal);
 
-            match ingress {
-                Some((ingress_listener, ingress_app)) => {
-                    let ingress_fut = axum::serve(
-                        ingress_listener,
-                        ingress_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                    )
-                    .with_graceful_shutdown(shutdown_signal);
-                    tokio::try_join!(console_fut, ingress_fut)?;
-                }
-                None => console_fut.await?,
-            }
+            tokio::try_join!(console_fut, ingress_fut)?;
         }
     }
 

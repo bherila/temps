@@ -277,9 +277,10 @@ pub struct ServeCommand {
     /// the console itself stays restricted. The single-binary server picks a
     /// loopback port for this automatically. Set it only in split topology
     /// (`--role=console`), together with the same value on
-    /// `temps proxy --console-ingress-address`. Ignored when
-    /// `--console-admin-address` is set, because `--console-address` is
-    /// already public-only then.
+    /// `temps proxy --console-ingress-address`. It must be an address of its
+    /// own, also when `--console-admin-address` is set: `--console-address`
+    /// has no admin routes then, but still serves the authenticated MCP
+    /// endpoint.
     #[arg(long, env = "TEMPS_CONSOLE_INGRESS_ADDRESS")]
     pub console_ingress_address: Option<String>,
 
@@ -358,6 +359,26 @@ pub struct ServeCommand {
     /// exactly what the running process provides.
     #[arg(long, value_enum, default_value_t = ServeProfile::Full, env = "TEMPS_SERVE_PROFILE")]
     pub profile: ServeProfile,
+}
+
+/// Name the flag whose address the public-only listener would collide with,
+/// if any. Blank values count as unset.
+fn ingress_listener_clash(
+    ingress: Option<&str>,
+    console: Option<&str>,
+    admin: Option<&str>,
+) -> Option<&'static str> {
+    let ingress = ingress
+        .map(str::trim)
+        .filter(|address| !address.is_empty())?;
+    let same = |other: Option<&str>| other.map(str::trim) == Some(ingress);
+    if same(console) {
+        Some("--console-address")
+    } else if same(admin) {
+        Some("--console-admin-address")
+    } else {
+        None
+    }
 }
 
 impl ServeCommand {
@@ -458,6 +479,23 @@ impl ServeCommand {
                  `--console-address 127.0.0.1:8081`, and point the sibling \
                  `temps proxy --console-address <same>` at it. Without it the \
                  console would bind a random port the proxy process cannot find."
+            );
+        }
+
+        // The public-only listener exists so that a request may reach the
+        // public routes and nothing else. Pointing it at a listener that
+        // serves more would quietly remove that guarantee (and fail to bind).
+        if let Some(clash) = ingress_listener_clash(
+            self.console_ingress_address.as_deref(),
+            self.console_address.as_deref(),
+            self.console_admin_address.as_deref(),
+        ) {
+            anyhow::bail!(
+                "--console-ingress-address must be an address of its own, but it is the same \
+                 as {clash}.\n\nThat listener serves more than the public callback routes, so \
+                 requests the admin gate denies would reach it. Give the public-only listener \
+                 a separate loopback port, e.g. `--console-ingress-address 127.0.0.1:8082`, or \
+                 omit the flag to let `temps serve` pick one."
             );
         }
 
@@ -1303,6 +1341,50 @@ impl ServeCommand {
             self.profile.local_workloads_enabled(),
             console_startup_state,
         )
+    }
+}
+
+#[cfg(test)]
+mod ingress_listener_tests {
+    use super::ingress_listener_clash;
+
+    #[test]
+    fn a_dedicated_ingress_address_does_not_clash() {
+        assert_eq!(
+            ingress_listener_clash(
+                Some("127.0.0.1:8082"),
+                Some("127.0.0.1:8081"),
+                Some("127.0.0.1:9001")
+            ),
+            None
+        );
+        assert_eq!(
+            ingress_listener_clash(None, Some("127.0.0.1:8081"), None),
+            None
+        );
+        assert_eq!(ingress_listener_clash(Some("  "), Some("  "), None), None);
+    }
+
+    // Reusing the console listener is what let gate-denied requests reach
+    // authenticated MCP in dual-listener mode.
+    #[test]
+    fn reusing_the_console_or_admin_listener_is_refused() {
+        assert_eq!(
+            ingress_listener_clash(
+                Some("127.0.0.1:8081"),
+                Some("127.0.0.1:8081"),
+                Some("127.0.0.1:9001")
+            ),
+            Some("--console-address")
+        );
+        assert_eq!(
+            ingress_listener_clash(
+                Some(" 127.0.0.1:9001 "),
+                Some("127.0.0.1:8081"),
+                Some("127.0.0.1:9001")
+            ),
+            Some("--console-admin-address")
+        );
     }
 }
 

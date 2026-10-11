@@ -109,9 +109,12 @@ cut them off, so the public surface is reachable on its own:
 
 - **Restricted by the admin gate.** Nothing to configure. A request the gate
   denies is no longer answered with a `404` by the proxy; it is forwarded to a
-  listener that mounts only the public surface. A non-allowlisted client can
-  reach a tracking pixel or a webhook receiver and gets a `404` for everything
-  else, because nothing else is mounted there.
+  listener that mounts only the public callback routes and health probes. A
+  non-allowlisted client can reach a tracking pixel or a webhook receiver and
+  gets a `404` for everything else — the dashboard, the admin API and the MCP
+  endpoint — because nothing else is mounted there. This holds in two-listener
+  mode as well: that listener is separate from `TEMPS_CONSOLE_ADDRESS`, which
+  also serves MCP.
 - **Restricted by something in front of Temps** (VPN, firewall,
   identity-aware proxy). Temps cannot see that restriction. Expose one extra
   hostname publicly, point it at the proxy, and set it as the **Public ingress
@@ -131,7 +134,7 @@ that case.
 | ---------------------------------- | ---------------- | ---------- | -------------------------------------------------------------------------------------------- |
 | `TEMPS_CONSOLE_ADDRESS`            | `host:port`      | random     | Public listener (and admin listener when admin is not split out)                              |
 | `TEMPS_CONSOLE_ADMIN_ADDRESS`      | `host:port`      | unset      | Bind admin/management routes to this address. Enables two-listener mode.                      |
-| `TEMPS_CONSOLE_INGRESS_ADDRESS`    | `host:port`      | automatic  | Listener that serves only the public surface, used for callbacks while the console is restricted. `temps serve` picks a loopback port itself; set it only in split topology, to the same value on `temps serve --role=console` and `temps proxy`. Unused in two-listener mode, where `TEMPS_CONSOLE_ADDRESS` is already public-only. |
+| `TEMPS_CONSOLE_INGRESS_ADDRESS`    | `host:port`      | automatic  | Listener that serves only the public callback routes and health probes, used for callbacks while the console is restricted. `temps serve` picks a loopback port itself; set it only in split topology, to the same value on `temps serve --role=console` and `temps proxy`. It is always an address of its own, also in two-listener mode: `TEMPS_CONSOLE_ADDRESS` has no admin routes then but still serves the authenticated MCP endpoint, so it must not be reused. Startup fails if it equals another console listener. |
 | `TEMPS_ADMIN_ALLOWED_IPS`          | CSV of IP/CIDR   | empty      | Allowlist source addresses for the admin listener. Empty = no IP gate.                        |
 | `TEMPS_ADMIN_ALLOWED_HOSTS`        | CSV of hostnames | empty      | Allowlist `Host` header values on the admin listener. Empty = no Host gate. Port is stripped. |
 | `TEMPS_ADMIN_TRUST_FORWARDED_FOR`  | bool             | `false`    | Honor `X-Forwarded-For` for the IP gate, but only from loopback peers (anti-spoof).            |
