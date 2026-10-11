@@ -345,6 +345,16 @@ impl EmailService {
         let email = self.get(email_id).await?;
         ensure_resendable(&email, Utc::now())?;
         let request = stored_email_request(&email)?;
+        // An email recorded before custom headers were restricted can carry
+        // one the send pipeline now rejects; every resend of it would fail
+        // the same way, so refuse it before claiming the email.
+        validate_custom_headers(request.headers.as_ref()).map_err(|error| {
+            EmailError::NotResendable {
+                email_id,
+                status: email.status.clone(),
+                reason: format!("its stored headers can no longer be sent: {error}"),
+            }
+        })?;
 
         // A capture taken before the sender domain existed in Temps has no
         // domain; attach it now so the delivery counts towards that domain.
@@ -3114,17 +3124,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resend_that_fails_before_an_outcome_returns_the_email_to_captured() {
+    async fn resend_refuses_an_email_whose_stored_headers_can_no_longer_be_sent() {
         let Some((db, email_service, _provider_service, _domain_service)) = setup_test_env().await
         else {
             return;
         };
         let email_id = insert_email(&db.db, "captured", Some("Domain not verified")).await;
-        // A header the pipeline rejects makes delivery fail after the claim.
+        // Recorded before custom headers were restricted to X-Temps-*.
         emails::Entity::update_many()
             .col_expr(
                 emails::Column::Headers,
-                Expr::value(serde_json::json!({ "Bcc": "someone@test.com" })),
+                Expr::value(serde_json::json!({ "List-Unsubscribe": "<https://example.com/u>" })),
             )
             .filter(emails::Column::Id.eq(email_id))
             .exec(db.db.as_ref())
@@ -3134,10 +3144,41 @@ mod tests {
         let result = email_service.resend(email_id).await;
 
         assert!(
-            matches!(result, Err(EmailError::Validation(_))),
+            matches!(
+                &result,
+                Err(EmailError::NotResendable { email_id: id, reason, .. })
+                    if *id == email_id && reason.contains("headers")
+            ),
             "got {result:?}"
         );
         let stored = email_service.get(email_id).await.unwrap();
+        assert_eq!(
+            stored.status, "captured",
+            "a refused resend must not claim the email"
+        );
+        assert_eq!(stored.error_message.as_deref(), Some("Domain not verified"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_resend_returns_its_claim_to_captured_with_the_original_reason() {
+        let Some((db, email_service, _provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
+        let failure = EmailError::Validation("simulated delivery failure".to_string());
+
+        // A live claim, exactly as `resend_without_project` leaves it.
+        let claimed = insert_email(&db.db, "queued", None).await;
+        emails::Entity::update_many()
+            .col_expr(emails::Column::SentAt, Expr::value(Utc::now()))
+            .filter(emails::Column::Id.eq(claimed))
+            .exec(db.db.as_ref())
+            .await
+            .unwrap();
+        email_service
+            .release_failed_resend(claimed, Some("Domain not verified".to_string()), &failure)
+            .await;
+        let stored = email_service.get(claimed).await.unwrap();
         assert_eq!(
             stored.status, "captured",
             "a failed resend must not strand the email in queued"
@@ -3151,6 +3192,27 @@ mod tests {
             ensure_resendable(&stored, Utc::now()).is_ok(),
             "the email must stay resendable"
         );
+
+        // Without an original reason, the failure itself is recorded.
+        let unexplained = insert_email(&db.db, "queued", None).await;
+        email_service
+            .release_failed_resend(unexplained, None, &failure)
+            .await;
+        let stored = email_service.get(unexplained).await.unwrap();
+        assert_eq!(stored.status, "captured");
+        assert!(stored
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("simulated delivery failure")));
+
+        // An outcome that was already recorded is never overwritten.
+        let sent = insert_email(&db.db, "sent", None).await;
+        email_service
+            .release_failed_resend(sent, Some("Domain not verified".to_string()), &failure)
+            .await;
+        let stored = email_service.get(sent).await.unwrap();
+        assert_eq!(stored.status, "sent");
+        assert_eq!(stored.error_message, None);
     }
 
     #[tokio::test]
