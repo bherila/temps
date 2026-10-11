@@ -12,8 +12,9 @@ use sea_orm::{
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use temps_core::retry::RetryConfig;
 use temps_entities::{email_idempotency_keys, emails};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::errors::EmailError;
@@ -122,6 +123,8 @@ fn classify_provider_result(
 // retries, while still preventing concurrent provider calls.
 const DELIVERY_LEASE_SECONDS: i64 = 60;
 const PROVIDER_SEND_TIMEOUT_SECONDS: u64 = 20;
+/// Attempts at saving a provider result before reporting it as unrecorded.
+const OUTCOME_WRITE_ATTEMPTS: u32 = 3;
 
 /// Hard ceiling on the entire retry sequence: first attempt + 500 ms delay +
 /// second attempt.  Worst case: 2 × 20 s + 0.5 s ≈ 40.5 s, well inside this
@@ -410,8 +413,10 @@ impl EmailService {
     ///
     /// Delivery runs on a detached task, so a client that disconnects
     /// mid-request does not cancel it halfway through, and an attempt that
-    /// fails without recording an outcome puts the email back to `captured`
-    /// with its original reason instead of leaving it stuck in `queued`.
+    /// fails before the provider was contacted puts the email back to
+    /// `captured` with its original reason instead of leaving it stuck in
+    /// `queued`. An attempt whose provider result could not be saved keeps
+    /// its claim instead (see `release_failed_resend`).
     async fn resend_without_project(
         &self,
         email: emails::Model,
@@ -488,12 +493,26 @@ impl EmailService {
     /// restoring the reason it was captured with, so it can be resent again.
     /// Only a row still `queued` is touched: an outcome that did get recorded
     /// is never overwritten.
+    ///
+    /// A resend the provider accepted, or may have, is not released: it is
+    /// not an undelivered capture, and making it resendable at once would
+    /// invite a second delivery. It keeps its claim, which is only
+    /// resendable again once the delivery lease has lapsed.
     async fn release_failed_resend(
         &self,
         email_id: Uuid,
         original_error: Option<String>,
         error: &EmailError,
     ) {
+        if matches!(error, EmailError::DeliveryOutcomeNotRecorded { .. }) {
+            error!(
+                email_id = %email_id,
+                error = %error,
+                "Resend reached the provider but its result was not recorded; keeping the claim \
+                 instead of returning the email to captured"
+            );
+            return;
+        }
         warn!(email_id = %email_id, error = %error, "Resend failed; returning email to captured");
         let error_message = original_error.unwrap_or_else(|| format!("Resend failed: {error}"));
         if let Err(release_error) = emails::Entity::update_many()
@@ -949,7 +968,21 @@ impl EmailService {
                 active_model.provider_id = Set(provider_id);
                 active_model.attempt_count = Set(attempt_count);
 
-                let _email_model = active_model.update(self.db.as_ref()).await?;
+                self.record_delivery_outcome(active_model)
+                    .await
+                    .map_err(|db_error| {
+                        error!(
+                            email_id = %email_id,
+                            provider_message_id = %response.message_id,
+                            error = %db_error,
+                            "Provider accepted the email but the result could not be recorded"
+                        );
+                        EmailError::DeliveryOutcomeNotRecorded {
+                            email_id,
+                            outcome: "sent".to_string(),
+                            reason: db_error.to_string(),
+                        }
+                    })?;
 
                 info!(
                     "Email sent successfully, id: {}, provider_message_id: {}",
@@ -976,7 +1009,7 @@ impl EmailService {
                 active_model.provider_id = Set(provider_id);
                 active_model.attempt_count = Set(attempt_count);
 
-                active_model.update(self.db.as_ref()).await?;
+                self.record_delivery_outcome(active_model).await?;
 
                 Ok(SendEmailResponse {
                     id: email_id,
@@ -997,7 +1030,13 @@ impl EmailService {
                 active_model.sent_at = Set(Some(Utc::now()));
                 active_model.provider_id = Set(provider_id);
                 active_model.attempt_count = Set(attempt_count);
-                active_model.update(self.db.as_ref()).await?;
+                self.record_delivery_outcome(active_model)
+                    .await
+                    .map_err(|db_error| EmailError::DeliveryOutcomeNotRecorded {
+                        email_id,
+                        outcome: "delivery_unknown".to_string(),
+                        reason: db_error.to_string(),
+                    })?;
 
                 Ok(SendEmailResponse {
                     id: email_id,
@@ -1006,6 +1045,20 @@ impl EmailService {
                 })
             }
         }
+    }
+
+    /// Save the result of a provider call that has already happened. This
+    /// write is the only record of that call, so a transient database failure
+    /// is retried before giving up.
+    async fn record_delivery_outcome(
+        &self,
+        active_model: emails::ActiveModel,
+    ) -> Result<emails::Model, sea_orm::DbErr> {
+        RetryConfig::new(OUTCOME_WRITE_ATTEMPTS)
+            .with_base_delay(std::time::Duration::from_millis(200))
+            .with_max_delay(std::time::Duration::from_secs(1))
+            .retry(|| active_model.clone().update(self.db.as_ref()))
+            .await
     }
 
     /// Deliver one project-scoped email with a durable, fenced attempt.
@@ -3213,6 +3266,82 @@ mod tests {
         let stored = email_service.get(sent).await.unwrap();
         assert_eq!(stored.status, "sent");
         assert_eq!(stored.error_message, None);
+    }
+
+    #[tokio::test]
+    async fn a_resend_the_provider_may_have_accepted_is_never_returned_to_captured() {
+        let Some((db, email_service, _provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
+
+        // The provider answered, but the result cannot be saved: the row is
+        // gone, so every attempt at the write fails.
+        for (outcome, expected) in [
+            (
+                ProviderDeliveryOutcome::Accepted(crate::providers::SendEmailResponse {
+                    message_id: "provider-message-1".to_string(),
+                }),
+                "sent",
+            ),
+            (
+                ProviderDeliveryOutcome::Unknown("provider timed out".to_string()),
+                "delivery_unknown",
+            ),
+        ] {
+            let vanished = insert_email(&db.db, "queued", None).await;
+            let model = email_service.get(vanished).await.unwrap();
+            emails::Entity::delete_by_id(vanished)
+                .exec(db.db.as_ref())
+                .await
+                .unwrap();
+            let error = email_service
+                .finalize_unfenced_delivery(model, outcome, None, Some(1))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    EmailError::DeliveryOutcomeNotRecorded { email_id, outcome, .. }
+                        if *email_id == vanished && outcome == expected
+                ),
+                "an unsaved '{expected}' result must be reported as such, got {error:?}"
+            );
+        }
+
+        // A live resend claim whose delivery ended that way keeps its claim.
+        let claimed = insert_email(&db.db, "queued", None).await;
+        emails::Entity::update_many()
+            .col_expr(emails::Column::SentAt, Expr::value(Utc::now()))
+            .filter(emails::Column::Id.eq(claimed))
+            .exec(db.db.as_ref())
+            .await
+            .unwrap();
+        let unrecorded = EmailError::DeliveryOutcomeNotRecorded {
+            email_id: claimed,
+            outcome: "sent".to_string(),
+            reason: "connection reset".to_string(),
+        };
+        email_service
+            .release_failed_resend(
+                claimed,
+                Some("Domain not verified".to_string()),
+                &unrecorded,
+            )
+            .await;
+        let stored = email_service.get(claimed).await.unwrap();
+        assert_eq!(
+            stored.status, "queued",
+            "an email the provider accepted must not reappear as an undelivered capture"
+        );
+        assert_eq!(stored.error_message, None);
+        assert!(
+            matches!(
+                email_service.resend(claimed).await,
+                Err(EmailError::NotResendable { .. })
+            ),
+            "it must not be resendable while its claim is live"
+        );
     }
 
     #[tokio::test]

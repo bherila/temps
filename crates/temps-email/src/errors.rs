@@ -64,6 +64,19 @@ pub enum EmailError {
         reason: String,
     },
 
+    /// The provider was handed the email and accepted it, or may have, but
+    /// that result could not be saved. The email is not undelivered, and
+    /// sending it again could deliver it twice.
+    #[error(
+        "Email {email_id} was handed to the provider (outcome: {outcome}) but that result \
+         could not be recorded: {reason}"
+    )]
+    DeliveryOutcomeNotRecorded {
+        email_id: uuid::Uuid,
+        outcome: String,
+        reason: String,
+    },
+
     #[error("Invalid provider type: {0}")]
     InvalidProviderType(String),
 
