@@ -346,9 +346,9 @@ WORKDIR /{project_slug}
         // Normalize the runtime tree after the build. Standalone mode is
         // selected from actual output, so functional/TypeScript configs work
         // without parsing or changing the user's Next.js configuration.
-        // `.git` stays in the build stage for builds that read VCS metadata,
-        // but never reaches the runtime image: the `next start` fallback
-        // copies the whole tree, and repository history must not ship.
+        // Build-time credentials and repository metadata stay in the build
+        // stage. The `next start` fallback retains custom runtime files and
+        // workspace dependencies, then removes .env files, .npmrc, and .git.
         let app_relative = if matches!(build_system.monorepo_tool, MonorepoTool::None) {
             ""
         } else {
@@ -382,6 +382,7 @@ RUN mkdir -p public {runtime_app} && \
         cp -a /{project_slug}/. /temps-runtime/ && \
         printf '%s\n' '#!/bin/sh' "exec node \"\$(node -p \"require.resolve('next/dist/bin/next')\")\" start" > /temps-start.sh; \
     fi && \
+    find /temps-runtime \( -name .env -o -name '.env.*' \) \( -type f -o -type l \) -delete && \
     find /temps-runtime -name .npmrc -type f -delete && \
     find /temps-runtime -name .git -prune -exec rm -rf {{}} +
 
@@ -538,6 +539,38 @@ mod tests {
             std::fs::write(root.join("node_modules/shared/index.js"), "shared").unwrap();
             std::fs::write(app.join(".next/static/chunk.js"), "chunk").unwrap();
             std::fs::write(app.join("public/asset.txt"), "asset").unwrap();
+            std::fs::write(root.join(".env"), "BUILD_ONLY=test-only").unwrap();
+            std::fs::write(root.join(".env.production"), "BUILD_ONLY=test-only").unwrap();
+            std::fs::write(app.join("public/.env.local"), "BUILD_ONLY=test-only").unwrap();
+            let runtime_source = if standalone {
+                app.join(".next/standalone").join(app_relative)
+            } else {
+                app.clone()
+            };
+            std::fs::create_dir_all(runtime_source.join("runtime-data")).unwrap();
+            std::fs::write(runtime_source.join("runtime-data/catalog.json"), "catalog").unwrap();
+            std::fs::write(
+                runtime_source.join("runtime-data/.env.local"),
+                "BUILD_ONLY=test-only",
+            )
+            .unwrap();
+            std::fs::write(runtime_source.join(".env"), "BUILD_ONLY=test-only").unwrap();
+            std::fs::write(
+                runtime_source.join(".env.production"),
+                "BUILD_ONLY=test-only",
+            )
+            .unwrap();
+            std::fs::write(
+                runtime_source.join("runtime-data/config.env"),
+                "runtime config",
+            )
+            .unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(
+                "runtime-data/catalog.json",
+                runtime_source.join(".env.link"),
+            )
+            .unwrap();
             if !app_relative.is_empty() {
                 std::fs::write(root.join("turbo.json"), "{}").unwrap();
                 std::fs::write(app.join("package.json"), "{}").unwrap();
@@ -588,6 +621,29 @@ mod tests {
             let packaged_app = runtime.join(app_relative);
             assert!(!runtime.join(".npmrc").exists());
             assert!(!runtime.join(".git").exists());
+            for path in [
+                runtime.join(".env"),
+                runtime.join(".env.production"),
+                packaged_app.join(".env"),
+                packaged_app.join(".env.production"),
+                packaged_app.join(".env.link"),
+                packaged_app.join("runtime-data/.env.local"),
+                packaged_app.join("public/.env.local"),
+            ] {
+                assert!(
+                    std::fs::symlink_metadata(&path).is_err(),
+                    "{}",
+                    path.display()
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(packaged_app.join("runtime-data/catalog.json")).unwrap(),
+                "catalog"
+            );
+            assert_eq!(
+                std::fs::read_to_string(packaged_app.join("runtime-data/config.env")).unwrap(),
+                "runtime config"
+            );
             assert_eq!(
                 std::fs::read_to_string(packaged_app.join("public/asset.txt")).unwrap(),
                 "asset"
