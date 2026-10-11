@@ -2016,11 +2016,13 @@ pub async fn get_recent_activity(
     project_scope_guard!(auth, query.project_id);
     project_access_guard!(auth, query.project_id, app_state.project_access_checker);
 
+    let environment_id = scoped_recent_activity_environment(&auth, query.environment_id)?;
+
     match app_state
         .analytics_service
         .get_recent_activity(
             query.project_id,
-            query.environment_id,
+            environment_id,
             query.since_id,
             query.limit,
         )
@@ -2032,6 +2034,33 @@ pub async fn get_recent_activity(
             Err(handle_analytics_error(e))
         }
     }
+}
+
+fn scoped_recent_activity_environment(
+    auth: &temps_auth::AuthContext,
+    requested_environment_id: Option<i32>,
+) -> Result<Option<i32>, Problem> {
+    let Some(token_info) = auth.deployment_token_info() else {
+        return Ok(requested_environment_id);
+    };
+
+    let Some(scoped_environment_id) = token_info.environment_id else {
+        return Ok(requested_environment_id);
+    };
+
+    if let Some(requested_environment_id) = requested_environment_id {
+        if requested_environment_id != scoped_environment_id {
+            return Err(temps_core::error_builder::ErrorBuilder::new(axum::http::StatusCode::FORBIDDEN)
+                .type_("https://temps.sh/probs/cross-environment-access-denied")
+                .title("Cross-Environment Access Denied")
+                .detail(
+                    "This deployment token is scoped to a different environment and cannot access this resource",
+                )
+                .build());
+        }
+    }
+
+    Ok(Some(scoped_environment_id))
 }
 
 /// Get detailed analytics for a specific event
@@ -2533,5 +2562,66 @@ mod enrich_handler_tests {
         );
 
         cleanup_test_analytics!(db);
+    }
+}
+
+#[cfg(test)]
+mod recent_activity_scope_tests {
+    use super::scoped_recent_activity_environment;
+    use axum::{http::StatusCode, response::IntoResponse};
+    use temps_auth::AuthContext;
+    use temps_entities::deployment_tokens::DeploymentTokenPermission;
+
+    fn deployment_token(environment_id: Option<i32>) -> AuthContext {
+        AuthContext::new_deployment_token(
+            7,
+            environment_id,
+            Some(70),
+            1,
+            "test-token".to_string(),
+            vec![DeploymentTokenPermission::AnalyticsRead],
+        )
+    }
+
+    #[test]
+    fn environment_scoped_deployment_token_forces_missing_environment_filter() {
+        let auth = deployment_token(Some(42));
+
+        assert_eq!(
+            scoped_recent_activity_environment(&auth, None).unwrap(),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn environment_scoped_deployment_token_allows_matching_environment_filter() {
+        let auth = deployment_token(Some(42));
+
+        assert_eq!(
+            scoped_recent_activity_environment(&auth, Some(42)).unwrap(),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn environment_scoped_deployment_token_rejects_different_environment_filter() {
+        let auth = deployment_token(Some(42));
+
+        let error = scoped_recent_activity_environment(&auth, Some(43)).unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn project_scoped_deployment_token_preserves_requested_environment_filter() {
+        let auth = deployment_token(None);
+
+        assert_eq!(
+            scoped_recent_activity_environment(&auth, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            scoped_recent_activity_environment(&auth, Some(43)).unwrap(),
+            Some(43)
+        );
     }
 }
