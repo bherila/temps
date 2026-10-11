@@ -77,6 +77,18 @@ pub enum EmailError {
         reason: String,
     },
 
+    /// The provider definitively rejected the email, but that result could
+    /// not be saved. The email was not delivered, so sending it again is safe.
+    #[error(
+        "Email {email_id} was rejected by the provider ({rejection}) but that result could not \
+         be recorded: {reason}"
+    )]
+    DeliveryRejectionNotRecorded {
+        email_id: uuid::Uuid,
+        rejection: String,
+        reason: String,
+    },
+
     #[error("Invalid provider type: {0}")]
     InvalidProviderType(String),
 

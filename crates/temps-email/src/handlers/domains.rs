@@ -129,6 +129,7 @@ impl From<EmailError> for Problem {
             | EmailError::TrackingRewrite { .. }
             | EmailError::ResendInterrupted { .. }
             | EmailError::DeliveryOutcomeNotRecorded { .. }
+            | EmailError::DeliveryRejectionNotRecorded { .. }
             | EmailError::SendFailed { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
