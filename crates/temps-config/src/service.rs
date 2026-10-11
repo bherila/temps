@@ -421,6 +421,17 @@ pub struct ServerConfig {
     // etc.). When unset, both surfaces share `console_address` for backwards
     // compatibility. See [admin-listener-split] for the route classification.
     pub console_admin_address: Option<String>,
+    /// Address of a listener that serves only the console's public routes
+    /// (ADR-051): health probes and the receivers third parties call (email
+    /// tracking, provider webhooks, ingest). The proxy sends the public
+    /// ingress hostname and admin-gate-denied requests here, so they cannot
+    /// reach an admin handler or the dashboard whatever their path.
+    ///
+    /// Bootstrap configuration, like `console_address`: it has to be known
+    /// before the listener binds. It is a listener of its own even when
+    /// `console_admin_address` is set — see
+    /// [`ServerConfig::public_surface_address`], which is what to read.
+    pub console_ingress_address: Option<String>,
     /// Comma-separated list of IPs / CIDRs allowed to reach the admin listener.
     /// Empty / unset = no IP allowlist (admin gated only by binding address).
     pub admin_allowed_ips: Vec<String>,
@@ -495,6 +506,14 @@ impl ServerConfig {
             .ok()
             .filter(|s| !s.is_empty());
 
+        // Public-only listener (ADR-051). Named explicitly only when the
+        // proxy is a separate process that must be told where it is; the
+        // single-binary server picks a loopback port for itself via
+        // `with_default_ingress_listener`.
+        let console_ingress_address = std::env::var("TEMPS_CONSOLE_INGRESS_ADDRESS")
+            .ok()
+            .filter(|s| !s.is_empty());
+
         let admin_allowed_ips = std::env::var("TEMPS_ADMIN_ALLOWED_IPS")
             .ok()
             .map(|s| {
@@ -528,6 +547,7 @@ impl ServerConfig {
             tls_address,
             console_address,
             console_admin_address,
+            console_ingress_address,
             admin_allowed_ips,
             admin_allowed_hosts,
             admin_trust_forwarded_for,
@@ -605,6 +625,36 @@ impl ServerConfig {
             && self.clickhouse_database.is_some()
             && self.clickhouse_user.is_some()
             && self.clickhouse_password.is_some()
+    }
+
+    /// Reserve a loopback address for the public-only listener when the
+    /// operator named none.
+    ///
+    /// For the single-binary server, where the in-process proxy is handed the
+    /// address directly. A split console must not call this: a sibling
+    /// `temps proxy` cannot discover a random port, so there the listener is
+    /// only bound when `--console-ingress-address` names one.
+    pub fn with_default_ingress_listener(mut self) -> Self {
+        if self.public_surface_address().is_none() {
+            self.console_ingress_address = Some(Self::get_random_console_address());
+        }
+        self
+    }
+
+    /// The address of the listener that serves only the console's public
+    /// routes, when one exists (ADR-051). The console binds it, and the proxy
+    /// sends it every request that may reach nothing else.
+    ///
+    /// It is a listener of its own in every topology. In dual-listener mode
+    /// `console_address` looks like a candidate, since no admin route is
+    /// mounted there, but it also serves the MCP endpoint, whose operations
+    /// accept a session cookie or an API key. Reusing it would let a client
+    /// the admin gate denied run MCP operations with valid credentials, which
+    /// is exactly what the gate exists to prevent.
+    pub fn public_surface_address(&self) -> Option<&str> {
+        self.console_ingress_address
+            .as_deref()
+            .filter(|address| !address.is_empty())
     }
 
     /// Get a random available port for console address
@@ -1134,6 +1184,75 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         Ok(settings
             .external_url
             .unwrap_or_else(|| "http://localho.st".to_string()))
+    }
+
+    /// Base URL handed to third parties that call back into Temps (ADR-051):
+    /// `public_ingress_url` when set, `external_url` otherwise, the local
+    /// default when neither is. No trailing slash.
+    ///
+    /// Use this, not [`Self::get_external_url_or_default`], for any URL a
+    /// machine or person who is not an operator will request: tracking pixels
+    /// and click redirects, provider webhooks, a browser-SDK DSN. Links an
+    /// operator opens in the console keep using the external URL.
+    pub async fn get_public_ingress_url(&self) -> Result<String, ConfigServiceError> {
+        Ok(self.get_settings().await?.effective_public_ingress_url())
+    }
+
+    /// Name the kind of stored domain record that covers `host`, or `None`
+    /// when no record does.
+    ///
+    /// A record covers `host` when it names it exactly or is a single-label
+    /// wildcard over it (`*.example.com` covers `app.example.com`, matching
+    /// how the proxy resolves wildcards).
+    ///
+    /// This sees records the route table does not serve yet — a custom domain
+    /// on an environment that was never deployed — but it is not the whole
+    /// answer: names generated from an environment's subdomain are not stored
+    /// as domain rows at all. Callers that must know whether a hostname is in
+    /// use combine it with the route table's own check
+    /// (`RouteTableRefresher::application_serving_host`).
+    pub async fn hostname_claimed_by(
+        &self,
+        host: &str,
+    ) -> Result<Option<&'static str>, ConfigServiceError> {
+        use temps_entities::{custom_routes, environment_domains, project_custom_domains};
+
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            return Ok(None);
+        }
+        let mut candidates = vec![host.clone()];
+        if let Some((label, parent)) = host.split_once('.') {
+            if !label.is_empty() && !parent.is_empty() {
+                candidates.push(format!("*.{parent}"));
+            }
+        }
+
+        if project_custom_domains::Entity::find()
+            .filter(project_custom_domains::Column::Domain.is_in(candidates.clone()))
+            .one(self.db.as_ref())
+            .await?
+            .is_some()
+        {
+            return Ok(Some("a project custom domain"));
+        }
+        if environment_domains::Entity::find()
+            .filter(environment_domains::Column::Domain.is_in(candidates.clone()))
+            .one(self.db.as_ref())
+            .await?
+            .is_some()
+        {
+            return Ok(Some("an environment domain"));
+        }
+        if custom_routes::Entity::find()
+            .filter(custom_routes::Column::Domain.is_in(candidates))
+            .one(self.db.as_ref())
+            .await?
+            .is_some()
+        {
+            return Ok(Some("a custom route"));
+        }
+        Ok(None)
     }
 
     /// Derive the URL scheme from `external_url` — returns "http" or "https".
@@ -5393,5 +5512,353 @@ mod tests {
             updated.cloud.console_access_enabled,
             "the 4th positional argument must map to console_access_enabled"
         );
+    }
+
+    fn config_with_listeners(admin: Option<&str>, ingress: Option<&str>) -> ServerConfig {
+        let mut config = (*test_config()).clone();
+        config.console_address = "127.0.0.1:8000".to_string();
+        config.console_admin_address = admin.map(str::to_string);
+        config.console_ingress_address = ingress.map(str::to_string);
+        config
+    }
+
+    // ADR-051 D4: the public-only surface is a listener of its own in every
+    // topology.
+    #[test]
+    fn single_listener_binds_a_dedicated_public_only_listener() {
+        let config = config_with_listeners(None, Some("127.0.0.1:8002"));
+        assert_eq!(config.public_surface_address(), Some("127.0.0.1:8002"));
+    }
+
+    // In dual-listener mode `console_address` has no admin routes but does
+    // serve authenticated MCP. A request the admin gate denied must not land
+    // there, so it is never the public-only surface.
+    #[test]
+    fn dual_listener_never_reuses_the_console_listener_as_the_public_surface() {
+        let with_ingress = config_with_listeners(Some("127.0.0.1:8001"), Some("127.0.0.1:8002"));
+        assert_eq!(
+            with_ingress.public_surface_address(),
+            Some("127.0.0.1:8002")
+        );
+
+        let without_ingress = config_with_listeners(Some("127.0.0.1:8001"), None);
+        assert_eq!(
+            without_ingress.public_surface_address(),
+            None,
+            "without a dedicated listener there is no public-only surface, \
+             and the proxy keeps answering gate-denied requests itself"
+        );
+        assert_ne!(
+            with_ingress.public_surface_address(),
+            Some(with_ingress.console_address.as_str())
+        );
+    }
+
+    #[test]
+    fn no_public_only_listener_without_an_ingress_address() {
+        for ingress in [None, Some("")] {
+            let config = config_with_listeners(None, ingress);
+            assert_eq!(config.public_surface_address(), None);
+        }
+    }
+
+    #[test]
+    fn default_ingress_listener_is_loopback_and_filled_in_both_listener_modes() {
+        for admin in [None, Some("127.0.0.1:8001")] {
+            let config = config_with_listeners(admin, None).with_default_ingress_listener();
+            let address = config
+                .public_surface_address()
+                .expect("the single-binary server gets a public-only listener");
+            let socket: std::net::SocketAddr = address.parse().expect("a socket address");
+            assert!(socket.ip().is_loopback(), "{address} must be loopback");
+            assert_ne!(address, config.console_address);
+            assert_ne!(Some(address), config.console_admin_address.as_deref());
+        }
+
+        // An explicit address is kept; an empty one counts as unset.
+        let explicit =
+            config_with_listeners(None, Some("127.0.0.1:8002")).with_default_ingress_listener();
+        assert_eq!(explicit.public_surface_address(), Some("127.0.0.1:8002"));
+        let blank = config_with_listeners(None, Some("")).with_default_ingress_listener();
+        assert!(blank.public_surface_address().is_some());
+    }
+
+    /// Count occurrences of `needle` in every `.rs` file under `dir`, keyed by
+    /// path relative to `root`.
+    fn count_in_sources(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        needle: &str,
+        counts: &mut BTreeMap<String, usize>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                count_in_sources(root, &path, needle, counts);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let count = std::fs::read_to_string(&path)
+                    .map(|source| source.matches(needle).count())
+                    .unwrap_or(0);
+                if count > 0 {
+                    let relative = path.strip_prefix(root).unwrap_or(&path);
+                    counts.insert(relative.to_string_lossy().replace('\\', "/"), count);
+                }
+            }
+        }
+    }
+
+    // ADR-051 D2: every URL Temps emits is classified by who will request it.
+    // A third party gets `get_public_ingress_url`; only links an operator's
+    // own browser follows may use the external (console) URL.
+    //
+    // This fails when a crate that serves third-party receivers gains a new
+    // `get_external_url*` call, so the author has to decide which it is: use
+    // `get_public_ingress_url`, or add the site below with the reason it is
+    // operator-facing. Getting it wrong is silent in production — the
+    // callback simply never arrives when the console is restricted.
+    #[test]
+    fn external_url_use_in_receiver_crates_is_classified() {
+        const RECEIVER_CRATES: &[&str] = &[
+            "temps-agents",
+            "temps-analytics-events",
+            "temps-analytics-performance",
+            "temps-analytics-session-replay",
+            "temps-email",
+            "temps-email-tracking",
+            "temps-error-tracking",
+            "temps-git",
+            "temps-otel",
+            "temps-projects",
+        ];
+        // (file, call sites, why the console URL is right there)
+        const OPERATOR_FACING: &[(&str, usize, &str)] = &[(
+            "temps-git/src/handlers/github.rs",
+            3,
+            "GitHub redirects the operator's own browser back to the console \
+             after creating, authorizing or installing the App",
+        )];
+
+        let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("temps-config lives in crates/");
+        let mut found = BTreeMap::new();
+        for name in RECEIVER_CRATES {
+            count_in_sources(
+                crates_dir,
+                &crates_dir.join(name).join("src"),
+                "get_external_url",
+                &mut found,
+            );
+        }
+
+        let expected: BTreeMap<String, usize> = OPERATOR_FACING
+            .iter()
+            .map(|(file, count, _reason)| (file.to_string(), *count))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "a crate that serves third-party receivers changed how often it reads the \
+             external (console) URL. A URL a third party will request must be built \
+             from ConfigService::get_public_ingress_url (ADR-051 D2); if the new use \
+             is a link an operator's browser follows, record it in OPERATOR_FACING \
+             with the reason."
+        );
+    }
+
+    fn settings_row_with_urls(external: Option<&str>, ingress: Option<&str>) -> settings::Model {
+        let s = AppSettings {
+            external_url: external.map(str::to_string),
+            public_ingress_url: ingress.map(str::to_string),
+            ..AppSettings::default()
+        };
+        settings::Model {
+            id: 1,
+            data: s.to_json(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    // ADR-051 D1: one getter resolves the URL third parties are given.
+    #[tokio::test]
+    async fn public_ingress_url_prefers_the_explicit_setting() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row_with_urls(
+                Some("https://console.example.com"),
+                Some("https://hooks.example.com"),
+            )]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        assert_eq!(
+            svc.get_public_ingress_url().await.expect("ingress url"),
+            "https://hooks.example.com"
+        );
+        // Operator-facing links are untouched by the ingress setting.
+        assert_eq!(
+            svc.get_external_url_or_default().await.expect("external"),
+            "https://console.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_ingress_url_falls_back_to_the_external_url_then_the_default() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row_with_urls(
+                Some("https://console.example.com/"),
+                None,
+            )]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        assert_eq!(
+            svc.get_public_ingress_url().await.expect("ingress url"),
+            "https://console.example.com"
+        );
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row_with_urls(None, None)]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        assert_eq!(
+            svc.get_public_ingress_url().await.expect("ingress url"),
+            svc.get_external_url_or_default().await.expect("external"),
+            "an unconfigured install must keep emitting the URLs it always has"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_ingress_url_surfaces_a_database_error() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors(vec![sea_orm::DbErr::Custom("connection reset".into())])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        assert!(matches!(
+            svc.get_public_ingress_url().await,
+            Err(ConfigServiceError::Database(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hostname_claimed_by_reports_a_free_hostname() {
+        use temps_entities::{custom_routes, environment_domains, project_custom_domains};
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<project_custom_domains::Model>::new()])
+            .append_query_results(vec![Vec::<environment_domains::Model>::new()])
+            .append_query_results(vec![Vec::<custom_routes::Model>::new()])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        assert_eq!(
+            svc.hostname_claimed_by("hooks.example.com").await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn hostname_claimed_by_names_the_record_that_routes_it() {
+        use temps_entities::{environment_domains, project_custom_domains};
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![project_custom_domains::Model {
+                id: 7,
+                project_id: 3,
+                environment_id: 4,
+                domain: "hooks.example.com".into(),
+                redirect_to: None,
+                status_code: None,
+                branch: None,
+                status: "active".into(),
+                message: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                certificate_id: None,
+                service_name: None,
+            }]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        assert_eq!(
+            svc.hostname_claimed_by(" Hooks.Example.com. ")
+                .await
+                .unwrap(),
+            Some("a project custom domain")
+        );
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<project_custom_domains::Model>::new()])
+            .append_query_results(vec![vec![environment_domains::Model {
+                id: 9,
+                environment_id: 4,
+                domain: "hooks.example.com".into(),
+                created_at: Utc::now(),
+            }]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        assert_eq!(
+            svc.hostname_claimed_by("hooks.example.com").await.unwrap(),
+            Some("an environment domain")
+        );
+    }
+
+    // A wildcard record serves every name one label below it, so reserving
+    // such a name would take the application behind the wildcard offline.
+    #[tokio::test]
+    async fn hostname_claimed_by_looks_for_the_wildcard_that_covers_the_host() {
+        use temps_entities::project_custom_domains;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![project_custom_domains::Model {
+                    id: 7,
+                    project_id: 3,
+                    environment_id: 4,
+                    domain: "*.example.com".into(),
+                    redirect_to: None,
+                    status_code: None,
+                    branch: None,
+                    status: "active".into(),
+                    message: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    certificate_id: None,
+                    service_name: None,
+                }]])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        assert_eq!(
+            svc.hostname_claimed_by("App.Example.com").await.unwrap(),
+            Some("a project custom domain")
+        );
+        // The query asked for the exact name and for the wildcard one label up.
+        drop(svc);
+        let db = Arc::into_inner(db).expect("the service was the only other owner");
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(log.contains("app.example.com"), "{log}");
+        assert!(log.contains("*.example.com"), "{log}");
+        assert!(
+            !log.contains("*.com"),
+            "a wildcard stands for exactly one label: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hostname_claimed_by_ignores_an_empty_hostname_without_querying() {
+        // No query results are queued: touching the database would error.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        assert_eq!(svc.hostname_claimed_by("  ").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn hostname_claimed_by_surfaces_a_database_error() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors(vec![sea_orm::DbErr::Custom("connection reset".into())])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        assert!(matches!(
+            svc.hostname_claimed_by("hooks.example.com").await,
+            Err(ConfigServiceError::Database(_))
+        ));
     }
 }

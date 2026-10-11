@@ -21,6 +21,16 @@ pub struct AppSettings {
     /// mapping (which Temps adds to provisioned containers). Distinct from
     /// `external_url`, which is the public-facing address.
     pub internal_url: Option<String>,
+    /// Base URL handed to third parties that call back into Temps: email
+    /// open/click tracking, git provider webhooks, SES/SNS events, revenue
+    /// webhooks, the Sentry DSN (ADR-051). `None` (the default) falls back to
+    /// `external_url`, which is right whenever the console is publicly
+    /// reachable. Set it when the console host is restricted (VPN, firewall,
+    /// identity-aware proxy) so only this hostname has to be public: the proxy
+    /// serves nothing but the public callback routes on it. Read it through
+    /// [`AppSettings::effective_public_ingress_url`].
+    #[serde(default)]
+    pub public_ingress_url: Option<String>,
     pub preview_domain: String,
     /// Public edge target that generated DNS records point at when a managed
     /// domain opts into automatic record sync. An IPv4/IPv6 address produces an
@@ -2001,6 +2011,7 @@ impl Default for AppSettings {
         Self {
             external_url: None,
             internal_url: None,
+            public_ingress_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
             edge_target: None,
             cloudflare_new_projects: false,
@@ -2347,9 +2358,10 @@ impl AppSettings {
     /// True when `host` is owned by the platform itself and must never be
     /// claimed by a project domain.
     ///
-    /// Reserved hosts are the console hostname (`external_url`) and the
-    /// preview domain apex — routing either of them at a project makes the
-    /// console or every generated preview URL unreachable, and recovering
+    /// Reserved hosts are the console hostname (`external_url`), the public
+    /// ingress hostname (`public_ingress_url`) and the preview domain apex —
+    /// routing any of them at a project makes the console, every third-party
+    /// callback or every generated preview URL unreachable, and recovering
     /// requires shell/IP access to the box (issue #478).
     pub fn is_reserved_hostname(&self, host: &str) -> bool {
         let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -2357,6 +2369,9 @@ impl AppSettings {
             return false;
         }
         if self.console_hostname().as_deref() == Some(host.as_str()) {
+            return true;
+        }
+        if self.public_ingress_hostname().as_deref() == Some(host.as_str()) {
             return true;
         }
         let preview = self
@@ -2588,6 +2603,36 @@ mod tests {
             ..Default::default()
         };
         assert!(!s.is_reserved_hostname("anything.example.com"));
+    }
+
+    // ADR-051: the public ingress hostname is a platform host, exactly like
+    // the console hostname. A project that claimed it would swallow every
+    // third-party callback.
+    #[test]
+    fn reserved_hostname_covers_the_public_ingress_host() {
+        let s = AppSettings {
+            external_url: Some("https://console.example.com".to_string()),
+            public_ingress_url: Some("https://Hooks.example.com/".to_string()),
+            preview_domain: "apps.example.com".to_string(),
+            ..Default::default()
+        };
+        assert!(s.is_reserved_hostname("hooks.example.com"));
+        assert!(s.is_reserved_hostname("HOOKS.example.com."));
+        assert!(s.is_reserved_hostname("console.example.com"));
+        assert!(!s.is_reserved_hostname("other.example.com"));
+    }
+
+    #[test]
+    fn settings_stored_before_public_ingress_existed_still_load() {
+        let s = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://console.example.com",
+            "preview_domain": "apps.example.com"
+        }));
+        assert_eq!(s.public_ingress_url, None);
+        assert_eq!(
+            s.effective_public_ingress_url(),
+            "https://console.example.com"
+        );
     }
 
     // ADR-024: cluster-DNS injection is experimental/beta and defaults OFF

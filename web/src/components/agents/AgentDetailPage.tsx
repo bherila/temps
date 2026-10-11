@@ -36,6 +36,7 @@ import {
 import type { AgentRunResponse as AgentRun } from '@/api/client/types.gen'
 import { AutopilotStatusBadge } from './AutopilotStatusBadge'
 import { settingsSectionHref } from '@/lib/project-settings-sections'
+import { PublicCallbackUrl } from '@/components/settings/PublicCallbackUrl'
 
 interface AgentDetailPageProps {
   project: ProjectResponse
@@ -324,25 +325,15 @@ function AgentProperties({ agent }: { agent: Agent }) {
               </div>
               <div className="space-y-1.5">
                 <label className="text-xs text-muted-foreground">URL</label>
-                <div className="flex items-center gap-2">
-                  <code className="text-xs bg-muted px-2 py-1.5 rounded flex-1 overflow-x-auto">
-                    POST {window.location.origin}
-                    {agent.webhook_url}
-                  </code>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      navigator.clipboard.writeText(
-                        `${window.location.origin}${agent.webhook_url}`
-                      )
-                      toast.success('URL copied')
-                    }}
-                    className="text-muted-foreground hover:text-foreground p-1"
-                    title="Copy URL"
-                  >
-                    <Copy className="h-3.5 w-3.5" />
-                  </button>
-                </div>
+                {/* Whatever triggers the agent calls from outside, so the URL
+                    is built from the public ingress URL the API reports, not
+                    from the address being browsed. */}
+                <PublicCallbackUrl
+                  path={agent.webhook_url}
+                  prefix="POST"
+                  label="Copy webhook URL"
+                  codeClassName="py-1.5"
+                />
               </div>
               <div className="space-y-1.5">
                 <label className="text-xs text-muted-foreground">

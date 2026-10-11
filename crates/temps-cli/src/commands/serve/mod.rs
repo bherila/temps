@@ -270,6 +270,20 @@ pub struct ServeCommand {
     #[arg(long, env = "TEMPS_CONSOLE_ADMIN_ADDRESS")]
     pub console_admin_address: Option<String>,
 
+    /// Address of a listener that serves only the console's public routes
+    /// (email tracking, provider webhooks, ingest) and nothing else.
+    ///
+    /// The proxy sends third-party callbacks here, so they can arrive while
+    /// the console itself stays restricted. The single-binary server picks a
+    /// loopback port for this automatically. Set it only in split topology
+    /// (`--role=console`), together with the same value on
+    /// `temps proxy --console-ingress-address`. It must be an address of its
+    /// own, also when `--console-admin-address` is set: `--console-address`
+    /// has no admin routes then, but still serves the authenticated MCP
+    /// endpoint.
+    #[arg(long, env = "TEMPS_CONSOLE_INGRESS_ADDRESS")]
+    pub console_ingress_address: Option<String>,
+
     /// Forbid applying release updates from the console, permanently for the
     /// lifetime of this process.
     ///
@@ -347,6 +361,26 @@ pub struct ServeCommand {
     pub profile: ServeProfile,
 }
 
+/// Name the flag whose address the public-only listener would collide with,
+/// if any. Blank values count as unset.
+fn ingress_listener_clash(
+    ingress: Option<&str>,
+    console: Option<&str>,
+    admin: Option<&str>,
+) -> Option<&'static str> {
+    let ingress = ingress
+        .map(str::trim)
+        .filter(|address| !address.is_empty())?;
+    let same = |other: Option<&str>| other.map(str::trim) == Some(ingress);
+    if same(console) {
+        Some("--console-address")
+    } else if same(admin) {
+        Some("--console-admin-address")
+    } else {
+        None
+    }
+}
+
 impl ServeCommand {
     /// Run `temps serve` with the OSS-only plugin set.
     pub fn execute(self) -> anyhow::Result<()> {
@@ -415,6 +449,9 @@ impl ServeCommand {
         if let Some(ref admin) = self.console_admin_address {
             std::env::set_var("TEMPS_CONSOLE_ADMIN_ADDRESS", admin);
         }
+        if let Some(ref ingress) = self.console_ingress_address {
+            std::env::set_var("TEMPS_CONSOLE_INGRESS_ADDRESS", ingress);
+        }
 
         // Same bridge for the data directory. `ServerConfig::new` resolves it
         // from TEMPS_DATA_DIR or falls back to ~/.temps, and never saw this
@@ -445,6 +482,23 @@ impl ServeCommand {
             );
         }
 
+        // The public-only listener exists so that a request may reach the
+        // public routes and nothing else. Pointing it at a listener that
+        // serves more would quietly remove that guarantee (and fail to bind).
+        if let Some(clash) = ingress_listener_clash(
+            self.console_ingress_address.as_deref(),
+            self.console_address.as_deref(),
+            self.console_admin_address.as_deref(),
+        ) {
+            anyhow::bail!(
+                "--console-ingress-address must be an address of its own, but it is the same \
+                 as {clash}.\n\nThat listener serves more than the public callback routes, so \
+                 requests the admin gate denies would reach it. Give the public-only listener \
+                 a separate loopback port, e.g. `--console-ingress-address 127.0.0.1:8082`, or \
+                 omit the flag to let `temps serve` pick one."
+            );
+        }
+
         let (effective_proxy_address, effective_proxy_tls_address) = effective_proxy_listeners(
             self.role,
             &self.address,
@@ -455,12 +509,21 @@ impl ServeCommand {
 
         let external_plugin_registry = temps_external_plugins::catalog::RegistryConfig::default();
 
-        let serve_config = Arc::new(temps_config::ServerConfig::new(
+        let serve_config = temps_config::ServerConfig::new(
             effective_proxy_address,
             self.database_url.clone(),
             effective_proxy_tls_address,
             self.console_address.clone(),
-        )?);
+        )?;
+        // ADR-051: the in-process proxy is handed the public-only listener's
+        // address directly, so it can live on a random loopback port. A split
+        // console only binds one when `--console-ingress-address` names it,
+        // because the sibling `temps proxy` could not discover a random port.
+        let serve_config = Arc::new(if self.role == ServeRole::Console {
+            serve_config
+        } else {
+            serve_config.with_default_ingress_listener()
+        });
         let encryption_service = Arc::new(temps_core::EncryptionService::new(
             &serve_config.encryption_key,
         )?);
@@ -1278,6 +1341,50 @@ impl ServeCommand {
             self.profile.local_workloads_enabled(),
             console_startup_state,
         )
+    }
+}
+
+#[cfg(test)]
+mod ingress_listener_tests {
+    use super::ingress_listener_clash;
+
+    #[test]
+    fn a_dedicated_ingress_address_does_not_clash() {
+        assert_eq!(
+            ingress_listener_clash(
+                Some("127.0.0.1:8082"),
+                Some("127.0.0.1:8081"),
+                Some("127.0.0.1:9001")
+            ),
+            None
+        );
+        assert_eq!(
+            ingress_listener_clash(None, Some("127.0.0.1:8081"), None),
+            None
+        );
+        assert_eq!(ingress_listener_clash(Some("  "), Some("  "), None), None);
+    }
+
+    // Reusing the console listener is what let gate-denied requests reach
+    // authenticated MCP in dual-listener mode.
+    #[test]
+    fn reusing_the_console_or_admin_listener_is_refused() {
+        assert_eq!(
+            ingress_listener_clash(
+                Some("127.0.0.1:8081"),
+                Some("127.0.0.1:8081"),
+                Some("127.0.0.1:9001")
+            ),
+            Some("--console-address")
+        );
+        assert_eq!(
+            ingress_listener_clash(
+                Some(" 127.0.0.1:9001 "),
+                Some("127.0.0.1:8081"),
+                Some("127.0.0.1:9001")
+            ),
+            Some("--console-admin-address")
+        );
     }
 }
 

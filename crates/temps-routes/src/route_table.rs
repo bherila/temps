@@ -616,6 +616,10 @@ struct LegacyRouteTable {
     exact: HashMap<String, RouteInfo>,
     wildcards: WildcardMatcher,
     reserved_console_host: Option<String>,
+    /// Hostname of an explicit `public_ingress_url` that is not the console
+    /// hostname (ADR-051). Reserved exactly like the console hostname, and
+    /// additionally pinned by the proxy to the public-only console surface.
+    reserved_ingress_host: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -645,8 +649,15 @@ impl RouteTableSnapshot {
 }
 
 impl LegacyRouteTable {
+    /// Whether `host` belongs to the platform itself (console or public
+    /// ingress) and must therefore never resolve to a project route.
+    fn is_reserved(&self, host: &str) -> bool {
+        self.reserved_console_host.as_deref() == Some(host)
+            || self.reserved_ingress_host.as_deref() == Some(host)
+    }
+
     fn get(&self, host: &str) -> Option<&RouteInfo> {
-        if self.reserved_console_host.as_deref() == Some(host) {
+        if self.is_reserved(host) {
             return None;
         }
         self.exact
@@ -689,12 +700,10 @@ fn build_route_ownership_snapshot<'a>(
     legacy_hosts: impl IntoIterator<Item = &'a String>,
     http_hosts: impl IntoIterator<Item = &'a String>,
     tls_hosts: impl IntoIterator<Item = &'a String>,
-    reserved_console_host: Option<String>,
+    reserved_hosts: impl IntoIterator<Item = String>,
 ) -> RouteOwnershipSnapshot {
     let mut snapshot = RouteOwnershipSnapshot::default();
-    if let Some(host) = reserved_console_host {
-        snapshot.reserved_hosts.insert(host);
-    }
+    snapshot.reserved_hosts.extend(reserved_hosts);
     for host in legacy_hosts.into_iter().chain(http_hosts).chain(tls_hosts) {
         if let Some(base) = host.strip_prefix("*.") {
             if !base.is_empty() {
@@ -1240,7 +1249,7 @@ impl CachedPeerTable {
     /// Checks exact matches first, then wildcard patterns.
     pub fn get_route_by_host(&self, host: &str) -> Option<RouteInfo> {
         let snapshot = self.route_snapshot.load();
-        if snapshot.legacy.reserved_console_host.as_deref() == Some(host) {
+        if snapshot.legacy.is_reserved(host) {
             return None;
         }
 
@@ -1270,7 +1279,7 @@ impl CachedPeerTable {
     /// Checks exact matches first, then wildcard patterns.
     pub fn get_route_by_sni(&self, sni: &str) -> Option<RouteInfo> {
         let snapshot = self.route_snapshot.load();
-        if snapshot.legacy.reserved_console_host.as_deref() == Some(sni) {
+        if snapshot.legacy.is_reserved(sni) {
             return None;
         }
 
@@ -1295,7 +1304,7 @@ impl CachedPeerTable {
     /// and reject every certable host. O(1) per map, no I/O.
     pub fn resolve_route_for_sni(&self, sni: &str) -> Option<RouteInfo> {
         let snapshot = self.route_snapshot.load();
-        if snapshot.legacy.reserved_console_host.as_deref() == Some(sni) {
+        if snapshot.legacy.is_reserved(sni) {
             return None;
         }
         snapshot
@@ -1326,7 +1335,12 @@ impl CachedPeerTable {
             snapshot.legacy.exact.keys(),
             snapshot.http_routes.keys(),
             snapshot.tls_routes.keys(),
-            snapshot.legacy.reserved_console_host.clone(),
+            snapshot
+                .legacy
+                .reserved_console_host
+                .iter()
+                .chain(snapshot.legacy.reserved_ingress_host.iter())
+                .cloned(),
         );
         self.route_snapshot.store(Arc::new(snapshot));
     }
@@ -1345,6 +1359,16 @@ impl CachedPeerTable {
     pub fn reserve_hostname_for_test(&self, host: &str) {
         let mut snapshot = (*self.route_snapshot.load_full()).clone();
         snapshot.legacy.reserved_console_host = Some(host.to_string());
+        snapshot.ownership.reserved_hosts.insert(host.to_string());
+        self.route_snapshot.store(Arc::new(snapshot));
+    }
+
+    /// Reserve the public ingress hostname for cross-crate tests without
+    /// database setup.
+    #[doc(hidden)]
+    pub fn reserve_public_ingress_hostname_for_test(&self, host: &str) {
+        let mut snapshot = (*self.route_snapshot.load_full()).clone();
+        snapshot.legacy.reserved_ingress_host = Some(host.to_string());
         snapshot.ownership.reserved_hosts.insert(host.to_string());
         self.route_snapshot.store(Arc::new(snapshot));
     }
@@ -2778,6 +2802,24 @@ impl CachedPeerTable {
             }
         }
 
+        // The public ingress hostname is owned by the control plane for the
+        // same reason (ADR-051): a project route on it would swallow every
+        // third-party callback. The settings API refuses a hostname that is
+        // already routed, so this only fires for a route created by a path
+        // that bypassed that check.
+        let ingress_host = app_settings.dedicated_public_ingress_hostname();
+        if let Some(ingress_host) = ingress_host.as_ref() {
+            let removed = routes.remove(ingress_host).is_some()
+                | http_routes_map.remove(ingress_host).is_some()
+                | tls_routes_map.remove(ingress_host).is_some();
+            if removed {
+                warn!(
+                    "Ignoring project route for reserved public ingress hostname '{}' — Temps serves third-party callbacks on it (ADR-051)",
+                    ingress_host
+                );
+            }
+        }
+
         // A live route always wins over an unavailable entry for the same
         // host, whichever section recorded it, and the console hostname is
         // never reported as an application host. Lookups re-check live
@@ -2792,6 +2834,9 @@ impl CachedPeerTable {
             .retain(|base, _| !routes.contains_key(&format!("*.{base}")));
         if let Some(console_host) = app_settings.console_hostname() {
             unavailable.exact.remove(&console_host);
+        }
+        if let Some(ingress_host) = ingress_host.as_ref() {
+            unavailable.exact.remove(ingress_host);
         }
 
         // Build the wildcard index for legacy project/environment routes. A
@@ -2814,7 +2859,10 @@ impl CachedPeerTable {
             routes.keys(),
             http_routes_map.keys(),
             tls_routes_map.keys(),
-            app_settings.console_hostname(),
+            app_settings
+                .console_hostname()
+                .into_iter()
+                .chain(ingress_host.clone()),
         );
 
         // Atomically replace all route tables
@@ -2835,6 +2883,7 @@ impl CachedPeerTable {
                 exact: routes,
                 wildcards: legacy_wildcards_matcher,
                 reserved_console_host: app_settings.console_hostname(),
+                reserved_ingress_host: ingress_host,
             },
             ownership: route_ownership,
             unavailable,
@@ -2995,9 +3044,7 @@ impl CachedPeerTable {
         // The unavailable map is usually empty, so check it first: console
         // and unknown-host requests pay one hash lookup, not the full chain.
         let route = snapshot.unavailable.get(host)?;
-        if snapshot.legacy.reserved_console_host.as_deref() == Some(host)
-            || snapshot.has_live_route(host)
-        {
+        if snapshot.legacy.is_reserved(host) || snapshot.has_live_route(host) {
             return None;
         }
         Some(route.clone())
@@ -3012,15 +3059,33 @@ impl CachedPeerTable {
         self.route_snapshot.store(Arc::new(snapshot));
     }
 
-    /// Whether this hostname is reserved for the control-plane console.
-    /// Wake-on-request checks this before consulting sleeping wildcards.
+    /// Whether this hostname is reserved for the control plane: the console
+    /// hostname or the public ingress hostname. Wake-on-request checks this
+    /// before consulting sleeping wildcards.
     pub fn is_reserved_hostname(&self, host: &str) -> bool {
-        self.route_snapshot
-            .load()
-            .legacy
-            .reserved_console_host
-            .as_deref()
-            == Some(host)
+        self.route_snapshot.load().legacy.is_reserved(host)
+    }
+
+    /// Whether `host` is the dedicated public ingress hostname (ADR-051): an
+    /// explicit `public_ingress_url` whose host is not the console host.
+    ///
+    /// The proxy sends such a request to the public-only console surface, and
+    /// nowhere else. One lock-free snapshot load and one string comparison
+    /// with no allocation, so it is safe on the per-request path. `host` may
+    /// be a raw `Host` header: a `:port` suffix, a trailing dot and letter
+    /// case are ignored.
+    pub fn is_public_ingress_hostname(&self, host: &str) -> bool {
+        let snapshot = self.route_snapshot.load();
+        let Some(reserved) = snapshot.legacy.reserved_ingress_host.as_deref() else {
+            return false;
+        };
+        let host = match host.rsplit_once(':') {
+            Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+                name
+            }
+            _ => host,
+        };
+        reserved.eq_ignore_ascii_case(host.trim_end_matches('.'))
     }
 
     /// Return whether an active route or reserved control-plane hostname owns
@@ -3129,6 +3194,144 @@ impl temps_core::route_table::RouteTableRefresher for CachedPeerTable {
         let count =
             snapshot.legacy.exact.len() + snapshot.http_routes.len() + snapshot.tls_routes.len();
         Ok(count)
+    }
+
+    async fn application_serving_host(
+        &self,
+        host: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .application_use_of(host)
+            .await?
+            .map(|usage| usage.describe().to_string()))
+    }
+}
+
+/// How an application currently uses a hostname. See
+/// [`CachedPeerTable::application_use_of`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplicationHostUse {
+    /// A live route resolves it: an exact route, or a wildcard that covers it.
+    LiveRoute,
+    /// It belongs to a deployment with no live upstream (stopped, crashed or
+    /// paused). The proxy answers 503 on it today.
+    StoppedDeployment,
+    /// It wakes an on-demand environment that is currently asleep.
+    SleepingEnvironment,
+    /// It is the generated hostname of an environment that has not been
+    /// deployed yet, and becomes a live route on its first deployment.
+    EnvironmentHostname,
+}
+
+impl ApplicationHostUse {
+    /// A phrase that completes "… is already used by …".
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::LiveRoute => "a deployed application",
+            Self::StoppedDeployment => "an application whose deployment is stopped or paused",
+            Self::SleepingEnvironment => "a sleeping on-demand environment",
+            Self::EnvironmentHostname => "an environment's generated hostname",
+        }
+    }
+}
+
+/// Whether a stored route hostname, exact or a single-label wildcard
+/// (`*.example.com`), covers `host`. Mirrors `WildcardMatcher`: a wildcard
+/// stands for exactly one label.
+fn stored_hostname_covers(stored: &str, host: &str) -> bool {
+    let stored = stored.trim_end_matches('.');
+    match stored.strip_prefix("*.") {
+        Some(base) if !base.is_empty() => host
+            .split_once('.')
+            .is_some_and(|(label, rest)| !label.is_empty() && rest.eq_ignore_ascii_case(base)),
+        Some(_) => false,
+        None => stored.eq_ignore_ascii_case(host),
+    }
+}
+
+impl CachedPeerTable {
+    /// What serves `host` as an application right now, judged against a fresh
+    /// load of the route table.
+    ///
+    /// This is the complete answer to "would reserving this hostname for the
+    /// platform take something offline": the route table is where exact
+    /// routes, wildcard routes and generated environment names all come
+    /// together, and it is what drops a project route once a host is
+    /// reserved. Checked, in order:
+    ///
+    /// 1. live routes, including wildcard matches;
+    /// 2. hosts whose deployment is stopped or paused;
+    /// 3. hosts that wake a sleeping on-demand environment;
+    /// 4. the generated hostname of an environment not deployed yet.
+    ///
+    /// A host that is already reserved (the console, the current public
+    /// ingress host) is not reported: no project route exists on it.
+    ///
+    /// Reloads the table, so it belongs on a rare control-plane write, never
+    /// on a request path.
+    pub async fn application_use_of(
+        &self,
+        host: &str,
+    ) -> Result<Option<ApplicationHostUse>, RouteLoadError> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use temps_entities::{environments, settings};
+
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            return Ok(None);
+        }
+
+        let sleeping = self.load_routes().await?;
+        {
+            let snapshot = self.route_snapshot.load();
+            if snapshot.legacy.is_reserved(&host) {
+                return Ok(None);
+            }
+            if snapshot.has_live_route(&host) {
+                return Ok(Some(ApplicationHostUse::LiveRoute));
+            }
+            if snapshot.unavailable.get(&host).is_some() {
+                return Ok(Some(ApplicationHostUse::StoppedDeployment));
+            }
+        }
+        if sleeping
+            .iter()
+            .any(|entry| stored_hostname_covers(&entry.domain, &host))
+        {
+            return Ok(Some(ApplicationHostUse::SleepingEnvironment));
+        }
+
+        // An environment that has never been deployed has no route yet, but
+        // its generated hostname is already promised to it. One indexed
+        // lookup by subdomain rather than a scan of every environment.
+        let preview_domain = settings::Entity::find()
+            .one(self.db.as_ref())
+            .await?
+            .map(|s| AppSettings::from_json(s.data))
+            .unwrap_or_default()
+            .preview_domain;
+        let preview_base = preview_domain
+            .trim()
+            .trim_start_matches("*.")
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        let subdomain = host
+            .strip_suffix(preview_base.as_str())
+            .and_then(|label| label.strip_suffix('.'))
+            .filter(|label| !preview_base.is_empty() && !label.is_empty() && !label.contains('.'));
+        if let Some(subdomain) = subdomain {
+            let claimed = environments::Entity::find()
+                .filter(environments::Column::Subdomain.eq(subdomain))
+                .filter(environments::Column::DeletedAt.is_null())
+                .one(self.db.as_ref())
+                .await?
+                .is_some();
+            if claimed {
+                return Ok(Some(ApplicationHostUse::EnvironmentHostname));
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -4489,6 +4692,241 @@ mod unavailable_route_tests {
             "only-down.example.com",
             (project.id, environment.id, deployment.id),
             UnavailableReason::NoLiveBackend,
+        );
+
+        Ok(())
+    }
+
+    // ── What already uses a hostname (ADR-051) ────────────────────────
+    //
+    // Before a hostname is reserved for the platform, every way the proxy
+    // can serve it has to be ruled out. Stored domain rows are not enough:
+    // a wildcard route covers names that are stored nowhere, and a name
+    // generated from an environment's subdomain is not a domain row at all.
+
+    async fn set_preview_domain(
+        test_db: &TestDBMockOperations,
+        preview_domain: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use sea_orm::{ActiveModelBehavior, EntityTrait};
+        use temps_entities::settings;
+
+        let app_settings = temps_core::AppSettings {
+            external_url: Some("https://console.example.com".to_string()),
+            preview_domain: preview_domain.to_string(),
+            ..Default::default()
+        };
+        settings::Entity::insert(settings::ActiveModel {
+            id: Set(1),
+            data: Set(app_settings.to_json()),
+            ..settings::ActiveModel::new()
+        })
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(settings::Column::Id)
+                .update_column(settings::Column::Data)
+                .to_owned(),
+        )
+        .exec(test_db.db.as_ref())
+        .await?;
+        Ok(())
+    }
+
+    async fn set_subdomain(
+        test_db: &TestDBMockOperations,
+        environment_id: i32,
+        subdomain: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        temps_entities::environments::ActiveModel {
+            id: Set(environment_id),
+            subdomain: Set(subdomain.to_string()),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_stored_wildcard_covers_exactly_one_label() {
+        use super::stored_hostname_covers;
+
+        assert!(stored_hostname_covers("app.example.com", "app.example.com"));
+        assert!(stored_hostname_covers(
+            "App.Example.com.",
+            "app.example.com"
+        ));
+        assert!(stored_hostname_covers("*.example.com", "app.example.com"));
+        assert!(!stored_hostname_covers("*.example.com", "example.com"));
+        assert!(!stored_hostname_covers("*.example.com", "a.b.example.com"));
+        assert!(!stored_hostname_covers("*.example.com", "app.example.org"));
+        assert!(!stored_hostname_covers("*.", "app.example.com"));
+        assert!(!stored_hostname_covers(
+            "other.example.com",
+            "app.example.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_name_served_through_a_wildcard_or_generated_for_an_environment_is_in_use(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::route_table::ApplicationHostUse;
+        use temps_entities::project_custom_domains;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        set_preview_domain(&test_db, "preview.example.com").await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("shop.example.com")
+            .await?;
+        set_subdomain(&test_db, environment.id, "shop-production").await?;
+        insert_container(&test_db, deployment.id, "running", Some(9741)).await?;
+        project_custom_domains::ActiveModel {
+            domain: Set("*.example.com".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            status: Set("active".to_string()),
+            redirect_to: Set(None),
+            status_code: Set(None),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+
+        // Stored nowhere as a row: only the wildcard route covers it.
+        assert_eq!(
+            route_table.application_use_of("app.example.com").await?,
+            Some(ApplicationHostUse::LiveRoute),
+            "a name the wildcard route serves is in use"
+        );
+        // Generated from the environment's subdomain, not a domain row either.
+        assert_eq!(
+            route_table
+                .application_use_of(" Shop-Production.preview.example.com. ")
+                .await?,
+            Some(ApplicationHostUse::LiveRoute),
+            "an environment's generated hostname is in use"
+        );
+
+        // A wildcard stands for one label, and unrelated names stay free.
+        assert_eq!(
+            route_table.application_use_of("a.b.example.com").await?,
+            None
+        );
+        assert_eq!(
+            route_table.application_use_of("hooks.example.org").await?,
+            None
+        );
+        assert_eq!(route_table.application_use_of("  ").await?, None);
+        // The console hostname is already reserved; no application is on it.
+        assert_eq!(
+            route_table
+                .application_use_of("console.example.com")
+                .await?,
+            None
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stopped_sleeping_or_not_yet_deployed_environment_still_holds_its_hostname(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::route_table::ApplicationHostUse;
+        use temps_entities::environments;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        set_preview_domain(&test_db, "preview.example.com").await?;
+
+        // Stopped: its only container exited.
+        let (_project, stopped_env, stopped_deployment) = test_db
+            .create_test_project_with_domain("stopped.example.com")
+            .await?;
+        set_subdomain(&test_db, stopped_env.id, "stopped-production").await?;
+        insert_container(&test_db, stopped_deployment.id, "exited", Some(9742)).await?;
+        insert_environment_domain(&test_db, stopped_env.id, "stopped.example.com").await?;
+
+        // Asleep: an on-demand environment waiting to be woken.
+        let (_project, sleeping_env, sleeping_deployment) = test_db
+            .create_test_project_with_domain("sleeping.example.com")
+            .await?;
+        set_subdomain(&test_db, sleeping_env.id, "sleeping-production").await?;
+        environments::ActiveModel {
+            id: Set(sleeping_env.id),
+            sleeping: Set(true),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        insert_container(&test_db, sleeping_deployment.id, "exited", Some(9743)).await?;
+        insert_environment_domain(&test_db, sleeping_env.id, "sleeping.example.com").await?;
+
+        // Never deployed: no route yet, but the name is promised to it.
+        let (_project, draft_env, _draft_deployment) = test_db
+            .create_test_project_with_domain("draft.example.com")
+            .await?;
+        environments::ActiveModel {
+            id: Set(draft_env.id),
+            subdomain: Set("draft-staging".to_string()),
+            current_deployment_id: Set(None),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+
+        assert_eq!(
+            route_table
+                .application_use_of("stopped.example.com")
+                .await?,
+            Some(ApplicationHostUse::StoppedDeployment)
+        );
+        assert_eq!(
+            route_table
+                .application_use_of("sleeping.example.com")
+                .await?,
+            Some(ApplicationHostUse::SleepingEnvironment)
+        );
+        assert_eq!(
+            route_table
+                .application_use_of("sleeping-production.preview.example.com")
+                .await?,
+            Some(ApplicationHostUse::SleepingEnvironment)
+        );
+        assert_eq!(
+            route_table
+                .application_use_of("draft-staging.preview.example.com")
+                .await?,
+            Some(ApplicationHostUse::EnvironmentHostname)
+        );
+
+        // A name under the preview domain that no environment generates.
+        assert_eq!(
+            route_table
+                .application_use_of("hooks.preview.example.com")
+                .await?,
+            None
+        );
+        // A deleted environment gives its name back.
+        environments::ActiveModel {
+            id: Set(draft_env.id),
+            deleted_at: Set(Some(chrono::Utc::now())),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        assert_eq!(
+            route_table
+                .application_use_of("draft-staging.preview.example.com")
+                .await?,
+            None
         );
 
         Ok(())

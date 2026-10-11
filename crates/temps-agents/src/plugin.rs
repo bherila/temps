@@ -898,33 +898,16 @@ impl TempsPlugin for AgentsPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        // Resolve the ProjectAccessChecker here, not in register_services.
-        // configure_routes runs after ALL plugins have completed both
-        // register_services and initialize_plugin_services, so any checker
-        // registered by another plugin is guaranteed to be visible here
-        // regardless of plugin load order.
-        let old = context.get_plugin_state::<AppState>("agents")?;
-        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
-        let ai_service = context.get_service::<dyn temps_ai::AiService>();
-        let app_state = Arc::new(AppState {
-            db: old.db.clone(),
-            encryption_service: old.encryption_service.clone(),
-            config_service: old.config_service.clone(),
-            run_service: old.run_service.clone(),
-            executor: old.executor.clone(),
-            audit_service: old.audit_service.clone(),
-            autofixer_service: old.autofixer_service.clone(),
-            secret_service: old.secret_service.clone(),
-            definition_service: old.definition_service.clone(),
-            docker: old.docker.clone(),
-            platform_config_service: old.platform_config_service.clone(),
-            preview_gateway_name: old.preview_gateway_name.clone(),
-            telemetry: old.telemetry.clone(),
-            project_access_checker,
-            ai_service,
-        });
+        let router = crate::handlers::configure_routes().with_state(route_state(context)?);
 
-        let router = crate::handlers::configure_routes().with_state(app_state);
+        Some(PluginRoutes::new(router))
+    }
+
+    /// The agent webhook trigger (ADR-051 D3): called with an
+    /// `X-Webhook-Token` and no session, so it must be reachable when the
+    /// console itself is restricted.
+    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        let router = crate::handlers::configure_public_routes().with_state(route_state(context)?);
 
         Some(PluginRoutes::new(router))
     }
@@ -933,6 +916,35 @@ impl TempsPlugin for AgentsPlugin {
         use utoipa::OpenApi;
         Some(crate::handlers::AgentsApiDoc::openapi())
     }
+}
+
+/// The handler state shared by the admin and public agent routers.
+fn route_state(context: &PluginContext) -> Option<Arc<AppState>> {
+    // Resolve the ProjectAccessChecker here, not in register_services.
+    // Route configuration runs after ALL plugins have completed both
+    // register_services and initialize_plugin_services, so any checker
+    // registered by another plugin is guaranteed to be visible here
+    // regardless of plugin load order.
+    let old = context.get_plugin_state::<AppState>("agents")?;
+    let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+    let ai_service = context.get_service::<dyn temps_ai::AiService>();
+    Some(Arc::new(AppState {
+        db: old.db.clone(),
+        encryption_service: old.encryption_service.clone(),
+        config_service: old.config_service.clone(),
+        run_service: old.run_service.clone(),
+        executor: old.executor.clone(),
+        audit_service: old.audit_service.clone(),
+        autofixer_service: old.autofixer_service.clone(),
+        secret_service: old.secret_service.clone(),
+        definition_service: old.definition_service.clone(),
+        docker: old.docker.clone(),
+        platform_config_service: old.platform_config_service.clone(),
+        preview_gateway_name: old.preview_gateway_name.clone(),
+        telemetry: old.telemetry.clone(),
+        project_access_checker,
+        ai_service,
+    }))
 }
 
 #[cfg(test)]

@@ -1079,6 +1079,7 @@ mod integration_tests {
             tls_address: None,
             console_address: "127.0.0.1:8080".to_string(),
             console_admin_address: None,
+            console_ingress_address: None,
             admin_allowed_ips: Vec::new(),
             admin_allowed_hosts: Vec::new(),
             admin_trust_forwarded_for: false,

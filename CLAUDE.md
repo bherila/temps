@@ -1093,6 +1093,7 @@ All use `TEMPS_` prefix:
 | `TEMPS_ADDRESS` | `127.0.0.1:3000` | No |
 | `TEMPS_TLS_ADDRESS` | -- | No |
 | `TEMPS_CONSOLE_ADDRESS` | -- | No |
+| `TEMPS_CONSOLE_INGRESS_ADDRESS` | random loopback port (`temps serve`) | No -- listener serving only the console's public routes (ADR-051). Bootstrap config like `TEMPS_CONSOLE_ADDRESS`; set it only in split topology, identically on `temps serve --role=console` and `temps proxy`. Always an address of its own: never reuse `TEMPS_CONSOLE_ADDRESS`, which also serves MCP |
 | `TEMPS_DATA_DIR` | `~/.temps` | No |
 | `TEMPS_LOG_LEVEL` | -- | No |
 | `TEMPS_DB_STARTUP_WAIT` | `120` | No -- seconds `temps serve` keeps retrying an unreachable database at startup (exponential backoff, one log line per attempt) before it exits; `0` tries once. Bootstrap-time: it is read before any database connection exists. |

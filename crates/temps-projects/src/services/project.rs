@@ -4278,6 +4278,18 @@ impl ProjectService {
         Ok((base_url, access_token, auth_method))
     }
 
+    /// Base URL a git provider is told to deliver webhooks to, with no
+    /// trailing slash.
+    ///
+    /// The provider calls from its own infrastructure, so this is the public
+    /// ingress URL (ADR-051) and not necessarily where operators reach the
+    /// console. An unreadable settings row falls back like an unconfigured
+    /// one: a failed read must not abort a project's git setup.
+    async fn git_webhook_base_url(&self) -> String {
+        let settings = self.config_service.get_settings().await.ok();
+        git_webhook_base_url(settings.as_ref())
+    }
+
     /// Install a GitLab webhook for the given project/connection.
     /// Returns `(hook_id, encrypted_signing_token)` on success.
     async fn install_gitlab_webhook_for_connection(
@@ -4318,14 +4330,10 @@ impl ProjectService {
         }
 
         // Resolve the webhook URL from config.
-        let external_url = self
-            .config_service
-            .get_settings()
-            .await
-            .ok()
-            .and_then(|s| s.external_url)
-            .unwrap_or_else(|| "http://localhost:8080".to_string());
-        let webhook_url = format!("{}/api/webhook/git/gitlab/events", external_url);
+        let webhook_url = format!(
+            "{}/api/webhook/git/gitlab/events",
+            self.git_webhook_base_url().await
+        );
 
         // Generate a random 32-byte signing token.
         let signing_token = generate_signing_token()
@@ -4492,7 +4500,7 @@ impl ProjectService {
     ///
     /// Steps:
     /// 1. Generate a fresh `bitbucket_webhook_token` via `OsRng`.
-    /// 2. Build the delivery URL: `{external_url}/api/webhook/git/bitbucket/events/{token}`.
+    /// 2. Build the delivery URL: `{public ingress URL}/api/webhook/git/bitbucket/events/{token}`.
     /// 3. Call `POST /2.0/repositories/{workspace}/{slug}/hooks`.
     /// 4. Return `(hook_uuid, encrypted_token)` to the caller for persistence.
     async fn install_bitbucket_webhook_for_connection(
@@ -4511,13 +4519,7 @@ impl ProjectService {
                 Err(e) => return Err(e),
             };
 
-        let external_url = self
-            .config_service
-            .get_settings()
-            .await
-            .ok()
-            .and_then(|s| s.external_url)
-            .unwrap_or_else(|| "http://localhost:8080".to_string());
+        let webhook_base_url = self.git_webhook_base_url().await;
 
         // Generate a fresh secret-in-path delivery token.
         let delivery_token = generate_bitbucket_webhook_token()
@@ -4525,8 +4527,7 @@ impl ProjectService {
 
         let webhook_url = format!(
             "{}/api/webhook/git/bitbucket/events/{}",
-            external_url.trim_end_matches('/'),
-            delivery_token
+            webhook_base_url, delivery_token
         );
 
         // Resolve the connection to get provider_id, then get provider service.
@@ -4685,7 +4686,7 @@ impl ProjectService {
     /// Steps:
     /// 1. Resolve the connection to confirm it's a Gitea provider.
     /// 2. Generate a fresh 32-byte hex signing token via `generate_gitea_signing_token`.
-    /// 3. Build the delivery URL: `{external_url}/api/webhook/git/gitea/events`.
+    /// 3. Build the delivery URL: `{public ingress URL}/api/webhook/git/gitea/events`.
     /// 4. Call `create_webhook` with the HMAC secret (Gitea HMAC signing).
     /// 5. Encrypt the token and return it for storage.
     ///
@@ -4706,21 +4707,13 @@ impl ProjectService {
             Err(e) => return Err(e),
         };
 
-        let external_url = self
-            .config_service
-            .get_settings()
-            .await
-            .ok()
-            .and_then(|s| s.external_url)
-            .unwrap_or_else(|| "http://localhost:8080".to_string());
-
         // Generate a fresh HMAC secret (used as the Gitea webhook secret).
         let signing_token = generate_gitea_signing_token()
             .map_err(|error| format!("Failed to generate Gitea webhook token: {error}"))?;
 
         let webhook_url = format!(
             "{}/api/webhook/git/gitea/events",
-            external_url.trim_end_matches('/')
+            self.git_webhook_base_url().await
         );
 
         // Resolve the connection to get provider_id, then get provider service.
@@ -4778,7 +4771,7 @@ impl ProjectService {
     //
     // BLOCKER 2 fix: the Generic provider has no REST API to auto-register a
     // hook.  We generate a token and store it encrypted.  The webhook URL
-    // (`{external_url}/api/webhook/git/generic/events/{token}`) is surfaced to
+    // (`{public ingress URL}/api/webhook/git/generic/events/{token}`) is surfaced to
     // the operator for manual configuration.
     //
     // Returns `Ok(Some(encrypted_token))` for Generic connections,
@@ -6594,9 +6587,50 @@ fn base_project_slug(name: &str) -> String {
     slug
 }
 
+/// Resolve the git webhook delivery base from the settings row:
+/// `public_ingress_url` when set, `external_url` otherwise, and the local
+/// development address when neither is configured.
+fn git_webhook_base_url(settings: Option<&temps_core::AppSettings>) -> String {
+    settings
+        .and_then(temps_core::AppSettings::configured_public_ingress_url)
+        .unwrap_or_else(|| "http://localhost:8080".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ADR-051 D2: provider webhooks are delivered to the public ingress URL.
+    #[test]
+    fn git_webhooks_are_delivered_to_the_public_ingress_url_when_set() {
+        let settings = temps_core::AppSettings {
+            external_url: Some("https://console.example.com".to_string()),
+            public_ingress_url: Some("https://hooks.example.com/".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            git_webhook_base_url(Some(&settings)),
+            "https://hooks.example.com"
+        );
+    }
+
+    #[test]
+    fn git_webhooks_fall_back_to_the_external_url_then_the_local_default() {
+        let settings = temps_core::AppSettings {
+            external_url: Some("https://console.example.com".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            git_webhook_base_url(Some(&settings)),
+            "https://console.example.com"
+        );
+        assert_eq!(
+            git_webhook_base_url(Some(&temps_core::AppSettings::default())),
+            "http://localhost:8080"
+        );
+        // An unreadable settings row behaves like an unconfigured one.
+        assert_eq!(git_webhook_base_url(None), "http://localhost:8080");
+    }
     use sea_orm::{ActiveModelTrait, Set};
 
     #[tokio::test]
