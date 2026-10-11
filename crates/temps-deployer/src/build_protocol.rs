@@ -222,12 +222,13 @@ impl BuildSpec {
 /// when a declaration names a variable reference and cannot be read.
 ///
 /// Instructions continued with the escape character (`\`, or the one set by
-/// a leading `# escape=` directive) are joined first, as Docker does, and
-/// comment and empty lines inside a continuation are skipped. Every other physical line
-/// is treated as a possible instruction, so a heredoc line that happens to
-/// start with `ARG` only adds a name: callers use the result to decide which
-/// values a build reads, where an extra name is harmless and a missing one is
-/// not.
+/// a leading `# escape=` directive) are joined first, exactly as Docker joins
+/// them: the lines are concatenated with nothing in between, and comment and
+/// empty lines inside a continuation are skipped. So `ARG API_\` followed by
+/// `URL` declares `API_URL`. Every other physical line is treated as a
+/// possible instruction, so a heredoc line that happens to start with `ARG`
+/// only adds a name: callers use the result to decide which values a build
+/// reads, where an extra name is harmless and a missing one is not.
 pub fn dockerfile_build_arg_names(contents: &str) -> Option<BTreeSet<String>> {
     let contents = contents.trim_start_matches('\u{feff}');
     let escape = dockerfile_escape_character(contents);
@@ -237,20 +238,17 @@ pub fn dockerfile_build_arg_names(contents: &str) -> Option<BTreeSet<String>> {
         if line.trim_start().starts_with('#') {
             continue;
         }
-        let mut instruction = line.trim_end().to_string();
-        while instruction.ends_with(escape) {
-            instruction.pop();
-            let Some(next) = lines.next() else {
-                break;
-            };
+        let mut instruction = String::new();
+        let mut current = line;
+        while let Some(continued) = strip_line_continuation(current, escape) {
+            instruction.push_str(continued);
             // Docker drops comment and empty lines inside a continuation.
-            if next.trim().is_empty() || next.trim_start().starts_with('#') {
-                instruction.push(escape);
-                continue;
-            }
-            instruction.push(' ');
-            instruction.push_str(next.trim_end());
+            let next = lines
+                .by_ref()
+                .find(|next| !next.trim().is_empty() && !next.trim_start().starts_with('#'));
+            current = next.unwrap_or_default();
         }
+        instruction.push_str(current);
         let mut words = instruction.split_whitespace();
         let Some(keyword) = words.next() else {
             continue;
@@ -279,6 +277,18 @@ pub fn dockerfile_build_arg_names(contents: &str) -> Option<BTreeSet<String>> {
         }
     }
     Some(names)
+}
+
+/// `line` without its line continuation, or `None` when it does not end with
+/// one. Docker's rule: the escape character, preceded by any character other
+/// than the escape character, with only blanks after it. An escaped escape
+/// (`\\`) at the end of a line therefore does not continue it.
+fn strip_line_continuation(line: &str, escape: char) -> Option<&str> {
+    let body = line.trim_end_matches([' ', '\t']).strip_suffix(escape)?;
+    match body.chars().next_back() {
+        Some(previous) if previous != escape => Some(body),
+        _ => None,
+    }
 }
 
 /// The escape character set by a `# escape=` parser directive, which Docker
@@ -570,6 +580,21 @@ mod tests {
         );
         // A continued RUN line that happens to start with ARG is not one.
         assert_eq!(names("RUN echo \\\n  ARG HIDDEN\n"), Some(vec![]));
+        // Docker joins continued lines with nothing in between, so a name
+        // split across lines is one name, and blanks after the escape
+        // character are ignored.
+        assert_eq!(
+            names("ARG API_\\\nURL=1 \\  \nBUILD_\\\n# note\nLABEL\nRUN true\n"),
+            Some(vec!["API_URL".into(), "BUILD_LABEL".into()])
+        );
+        // An escaped escape at the end of a line does not continue it, so
+        // the next line is still its own instruction.
+        assert_eq!(
+            names("RUN echo a\\\\\nARG NEXT\n"),
+            Some(vec!["NEXT".into()])
+        );
+        // A continuation that runs into the end of the file.
+        assert_eq!(names("ARG LAST \\\n"), Some(vec!["LAST".into()]));
         // A referenced name cannot be resolved here.
         assert_eq!(names("ARG ${NAME}\n"), None);
         assert_eq!(names("ARG\n"), None);
