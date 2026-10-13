@@ -223,7 +223,9 @@ jobs:
     # Warm this is ~5 minutes. The ceiling is sized for a fully cold cache,
     # which took 81 minutes the last time the cargo cache was evicted — a
     # tighter bound would turn a slow run into a failed one.
-    timeout-minutes: 100
+    # A dependency refresh exhausted 100 minutes while cold compilation was
+    # still progressing. Include headroom for the toolchain and final link.
+    timeout-minutes: 150
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
