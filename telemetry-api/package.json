@@ -11,11 +11,11 @@
     "test": "bun test"
   },
   "dependencies": {
-    "maxmind": "^5.0.6",
-    "pg": "^8.13.3"
+    "maxmind": "^5.0.7",
+    "pg": "^8.23.1"
   },
   "devDependencies": {
-    "@types/pg": "^8.11.10",
+    "@types/pg": "^8.23.1",
     "bun-types": "latest"
   }
 }

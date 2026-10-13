@@ -7,10 +7,10 @@
     "@types/bun": "latest"
   },
   "peerDependencies": {
-    "typescript": "^5"
+    "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@faker-js/faker": "^10.3.0",
-    "postgres": "^3.4.8"
+    "@faker-js/faker": "^10.6.0",
+    "postgres": "^3.4.9"
   }
 }
