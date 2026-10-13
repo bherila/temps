@@ -28,26 +28,26 @@
   "devDependencies": {
     "@hey-api/openapi-ts": "^0.99.0",
     "@types/bun": "latest",
-    "@types/react": "^19.2.9",
+    "@types/react": "^19.3.0",
     "react-devtools-core": "^7.0.1"
   },
   "peerDependencies": {
-    "typescript": "^5"
+    "typescript": "^5.9.3"
   },
   "dependencies": {
     "@hey-api/client-fetch": "^0.13.1",
-    "@inquirer/prompts": "^8.0.1",
-    "@inquirer/search": "^4.0.2",
-    "@types/ws": "^8.18.1",
+    "@inquirer/prompts": "^8.7.3",
+    "@inquirer/search": "^4.3.4",
+    "@types/ws": "^8.18.2",
     "chalk": "^5.6.2",
     "cli-table3": "^0.6.5",
-    "commander": "^14.0.2",
-    "conf": "^15.0.2",
-    "ink": "^6.6.0",
+    "commander": "^14.0.3",
+    "conf": "^15.1.0",
+    "ink": "^6.8.0",
     "ink-spinner": "^5.0.0",
     "jsonc-parser": "^3.3.1",
-    "ora": "^9.0.0",
-    "react": "^19.2.3",
-    "ws": "^8.21.2"
+    "ora": "^9.4.1",
+    "react": "^19.3.0",
+    "ws": "^8.22.0"
   }
 }

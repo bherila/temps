@@ -85,7 +85,8 @@ jobs:
   build-binary:
     name: Build temps Binary (musl)
     runs-on: ubuntu-latest
-    timeout-minutes: 100
+    # Match the cold-build budget used by rust-tests.yml.
+    timeout-minutes: 150
     steps:
       - name: Free up disk space
         run: |

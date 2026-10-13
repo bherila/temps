@@ -220,5 +220,5 @@ A separate `SessionRecordingProvider` + `useSessionRecordingControl` exist for u
 3. Confirm responses are `2xx` (when Temps-hosted, the proxy accepts them from any host).
 4. Check the Temps dashboard for incoming events / Web Vitals / session replays.
 5. Run the project's existing local typecheck script (for example,
-   `npm run typecheck -- --noEmit`). Do not use `npx`, because it may download
-   and execute a package when the expected local binary is absent.
+   `npm run typecheck -- --noEmit`). Verification must use dependencies already
+   installed from the project's lockfile.

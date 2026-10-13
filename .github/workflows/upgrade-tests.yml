@@ -89,7 +89,9 @@ jobs:
       # Never report CI instances to product telemetry.
       TEMPS_TELEMETRY: "0"
       GH_TOKEN: ${{ github.token }}
-      PREVIOUS_VERSION: ${{ github.event.inputs.previous-version }}
+      # Forks with custom release tags can configure a published baseline;
+      # an explicit manual selection still takes priority.
+      PREVIOUS_VERSION: ${{ github.event.inputs.previous-version || vars.UPGRADE_PREVIOUS_VERSION }}
       # `inputs` covers workflow_call and workflow_dispatch; a scheduled run
       # has neither and takes the stable default.
       PREVIOUS_CHANNEL: ${{ inputs.previous-channel || 'stable' }}
